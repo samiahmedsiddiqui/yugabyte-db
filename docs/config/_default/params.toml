@@ -1,6 +1,7 @@
 author = "Team Yugabyte"
 description = "YugabyteDB, the transactional, high-performance database for building internet-scale, globally-distributed apps."
 copyright = "Yugabyte, Inc."
+excludeSiteTitle = true
 privacy_policy = "https://www.yugabyte.com/privacy-policy/"
 algolia_docsearch = true
 algolia_sequence_expressions = true
