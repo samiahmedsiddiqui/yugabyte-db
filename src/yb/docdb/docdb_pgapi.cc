@@ -35,10 +35,7 @@
 #include "ybgate/ybgate_cpp_util.h"
 #include "ybgate/ybgate_status.h"
 
-// This file comes from this directory:
-// postgres_build/src/include/catalog
-// added as a special include path to CMakeLists.txt
-#include "pg_type_d.h" // NOLINT
+#include "catalog/pg_type_d.h"
 
 using std::string;
 
@@ -231,6 +228,12 @@ Status SetValueFromQLBinary(
       ql_value, pg_data_type, enum_oid_label_map, composite_atts_map, cdc_datum_message));
   PG_RETURN_NOT_OK(YbgResetMemoryContext());
   return Status::OK();
+}
+
+void DeleteMemoryContextIfSet() {
+  if (YBCPgGetThreadLocalCurrentMemoryContext() != nullptr) {
+    YbgDeleteMemoryContext();
+  }
 }
 
 namespace {

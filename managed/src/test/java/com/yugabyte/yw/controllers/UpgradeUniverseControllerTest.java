@@ -41,6 +41,7 @@ import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.common.ApiUtils;
+import com.yugabyte.yw.common.CloudUtilFactory;
 import com.yugabyte.yw.common.CustomWsClientFactory;
 import com.yugabyte.yw.common.CustomWsClientFactoryProvider;
 import com.yugabyte.yw.common.FakeApiHelper;
@@ -49,7 +50,9 @@ import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.PlatformGuiceApplicationBaseTest;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.ReleaseContainer;
 import com.yugabyte.yw.common.ReleaseManager;
+import com.yugabyte.yw.common.ReleasesUtils;
 import com.yugabyte.yw.common.TestHelper;
 import com.yugabyte.yw.common.XClusterUniverseService;
 import com.yugabyte.yw.common.certmgmt.CertConfigType;
@@ -132,6 +135,7 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
   private CertificateHelper certificateHelper;
   private AutoFlagUtil mockAutoFlagUtil;
   private XClusterUniverseService mockXClusterUniverseService;
+  private CloudUtilFactory mockCloudUtilFactory;
 
   private Universe defaultUniverse;
   private Universe k8sUniverse;
@@ -142,6 +146,8 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
   private final String TMP_CERTS_PATH = "/tmp/" + getClass().getSimpleName() + "/certs";
 
   @Mock RuntimeConfigFactory mockRuntimeConfigFactory;
+
+  @Mock ReleasesUtils mockReleasesUtils;
 
   String cert1Contents =
       "-----BEGIN CERTIFICATE-----\n"
@@ -191,14 +197,16 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
     mockConfig = mock(Config.class);
     mockAutoFlagUtil = mock(AutoFlagUtil.class);
     mockXClusterUniverseService = mock(XClusterUniverseService.class);
+    mockCloudUtilFactory = mock(CloudUtilFactory.class);
     ReleaseManager mockReleaseManager = mock(ReleaseManager.class);
 
     when(mockConfig.getBoolean("yb.cloud.enabled")).thenReturn(false);
     when(mockConfig.getString("yb.storage.path")).thenReturn("/tmp/" + getClass().getSimpleName());
+    ReleaseManager.ReleaseMetadata rm =
+        ReleaseManager.ReleaseMetadata.create("1.0.0")
+            .withChartPath(TMP_CHART_PATH + "/uuct_yugabyte-1.0.0-helm.tar.gz");
     when(mockReleaseManager.getReleaseByVersion(any()))
-        .thenReturn(
-            ReleaseManager.ReleaseMetadata.create("1.0.0")
-                .withChartPath(TMP_CHART_PATH + "/uuct_yugabyte-1.0.0-helm.tar.gz"));
+        .thenReturn(new ReleaseContainer(rm, mockCloudUtilFactory, mockConfig, mockReleasesUtils));
     when(mockConfig.getString("yb.security.type")).thenReturn("");
     when(mockConfig.getString("yb.security.clientID")).thenReturn("");
     when(mockConfig.getString("yb.security.secret")).thenReturn("");
@@ -417,7 +425,7 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
                     defaultUniverse,
                     p -> {
                       p.upgradeOption = UpgradeTaskParams.UpgradeOption.ROLLING_UPGRADE;
-                      p.ybSoftwareVersion = "2.16.7.5-b99";
+                      p.ybSoftwareVersion = "2.15.7.5-b99";
                     },
                     SoftwareUpgradeParams.class,
                     "software"));
@@ -460,6 +468,8 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
     assertThat(
         task.getType(), allOf(notNullValue(), equalTo(CustomerTask.TaskType.SoftwareUpgrade)));
     assertAuditEntry(1, customer.getUuid());
+    task.setCompletionTime(new Date());
+    task.save();
 
     // Software upgrade with rollback support.
     url =
@@ -566,6 +576,8 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
     assertThat(
         task.getType(), allOf(notNullValue(), equalTo(CustomerTask.TaskType.SoftwareUpgrade)));
     assertAuditEntry(1, customer.getUuid());
+    task.setCompletionTime(new Date());
+    task.save();
 
     // Software Upgrade with rollback support
     url =
@@ -688,7 +700,7 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
           runUpgrade(
               defaultUniverse,
               p -> {
-                p.ybSoftwareVersion = "2.20.2.0-b2";
+                p.ybSoftwareVersion = "2.21.0.0-b1";
               },
               SoftwareUpgradeParams.class,
               "software");
@@ -701,7 +713,7 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
                   runUpgrade(
                       defaultUniverse,
                       p -> {
-                        p.ybSoftwareVersion = "2.20.2.0-b2";
+                        p.ybSoftwareVersion = "2.21.0.0-b1";
                       },
                       SoftwareUpgradeParams.class,
                       "software"));
@@ -905,27 +917,6 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
   }
 
   @Test
-  public void testGFlagsUpgradeWithInvalidParams() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
-    UUID universeUUID = createUniverse(customer.getId()).getUniverseUUID();
-
-    String url =
-        "/api/customers/" + customer.getUuid() + "/universes/" + universeUUID + "/upgrade/gflags";
-    Result result =
-        assertPlatformException(
-            () -> doRequestWithAuthTokenAndBody("POST", url, authToken, Json.newObject()));
-    assertBadRequest(result, "gflags param is required");
-
-    ArgumentCaptor<GFlagsUpgradeParams> argCaptor =
-        ArgumentCaptor.forClass(GFlagsUpgradeParams.class);
-    verify(mockCommissioner, times(0)).submit(eq(TaskType.GFlagsUpgrade), argCaptor.capture());
-
-    assertNull(CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne());
-    assertAuditEntry(0, customer.getUuid());
-  }
-
-  @Test
   public void testGFlagsUpgradeWithSameFlags() {
     UUID fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
@@ -955,7 +946,7 @@ public class UpgradeUniverseControllerTest extends PlatformGuiceApplicationBaseT
     Result result =
         assertPlatformException(
             () -> doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson));
-    assertBadRequest(result, "No gflags to change");
+    assertBadRequest(result, "No changes in gflags (modify specificGflags in cluster)");
 
     ArgumentCaptor<GFlagsUpgradeParams> argCaptor =
         ArgumentCaptor.forClass(GFlagsUpgradeParams.class);

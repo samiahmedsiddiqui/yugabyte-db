@@ -16,6 +16,7 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/tserver/xcluster_consumer.h"
+#include "yb/tserver/xcluster_ddl_queue_handler.h"
 
 #include "yb/cdc/xcluster_rpc.h"
 #include "yb/cdc/cdc_service.pb.h"
@@ -25,6 +26,7 @@
 #include "yb/consensus/opid_util.h"
 
 #include "yb/gutil/dynamic_annotations.h"
+#include "yb/util/callsite_profiling.h"
 #include "yb/rpc/messenger.h"
 #include "yb/tserver/xcluster_consumer_auto_flags_info.h"
 #include "yb/util/flags.h"
@@ -67,6 +69,9 @@ DEFINE_test_flag(string, xcluster_simulated_lag_tablet_filter, "",
 DEFINE_test_flag(bool, cdc_skip_replication_poll, false,
                  "If true, polling will be skipped.");
 
+DEFINE_test_flag(bool, xcluster_simulate_get_changes_response_error, false,
+                 "Simulate xCluster GetChanges returning an error.");
+
 DEFINE_test_flag(bool, xcluster_disable_poller_term_check, false,
     "If true, the poller will not check the leader term.");
 
@@ -77,6 +82,7 @@ DEFINE_test_flag(
 DECLARE_int32(cdc_read_rpc_timeout_ms);
 DECLARE_bool(enable_xcluster_stat_collection);
 DECLARE_bool(enable_xcluster_auto_flag_validation);
+DECLARE_int32(xcluster_safe_time_update_interval_secs);
 
 using namespace std::placeholders;
 
@@ -107,6 +113,7 @@ namespace tserver {
 XClusterPoller::XClusterPoller(
     const xcluster::ProducerTabletInfo& producer_tablet_info,
     const xcluster::ConsumerTabletInfo& consumer_tablet_info,
+    const NamespaceId& consumer_namespace_id,
     std::shared_ptr<const AutoFlagsCompatibleVersion> auto_flags_version, ThreadPool* thread_pool,
     rpc::Rpcs* rpcs, const std::shared_ptr<XClusterClient>& local_client,
     const std::shared_ptr<XClusterClient>& producer_client, XClusterConsumer* xcluster_consumer,
@@ -115,6 +122,7 @@ XClusterPoller::XClusterPoller(
     : XClusterAsyncExecutor(thread_pool, local_client->messenger.get(), rpcs),
       producer_tablet_info_(producer_tablet_info),
       consumer_tablet_info_(consumer_tablet_info),
+      consumer_namespace_id_(consumer_namespace_id),
       poller_id_(
           producer_tablet_info.replication_group_id, consumer_tablet_info.table_id,
           producer_tablet_info.tablet_id, leader_term),
@@ -143,6 +151,15 @@ void XClusterPoller::Init(bool use_local_tserver, rocksdb::RateLimiter* rate_lim
       use_local_tserver, rate_limiter);
 }
 
+void XClusterPoller::InitDDLQueuePoller(
+    bool use_local_tserver, rocksdb::RateLimiter* rate_limiter, const NamespaceName& namespace_name,
+    ConnectToPostgresFunc connect_to_pg_func) {
+  Init(use_local_tserver, rate_limiter);
+
+  ddl_queue_handler_ = std::make_shared<XClusterDDLQueueHandler>(
+      local_client_, namespace_name, consumer_namespace_id_, std::move(connect_to_pg_func));
+}
+
 void XClusterPoller::StartShutdown() {
   // The poller is shutdown in two cases:
   // 1. The regular case where the poller is deleted via XClusterConsumer's
@@ -157,7 +174,7 @@ void XClusterPoller::StartShutdown() {
 
   DCHECK(!shutdown_);
   shutdown_ = true;
-  shutdown_cv_.notify_all();
+  YB_PROFILE(shutdown_cv_.notify_all());
 
   if (output_client_) {
     output_client_->StartShutdown();
@@ -261,11 +278,14 @@ HybridTime XClusterPoller::GetSafeTime() const {
 
 void XClusterPoller::UpdateSafeTime(int64 new_time) {
   HybridTime new_hybrid_time(new_time);
-  if (!new_hybrid_time.is_special()) {
-    std::lock_guard l(safe_time_lock_);
-    if (producer_safe_time_.is_special() || new_hybrid_time > producer_safe_time_) {
-      producer_safe_time_ = new_hybrid_time;
-    }
+  if (new_hybrid_time.is_special()) {
+    LOG(WARNING) << "Received invalid xCluster safe time: " << new_hybrid_time;
+    return;
+  }
+
+  std::lock_guard l(safe_time_lock_);
+  if (producer_safe_time_.is_special() || new_hybrid_time > producer_safe_time_) {
+    producer_safe_time_ = new_hybrid_time;
   }
 }
 
@@ -403,6 +423,7 @@ void XClusterPoller::HandleGetChangesResponse(
       // In case of errors, try polling again with backoff
       poll_failures_ =
           std::min(poll_failures_ + 1, GetAtomicFlag(&FLAGS_replication_failure_delay_exponent));
+      xcluster_consumer_->IncrementPollFailureCount();
       return SchedulePoll();
     }
     // Recover slowly if we're congested.
@@ -415,11 +436,16 @@ void XClusterPoller::HandleGetChangesResponse(
 }
 
 Status XClusterPoller::ProcessGetChangesResponseError(const cdc::GetChangesResponsePB& resp) {
+  if (PREDICT_FALSE(FLAGS_TEST_xcluster_simulate_get_changes_response_error)) {
+    return STATUS(IllegalState, "Simulate get change failure for testing");
+  }
+
   if (!resp.has_error()) {
     SCHECK(
         resp.has_checkpoint(), NotFound, "XClusterPoller GetChanges failure: No checkpoint found");
     return Status::OK();
   }
+
   const auto& error_code = resp.error().code();
 
   LOG_WITH_PREFIX(WARNING) << "XClusterPoller GetChanges failure response: code=" << error_code
@@ -456,10 +482,11 @@ void XClusterPoller::ApplyChangesCallback(XClusterOutputClientResponse&& respons
   }
 
   ScheduleFunc(
-      BIND_FUNCTION_AND_ARGS(XClusterPoller::HandleApplyChangesResponse, std::move(response)));
+      BIND_FUNCTION_AND_ARGS(XClusterPoller::VerifyApplyChangesResponse, std::move(response)));
 }
 
-void XClusterPoller::HandleApplyChangesResponse(XClusterOutputClientResponse& response) {
+void XClusterPoller::VerifyApplyChangesResponse(XClusterOutputClientResponse response) {
+  // Verify if the ApplyChanges failed, in which case we need to reschedule it.
   if (!response.status.ok() ||
       RandomActWithProbability(FLAGS_TEST_xcluster_simulate_random_failure_after_apply)) {
     LOG_WITH_PREFIX(WARNING) << "ApplyChanges failure: " << response.status;
@@ -471,11 +498,32 @@ void XClusterPoller::HandleApplyChangesResponse(XClusterOutputClientResponse& re
     // Repeat the ApplyChanges step, with exponential backoff.
     apply_failures_ =
         std::min(apply_failures_ + 1, GetAtomicFlag(&FLAGS_replication_failure_delay_exponent));
+    xcluster_consumer_->IncrementApplyFailureCount();
     ScheduleApplyChanges(std::move(response.get_changes_response));
     return;
   }
 
+  HandleApplyChangesResponse(std::move(response));
+}
+
+void XClusterPoller::HandleApplyChangesResponse(XClusterOutputClientResponse response) {
   DCHECK(response.get_changes_response);
+
+  if (ddl_queue_handler_) {
+    ACQUIRE_MUTEX_IF_ONLINE_ELSE_RETURN;
+    auto s = ddl_queue_handler_->ProcessDDLQueueTable(response);
+    if (!s.ok()) {
+      // If processing ddl_queue table fails, then retry just this part (don't repeat ApplyChanges).
+      YB_LOG_EVERY_N(WARNING, 30) << "ProcessDDLQueueTable Error: " << s << " " << THROTTLE_MSG;
+      if (FLAGS_enable_xcluster_stat_collection) {
+        poll_stats_history_.SetError(std::move(s));
+      }
+      ScheduleFuncWithDelay(
+          GetAtomicFlag(&FLAGS_xcluster_safe_time_update_interval_secs),
+          BIND_FUNCTION_AND_ARGS(XClusterPoller::HandleApplyChangesResponse, std::move(response)));
+      return;
+    }
+  }
 
   if (FLAGS_enable_xcluster_stat_collection) {
     size_t resp_size = 0;

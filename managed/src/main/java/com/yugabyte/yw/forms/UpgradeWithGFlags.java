@@ -29,23 +29,30 @@ public class UpgradeWithGFlags extends UpgradeTaskParams {
   public Map<String, String> masterGFlags;
   public Map<String, String> tserverGFlags;
 
-  protected void verifyGFlags(Universe universe, boolean isFirstTry) {
+  protected boolean verifyGFlagsHasChanges(Universe universe) {
     if (isUsingSpecificGFlags(universe)) {
-      verifySpecificGFlags(universe, isFirstTry);
+      return verifySpecificGFlags(universe);
     } else {
-      verifyGFlagsOld(universe, isFirstTry);
+      return verifyGFlagsOld(universe);
     }
   }
 
-  protected void verifySpecificGFlags(Universe universe, boolean isFirstTry) {
+  /**
+   * Verifies that specific gflags were changed for universe.
+   *
+   * @param universe
+   * @return true if changed
+   */
+  private boolean verifySpecificGFlags(Universe universe) {
     Map<UUID, Cluster> newClusters =
         clusters.stream().collect(Collectors.toMap(c -> c.uuid, c -> c));
     boolean hasClustersToUpdate = false;
     for (Cluster curCluster : universe.getUniverseDetails().clusters) {
       Cluster newCluster = newClusters.get(curCluster.uuid);
       if (newCluster == null
-          || Objects.equals(
-              newCluster.userIntent.specificGFlags, curCluster.userIntent.specificGFlags)) {
+          || (Objects.equals(
+                  newCluster.userIntent.specificGFlags, curCluster.userIntent.specificGFlags)
+              && !skipMatchWithUserIntent)) {
         continue;
       }
       if (newCluster.clusterType == ClusterType.PRIMARY) {
@@ -81,21 +88,15 @@ public class UpgradeWithGFlags extends UpgradeTaskParams {
         }
       }
     }
-    if (isFirstTry && !hasClustersToUpdate) {
-      throw new PlatformServiceException(Http.Status.BAD_REQUEST, SPECIFIC_GFLAGS_NO_CHANGES_ERROR);
-    }
+    return hasClustersToUpdate;
   }
 
-  protected void verifyGFlagsOld(Universe universe, boolean isFirstTry) {
+  private boolean verifyGFlagsOld(Universe universe) {
     UserIntent userIntent = universe.getUniverseDetails().getPrimaryCluster().userIntent;
-    if (masterGFlags.equals(userIntent.masterGFlags)
+    if (!skipMatchWithUserIntent
+        && masterGFlags.equals(userIntent.masterGFlags)
         && tserverGFlags.equals(userIntent.tserverGFlags)) {
-      if (masterGFlags.isEmpty() && tserverGFlags.isEmpty()) {
-        throw new PlatformServiceException(Http.Status.BAD_REQUEST, "gflags param is required.");
-      }
-      if (isFirstTry) {
-        throw new PlatformServiceException(Http.Status.BAD_REQUEST, "No gflags to change.");
-      }
+      return false;
     }
     boolean gFlagsDeleted =
         (!GFlagsUtil.getDeletedGFlags(userIntent.masterGFlags, masterGFlags).isEmpty())
@@ -105,6 +106,7 @@ public class UpgradeWithGFlags extends UpgradeTaskParams {
           Http.Status.BAD_REQUEST, "Cannot delete gFlags through non-restart upgrade option.");
     }
     GFlagsUtil.checkConsistency(masterGFlags, tserverGFlags);
+    return true;
   }
 
   /**

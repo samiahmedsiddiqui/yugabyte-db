@@ -26,10 +26,11 @@
 
 #include "yb_ash.h"
 
+#include "access/hash.h"
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "miscadmin.h"
-#include "parser/analyze.h"
+#include "parser/scansup.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
@@ -39,6 +40,7 @@
 #include "storage/shmem.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 #include "utils/uuid.h"
@@ -48,14 +50,27 @@
 #include "yb/yql/pggate/ybc_pggate.h"
 #include "yb/yql/pggate/util/ybc_util.h"
 
+/* The number of columns in different versions of the view */
+#define ACTIVE_SESSION_HISTORY_COLS_V1 12
+#define ACTIVE_SESSION_HISTORY_COLS_V2 13
+#define ACTIVE_SESSION_HISTORY_COLS_V3 14
+
+#define MAX_NESTED_QUERY_LEVEL 64
+
+#define set_query_id() (nested_level == 0 || \
+	(yb_ash_track_nested_queries != NULL && yb_ash_track_nested_queries()))
+
 /* GUC variables */
+bool yb_ash_enable_infra;
+bool yb_enable_ash;
 int yb_ash_circular_buffer_size;
 int yb_ash_sampling_interval_ms;
 int yb_ash_sample_size;
 
 /* Saved hook values in case of unload */
-static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
@@ -63,63 +78,44 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sighup = false;
 
-/* Struct to store ASH samples in the circular buffer. */
-typedef struct YbAshSample {
-	/*
-	 * Metadata of the sample.
-	 * yql_endpoint_tserver_uuid and rpc_request_id are also part of the metadata,
-	 * but the reason to not store them inside YBCAshMetadata is that these remain
-	 * constant in PG for all the samples of a particular node. So we don't store it
-	 * in YBCAshMetadata, which is stored in the procarray to save shared memory.
-	 */
-	YBCAshMetadata metadata;
-
-	/*
-	 * UUID of the TServer where the query generated.
-	 * This remains constant for PG samples on a node, but can differ for TServer
-	 * samples as TServer can be processing requests from other nodes.
-	 */
-	unsigned char yql_endpoint_tserver_uuid[16];
-
-	/*
-	 * A single query can generate multiple RPCs, this is used to differentiate
-	 * those RPCs. This will always be 0 for PG samples
-	 */
-	int64_t rpc_request_id;
-
-	/* Auxiliary information about the sample. */
-	char aux_info[16];
-
-	/* 32-bit wait event code of the sample. */
-	uint32_t wait_event_code;
-
-	/*
-	 * If a certain number of samples are available and we capture a portion of
-	 * them, the sample weight is the reciprocal of the captured portion or 1,
-	 * whichever is maximum.
-	 */
-	double sample_weight;
-
-	/* Timestamp when the sample was captured. */
-	TimestampTz sample_time;
-} YbAshSample;
+YbAshTrackNestedQueries yb_ash_track_nested_queries = NULL;
 
 typedef struct YbAsh
 {
 	LWLock		lock;			/* Protects the circular buffer */
 	int			index;			/* Index to insert new buffer entry */
 	int			max_entries;	/* Maximum # of entries in the buffer */
-	YbAshSample circular_buffer[FLEXIBLE_ARRAY_MEMBER];
+	YBCAshSample circular_buffer[FLEXIBLE_ARRAY_MEMBER];
 } YbAsh;
 
+typedef struct YbAshNestedQueryIdStack
+{
+	int			top_index;		/* top index of the stack, -1 for empty stack */
+	/* number of query ids not pushed due to the stack size being full */
+	int			num_query_ids_not_pushed;
+	uint64		query_ids[MAX_NESTED_QUERY_LEVEL];
+} YbAshNestedQueryIdStack;
+
 static YbAsh *yb_ash = NULL;
+static YbAshNestedQueryIdStack query_id_stack;
+static int nested_level = 0;
 
+static void YbAshInstallHooks(void);
 static int yb_ash_cb_max_entries(void);
-static void yb_set_ash_metadata(uint64_t query_id);
-static void yb_unset_ash_metadata();
+static void YbAshSetQueryId(uint64 query_id);
+static void YbAshResetQueryId(void);
+static uint64 yb_ash_utility_query_id(const char *query, int query_len,
+									  int query_location);
+static void YbAshAcquireBufferLock(bool exclusive);
+static void YbAshReleaseBufferLock();
+static bool YbAshNestedQueryIdStackPush(uint64 query_id);
+static uint64 YbAshNestedQueryIdStackPop(void);
 
-static void yb_ash_post_parse_analyze(ParseState *pstate, Query *query);
 static void yb_ash_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void yb_ash_ExecutorRun(QueryDesc *queryDesc,
+							   ScanDirection direction,
+							   uint64 count, bool execute_once);
+static void yb_ash_ExecutorFinish(QueryDesc *queryDesc);
 static void yb_ash_ExecutorEnd(QueryDesc *queryDesc);
 static void yb_ash_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 								  ProcessUtilityContext context, ParamListInfo params,
@@ -129,10 +125,23 @@ static void yb_ash_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 static const unsigned char *get_yql_endpoint_tserver_uuid();
 static void copy_pgproc_sample_fields(PGPROC *proc);
 static void copy_non_pgproc_sample_fields(float8 sample_weight, TimestampTz sample_time);
+static void YbAshIncrementCircularBufferIndex(void);
+static YBCAshSample *YbAshGetNextCircularBufferSlot(void);
 
 static void uchar_to_uuid(unsigned char *in, pg_uuid_t *out);
 static void client_ip_to_string(unsigned char *client_addr, uint16 client_port,
 								uint8_t addr_family, char *client_ip);
+
+bool
+yb_enable_ash_check_hook(bool *newval, void **extra, GucSource source)
+{
+	if (*newval && !yb_ash_enable_infra)
+	{
+		GUC_check_errdetail("ysql_yb_ash_enable_infra must be enabled.");
+		return false;
+	}
+	return true;
+}
 
 void
 YbAshRegister(void)
@@ -153,16 +162,27 @@ YbAshRegister(void)
 }
 
 void
+YbAshInit(void)
+{
+	YbAshInstallHooks();
+	query_id_stack.top_index = -1;
+	query_id_stack.num_query_ids_not_pushed = 0;
+}
+
+void
 YbAshInstallHooks(void)
 {
-	prev_post_parse_analyze_hook = post_parse_analyze_hook;
-	post_parse_analyze_hook = yb_ash_post_parse_analyze;
-
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = yb_ash_ExecutorStart;
 
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = yb_ash_ExecutorRun;
+
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = yb_ash_ExecutorEnd;
+
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = yb_ash_ExecutorFinish;
 
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = yb_ash_ProcessUtility;
@@ -176,10 +196,55 @@ YbAshSetSessionId(uint64 session_id)
 	LWLockRelease(&MyProc->yb_ash_metadata_lock);
 }
 
+void
+YbAshSetDatabaseId(Oid database_id)
+{
+	LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
+	MyProc->yb_ash_metadata.database_id = database_id;
+	LWLockRelease(&MyProc->yb_ash_metadata_lock);
+}
+
 static int
 yb_ash_cb_max_entries(void)
 {
-	return yb_ash_circular_buffer_size * 1024 / sizeof(YbAshSample);
+	return yb_ash_circular_buffer_size * 1024 / sizeof(YBCAshSample);
+}
+
+/*
+ * Push a query id to the stack. In case the stack is full, we increment
+ * a counter to maintain the number of query ids which were supposed to be
+ * pushed but couldn't be pushed. So that later, when we are supposed to pop
+ * from the stack, we know how many no-op pop operations we have to perform.
+ */
+static bool
+YbAshNestedQueryIdStackPush(uint64 query_id)
+{
+	if (query_id_stack.top_index < MAX_NESTED_QUERY_LEVEL)
+	{
+		query_id_stack.query_ids[++query_id_stack.top_index] = query_id;
+		return true;
+	}
+
+	ereport(LOG,
+			(errmsg("ASH stack for nested query ids is full")));
+	++query_id_stack.num_query_ids_not_pushed;
+	return false;
+}
+
+/*
+ * Pop a query id from the stack
+ */
+static uint64
+YbAshNestedQueryIdStackPop(void)
+{
+	if (query_id_stack.num_query_ids_not_pushed > 0)
+	{
+		--query_id_stack.num_query_ids_not_pushed;
+		return 0;
+	}
+
+	Assert(query_id_stack.top_index >= 0);
+	return query_id_stack.query_ids[query_id_stack.top_index--];
 }
 
 /*
@@ -193,7 +258,7 @@ YbAshShmemSize(void)
 
 	size = offsetof(YbAsh, circular_buffer);
 	size = add_size(size, mul_size(yb_ash_cb_max_entries(),
-								   sizeof(YbAshSample)));
+								   sizeof(YBCAshSample)));
 
 	return size;
 }
@@ -218,49 +283,111 @@ YbAshShmemInit(void)
 		LWLockInitialize(&yb_ash->lock, LWTRANCHE_YB_ASH_CIRCULAR_BUFFER);
 		yb_ash->index = 0;
 		yb_ash->max_entries = yb_ash_cb_max_entries();
-		MemSet(yb_ash->circular_buffer, 0, yb_ash->max_entries * sizeof(YbAshSample));
+		MemSet(yb_ash->circular_buffer, 0, yb_ash->max_entries * sizeof(YBCAshSample));
 	}
-}
-
-static void
-yb_ash_post_parse_analyze(ParseState *pstate, Query *query)
-{
-	if (prev_post_parse_analyze_hook)
-		prev_post_parse_analyze_hook(pstate, query);
-
-	/* query_id will be set to zero if pg_stat_statements is disabled. */
-	yb_set_ash_metadata(query->queryId);
 }
 
 static void
 yb_ash_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	/*
-	 * In case of prepared statements, the 'Parse' phase might be skipped.
-	 * We set the ASH metadata here if it's not been set yet.
-	 */
-	if (MyProc->yb_is_ash_metadata_set == false)
-		yb_set_ash_metadata(queryDesc->plannedstmt->queryId);
+	if (yb_enable_ash)
+	{
+		/* Query id can be zero here only if pg_stat_statements is disabled */
+		uint64 query_id = queryDesc->plannedstmt->queryId != 0
+						  ? queryDesc->plannedstmt->queryId
+						  : yb_ash_utility_query_id(queryDesc->sourceText,
+					   								queryDesc->plannedstmt->stmt_len,
+													queryDesc->plannedstmt->stmt_location);
+		YbAshSetQueryId(query_id);
+	}
 
-	if (prev_ExecutorStart)
-		prev_ExecutorStart(queryDesc, eflags);
-	else
-		standard_ExecutorStart(queryDesc, eflags);
+	PG_TRY();
+	{
+		if (prev_ExecutorStart)
+			prev_ExecutorStart(queryDesc, eflags);
+		else
+			standard_ExecutorStart(queryDesc, eflags);
+	}
+	PG_CATCH();
+	{
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+static void
+yb_ash_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
+				   bool execute_once)
+{
+	++nested_level;
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+		else
+			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+		--nested_level;
+	}
+	PG_CATCH();
+	{
+		--nested_level;
+
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+static void
+yb_ash_ExecutorFinish(QueryDesc *queryDesc)
+{
+	++nested_level;
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+		--nested_level;
+	}
+	PG_CATCH();
+	{
+		--nested_level;
+
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static void
 yb_ash_ExecutorEnd(QueryDesc *queryDesc)
 {
-	if (prev_ExecutorEnd)
-		prev_ExecutorEnd(queryDesc);
-	else
-		standard_ExecutorEnd(queryDesc);
+	PG_TRY();
+	{
+		if (prev_ExecutorEnd)
+			prev_ExecutorEnd(queryDesc);
+		else
+			standard_ExecutorEnd(queryDesc);
 
-	/*
-	 * Unset ASH metadata. Utility statements do not go through this
-	 * code path.
-	 */
-	yb_unset_ash_metadata();
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+	}
+	PG_CATCH();
+	{
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -269,47 +396,174 @@ yb_ash_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					  QueryEnvironment *queryEnv, DestReceiver *dest,
 					  char *completionTag)
 {
-	if (prev_ProcessUtility)
-		prev_ProcessUtility(pstmt, queryString,
-							context, params, queryEnv,
-							dest, completionTag);
-	else
-		standard_ProcessUtility(pstmt, queryString,
+	if (yb_enable_ash)
+	{
+		uint64 query_id = pstmt->queryId != 0
+						  ? pstmt->queryId
+						  : yb_ash_utility_query_id(queryString,
+					   								pstmt->stmt_len,
+													pstmt->stmt_location);
+		YbAshSetQueryId(query_id);
+	}
+
+	++nested_level;
+	PG_TRY();
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString,
 								context, params, queryEnv,
 								dest, completionTag);
+		else
+			standard_ProcessUtility(pstmt, queryString,
+									context, params, queryEnv,
+									dest, completionTag);
+		--nested_level;
 
-	/*
-	 * Unset ASH metadata in case of utility statements. This function
-	 * might recurse, and we only want to unset in the last step.
-	 */
-	if (YBGetDdlNestingLevel() == 0)
-		yb_unset_ash_metadata();
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+	}
+	PG_CATCH();
+	{
+		--nested_level;
+
+		if (yb_enable_ash)
+			YbAshResetQueryId();
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static void
-yb_set_ash_metadata(uint64_t query_id)
+YbAshSetQueryId(uint64 query_id)
 {
-	LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
+	if (set_query_id())
+	{
+		if (YbAshNestedQueryIdStackPush(MyProc->yb_ash_metadata.query_id))
+		{
+			LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
+			MyProc->yb_ash_metadata.query_id = query_id;
+			LWLockRelease(&MyProc->yb_ash_metadata_lock);
+		}
+	}
+}
 
-	MyProc->yb_ash_metadata.query_id = query_id;
+static void
+YbAshResetQueryId(void)
+{
+	if (set_query_id())
+	{
+		uint64 prev_query_id = YbAshNestedQueryIdStackPop();
+		if (prev_query_id != 0)
+		{
+			LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
+			MyProc->yb_ash_metadata.query_id = prev_query_id;
+			LWLockRelease(&MyProc->yb_ash_metadata_lock);
+		}
+	}
+}
+
+void
+YbAshSetMetadata(void)
+{
+	/* The stack must be empty at the start of a request */
+	Assert(query_id_stack.top_index == -1);
+
+	LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
 	YBCGenerateAshRootRequestId(MyProc->yb_ash_metadata.root_request_id);
-	MyProc->yb_is_ash_metadata_set = true;
-
 	LWLockRelease(&MyProc->yb_ash_metadata_lock);
 }
 
-static void
-yb_unset_ash_metadata()
+void
+YbAshUnsetMetadata(void)
 {
+	/*
+	 * Some queryids may not be popped from the stack if YbAshResetQueryId
+	 * returns an error. Reset the stack here. We can remove this if we
+	 * make query_id atomic
+	 */
+	query_id_stack.top_index = -1;
+	query_id_stack.num_query_ids_not_pushed = 0;
+
 	LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
+	MemSet(MyProc->yb_ash_metadata.root_request_id, 0,
+		sizeof(MyProc->yb_ash_metadata.root_request_id));
+	LWLockRelease(&MyProc->yb_ash_metadata_lock);
+}
+
+/*
+ * Calculate the query id for utility statements. This takes parts of pgss_store
+ * from pg_stat_statements.
+ */
+static uint64
+yb_ash_utility_query_id(const char *query, int query_len, int query_location)
+{
+	const char *redacted_query;
+	int			redacted_query_len;
+
+	Assert(query != NULL);
+
+	if (query_location >= 0)
+	{
+		Assert(query_location <= strlen(query));
+		query += query_location;
+		/* Length of 0 (or -1) means "rest of string" */
+		if (query_len <= 0)
+			query_len = strlen(query);
+		else
+			Assert(query_len <= strlen(query));
+	}
+	else
+	{
+		/* If query location is unknown, distrust query_len as well */
+		query_location = 0;
+		query_len = strlen(query);
+	}
 
 	/*
-	 * when yb_is_ash_metadata_set is set to false, it ensures that we
-	 * won't read the ASH metadata. So it's fine to not null out the values.
+	 * Discard leading and trailing whitespace, too.  Use scanner_isspace()
+	 * not libc's isspace(), because we want to match the lexer's behavior.
 	 */
-	MyProc->yb_is_ash_metadata_set = false;
+	while (query_len > 0 && scanner_isspace(query[0]))
+		query++, query_location++, query_len--;
+	while (query_len > 0 && scanner_isspace(query[query_len - 1]))
+		query_len--;
 
-	LWLockRelease(&MyProc->yb_ash_metadata_lock);
+	/* Use the redacted query for checking purposes. */
+	YbGetRedactedQueryString(query, query_len, &redacted_query, &redacted_query_len);
+
+	return DatumGetUInt64(hash_any_extended((const unsigned char *) redacted_query,
+											redacted_query_len, 0));
+}
+
+/*
+ * Events such as ClientRead can take up a lot of space in the circular buffer
+ * if there is an idle session. We don't want to include such wait events.
+ * This list may increase in the future.
+ */
+bool
+YbAshShouldIgnoreWaitEvent(uint32 wait_event_info)
+{
+	switch (wait_event_info)
+	{
+		case WAIT_EVENT_CLIENT_READ:
+			return true;
+		default:
+			return false;
+	}
+	return false;
+}
+
+static void
+YbAshAcquireBufferLock(bool exclusive)
+{
+	LWLockAcquire(&yb_ash->lock, exclusive ? LW_EXCLUSIVE : LW_SHARED);
+}
+
+static void
+YbAshReleaseBufferLock()
+{
+	LWLockRelease(&yb_ash->lock);
 }
 
 static void
@@ -375,14 +629,21 @@ YbAshMain(Datum main_arg)
 					(errmsg("bgworker yb_ash signal: processed SIGHUP")));
 		}
 
-		sample_time = GetCurrentTimestamp();
-
-		if (yb_ash_sample_size > 0)
+		if (yb_enable_ash && yb_ash_sample_size > 0)
 		{
-			LWLockAcquire(&yb_ash->lock, LW_EXCLUSIVE);
-			YbStoreAshSamples(sample_time);
-			/* TODO: get tserver samples */
-			LWLockRelease(&yb_ash->lock);
+			sample_time = GetCurrentTimestamp();
+
+			/*
+			 * The circular buffer lock is acquired in exclusive mode inside
+			 * YBCStoreTServerAshSamples after getting the ASH samples from
+			 * tserver and just before copying it into the buffer. The lock
+			 * is released after we copy the PG samples.
+			 */
+			YBCStoreTServerAshSamples(&YbAshAcquireBufferLock,
+									  &YbAshGetNextCircularBufferSlot,
+									  sample_time);
+			YbStorePgAshSamples(sample_time);
+			YbAshReleaseBufferLock();
 		}
 	}
 	proc_exit(0);
@@ -395,6 +656,16 @@ get_yql_endpoint_tserver_uuid()
 	if (!local_tserver_uuid && IsYugaByteEnabled())
 		local_tserver_uuid = YBCGetLocalTserverUuid();
 	return local_tserver_uuid;
+}
+
+/*
+ * Increments the index to insert in the circular buffer.
+ */
+static void
+YbAshIncrementCircularBufferIndex(void)
+{
+	if (++yb_ash->index == yb_ash->max_entries)
+		yb_ash->index = 0;
 }
 
 /*
@@ -413,8 +684,7 @@ YbAshStoreSample(PGPROC *proc, int num_procs, TimestampTz sample_time,
 	copy_pgproc_sample_fields(proc);
 	copy_non_pgproc_sample_fields(sample_weight, sample_time);
 
-	if (++yb_ash->index == yb_ash->max_entries)
-		yb_ash->index = 0;
+	YbAshIncrementCircularBufferIndex();
 
 	if (++(*samples_stored) == yb_ash_sample_size)
 		return false;
@@ -425,20 +695,19 @@ YbAshStoreSample(PGPROC *proc, int num_procs, TimestampTz sample_time,
 static void
 copy_pgproc_sample_fields(PGPROC *proc)
 {
-	YbAshSample *cb_sample = &yb_ash->circular_buffer[yb_ash->index];
+	YBCAshSample *cb_sample = &yb_ash->circular_buffer[yb_ash->index];
 
-	/* TODO: Add aux info to circular buffer once it's available */
 	LWLockAcquire(&proc->yb_ash_metadata_lock, LW_SHARED);
 	memcpy(&cb_sample->metadata, &proc->yb_ash_metadata, sizeof(YBCAshMetadata));
 	LWLockRelease(&proc->yb_ash_metadata_lock);
 
-	cb_sample->wait_event_code = proc->wait_event_info;
+	cb_sample->encoded_wait_event_code = proc->wait_event_info;
 }
 
 static void
 copy_non_pgproc_sample_fields(float8 sample_weight, TimestampTz sample_time)
 {
-	YbAshSample *cb_sample = &yb_ash->circular_buffer[yb_ash->index];
+	YBCAshSample *cb_sample = &yb_ash->circular_buffer[yb_ash->index];
 
 	/* yql_endpoint_tserver_uuid is constant for all PG samples */
 	if (get_yql_endpoint_tserver_uuid())
@@ -448,8 +717,22 @@ copy_non_pgproc_sample_fields(float8 sample_weight, TimestampTz sample_time)
 
 	/* rpc_request_id is 0 for PG samples */
 	cb_sample->rpc_request_id = 0;
+	/* TODO(asaha): Add aux info to circular buffer once it's available */
+	cb_sample->aux_info[0] = '\0';
 	cb_sample->sample_weight = sample_weight;
 	cb_sample->sample_time = sample_time;
+}
+
+/*
+ * Returns a pointer to the circular buffer slot where the sample should be
+ * inserted and increments the index.
+ */
+static YBCAshSample *
+YbAshGetNextCircularBufferSlot(void)
+{
+	YBCAshSample *slot = &yb_ash->circular_buffer[yb_ash->index];
+	YbAshIncrementCircularBufferIndex();
+	return slot;
 }
 
 Datum
@@ -461,13 +744,16 @@ yb_active_session_history(PG_FUNCTION_ARGS)
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 	int			i;
-#define ACTIVE_SESSION_HISTORY_COLS 12
+	static int  ncols = 0;
+
+	if (ncols < ACTIVE_SESSION_HISTORY_COLS_V3)
+		ncols = YbGetNumberOfFunctionOutputColumns(F_YB_ACTIVE_SESSION_HISTORY);
 
 	/* ASH must be loaded first */
 	if (!yb_ash)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("TEST_yb_enable_ash gflag must be enabled")));
+				 errmsg("ysql_yb_ash_enable_infra gflag must be enabled")));
 
 	/* check to see if caller supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -497,12 +783,12 @@ yb_active_session_history(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcontext);
 
-	LWLockAcquire(&yb_ash->lock, LW_SHARED);
+	YbAshAcquireBufferLock(false /* exclusive */);
 
 	for (i = 0; i < yb_ash->max_entries; ++i)
 	{
-		Datum		values[ACTIVE_SESSION_HISTORY_COLS];
-		bool		nulls[ACTIVE_SESSION_HISTORY_COLS];
+		Datum		values[ncols];
+		bool		nulls[ncols];
 		int			j = 0;
 		pg_uuid_t	root_request_id;
 		pg_uuid_t	yql_endpoint_tserver_uuid;
@@ -512,7 +798,7 @@ yb_active_session_history(PG_FUNCTION_ARGS)
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
 
-		YbAshSample *sample = &yb_ash->circular_buffer[i];
+		YBCAshSample *sample = &yb_ash->circular_buffer[i];
 		YBCAshMetadata *metadata = &sample->metadata;
 
 		if (sample->sample_time != 0)
@@ -528,9 +814,12 @@ yb_active_session_history(PG_FUNCTION_ARGS)
 		else
 			nulls[j++] = true;
 
-		values[j++] = CStringGetTextDatum(YBCGetWaitEventComponent(sample->wait_event_code));
-		values[j++] = CStringGetTextDatum(pgstat_get_wait_event_type(sample->wait_event_code));
-		values[j++] = CStringGetTextDatum(pgstat_get_wait_event(sample->wait_event_code));
+		values[j++] = CStringGetTextDatum(
+			YBCGetWaitEventComponent(sample->encoded_wait_event_code));
+		values[j++] = CStringGetTextDatum(
+			YBCGetWaitEventClass(sample->encoded_wait_event_code));
+		values[j++] = CStringGetTextDatum(
+			pgstat_get_wait_event(sample->encoded_wait_event_code));
 
 		uchar_to_uuid(sample->yql_endpoint_tserver_uuid, &yql_endpoint_tserver_uuid);
 		values[j++] = UUIDPGetDatum(&yql_endpoint_tserver_uuid);
@@ -546,7 +835,11 @@ yb_active_session_history(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			Assert(metadata->addr_family == AF_UNIX);
+			/*
+			 * internal operations such as flushes and compactions are not tied to any client
+			 * and they might have the addr_family as AF_UNSPEC
+			 */
+			Assert(metadata->addr_family == AF_UNIX || metadata->addr_family == AF_UNSPEC);
 			nulls[j++] = true;
 		}
 
@@ -557,12 +850,17 @@ yb_active_session_history(PG_FUNCTION_ARGS)
 
 		values[j++] = Float4GetDatum(sample->sample_weight);
 
+		if (ncols >= ACTIVE_SESSION_HISTORY_COLS_V2)
+			values[j++] = CStringGetTextDatum(
+				pgstat_get_wait_event_type(sample->encoded_wait_event_code));
+
+		if (ncols >= ACTIVE_SESSION_HISTORY_COLS_V3)
+			values[j++] = ObjectIdGetDatum(metadata->database_id);
+
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
-	LWLockRelease(&yb_ash->lock);
-
-#undef ACTIVE_SESSION_HISTORY_COLS
+	YbAshReleaseBufferLock();
 
 	/* clean up and return the tuplestore */
 	tuplestore_donestoring(tupstore);

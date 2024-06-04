@@ -1,156 +1,111 @@
 import { useState } from 'react';
+import { useQuery } from 'react-query';
 import { Box, makeStyles } from '@material-ui/core';
-import { DiagnosticBox } from './DiagnosticBox';
+import clsx from 'clsx';
+import { YBErrorIndicator, isNonEmptyArray } from '@yugabytedb/ui-components';
+import { PrimaryDashboardData } from './PrimaryDashboardData';
+import { TroubleshootAPI, QUERY_KEY } from '../api';
+import { Anomaly, AppName } from '../helpers/dtos';
 
-const MOCK_DATA = [
-  {
-    data: {
-      entityType: 'NODE',
-      isStale: false,
-      new: false,
-      observation:
-        'Node yb-admin-test-master-placement-n2 processed 39410.69% more queries than average of other 2 nodes',
-      recommendationPriority: 'MEDIUM',
-      recommendationState: 'OPEN',
-      recommendationInfo: {
-        node_with_highest_query_load_details: {
-          DeleteStmt: 24,
-          InsertStmt: 15685,
-          SelectStmt: 15702,
-          UpdateStmt: 0
-        },
-        other_nodes_average_query_load_details: {
-          DeleteStmt: 24,
-          InsertStmt: 24,
-          SelectStmt: 31.5,
-          UpdateStmt: 0
-        }
-      },
-      recommendationTimestamp: 1702047631.751105,
-      suggestion: 'Redistribute queries to other nodes in the cluster.',
-      target: 'yb-admin-test-master-placement-n2',
-      type: 'NODE_ISSUE'
-    },
-    key: 'NODE_ISSUE-yb-admin-test-master-placement-n2-08cbf046a0505',
-    uuid: '6e2f-779e'
-  },
-  {
-    data: {
-      entityType: 'NODE',
-      isStale: false,
-      new: false,
-      observation:
-        'Node yb-admin-test-master-placement-n1 processed 3008.71% more queries than average of other 2 nodes',
-      recommendationPriority: 'MEDIUM',
-      recommendationState: 'OPEN',
-      recommendationInfo: {
-        node_with_highest_query_load_details: {
-          DeleteStmt: 11000,
-          InsertStmt: 9020,
-          SelectStmt: 37,
-          UpdateStmt: 0
-        },
-        other_nodes_average_query_load_details: {
-          DeleteStmt: 150,
-          InsertStmt: 21,
-          SelectStmt: 31.5,
-          UpdateStmt: 0
-        }
-      },
-      recommendationTimestamp: 1702047631.751105,
-      suggestion: 'Redistribute queries to other nodes in the cluster.',
-      target: 'yb-admin-test-master-placement-n1',
-      type: 'NODE_ISSUE'
-    },
-    key: 'NODE_ISSUE-yb-admin-test-master-placement-n1-08cbf046a0505',
-    uuid: '6e9l-30dw'
-  },
-  {
-    data: {
-      entityType: 'NODE',
-      isStale: false,
-      new: false,
-      observation:
-        'Node yb-admin-test-master-placement-n3 processed 1055.26% more queries than average of other 2 nodes',
-      recommendationPriority: 'MEDIUM',
-      recommendationState: 'OPEN',
-      recommendationInfo: {
-        node_with_highest_query_load_details: {
-          DeleteStmt: 24,
-          InsertStmt: 6300,
-          SelectStmt: 4075,
-          UpdateStmt: 0
-        },
-        other_nodes_average_query_load_details: {
-          DeleteStmt: 24,
-          InsertStmt: 24,
-          SelectStmt: 31.5,
-          UpdateStmt: 0
-        }
-      },
-      recommendationTimestamp: 1702047631.751105,
-      suggestion: 'Redistribute queries to other nodes in the cluster.',
-      target: 'yb-admin-test-master-placement-n3',
-      type: 'NODE_ISSUE'
-    },
-    key: 'NODE_ISSUE-yb-admin-test-master-placement-n3-08cbf046a0505',
-    uuid: '11k3-56qq'
-  }
-];
+import { ReactComponent as LoadingIcon } from '../assets/loading.svg';
+import { useHelperStyles } from './styles';
 
 interface TroubleshootAdvisorProps {
-  universeUUID?: string;
-  clusterUUID?: string;
-  data: any;
+  universeUuid: string;
+  appName: AppName;
+  timezone?: string;
+  hostUrl?: string;
+  onSelectedIssue?: (troubleshootUuid: string) => void;
 }
 
 const useStyles = makeStyles((theme) => ({
-  troubleshootAdvisorBox: {
-    marginRight: theme.spacing(1)
+  inProgressIcon: {
+    color: '#1A44A5'
+  },
+  icon: {
+    height: '40px',
+    width: '40px'
+  },
+  loadingBox: {
+    position: 'fixed',
+    left: '50%',
+    top: '50%',
+    width: '100%',
+    height: '100%'
   }
 }));
 
-interface TroubleshootDetailProps {
-  data: any;
-  key: string;
-  isResolved?: boolean;
-}
-
 export const TroubleshootAdvisor = ({
-  data,
-  universeUUID,
-  clusterUUID
+  universeUuid,
+  appName,
+  timezone,
+  hostUrl,
+  onSelectedIssue
 }: TroubleshootAdvisorProps) => {
+  const helperClasses = useHelperStyles();
   const classes = useStyles();
-  const [displayedRecomendations, setDisplayedRecommendations] = useState<
-    TroubleshootDetailProps[]
-  >(MOCK_DATA);
 
-  const handleResolve = (id: string, isResolved: boolean) => {
-    const copyRecommendations: any = [...MOCK_DATA];
-    const userSelectedRecommendation = copyRecommendations.find((rec: any) => rec.key === id);
-    if (userSelectedRecommendation) {
-      userSelectedRecommendation.isResolved = isResolved;
+  const [anomalyList, setAnomalyList] = useState<Anomaly[] | null>(null);
+  const [startDateTime, setDateStartTime] = useState<Date | null>(null);
+  const [endDateTime, setDateEndTime] = useState<Date | null>(null);
+
+  const { isLoading, isError, isIdle, refetch: anomaliesRefetch } = useQuery(
+    [QUERY_KEY.fetchAnamolies, universeUuid],
+    () => TroubleshootAPI.fetchAnamolies(universeUuid, startDateTime, endDateTime, hostUrl),
+    {
+      enabled: anomalyList === null,
+      onSuccess: (data: Anomaly[]) => {
+        setAnomalyList(data);
+      },
+      onError: (error: any) => {
+        console.error('Failed to fetch anomalies', error);
+      }
     }
-    setDisplayedRecommendations(copyRecommendations);
+  );
+
+  const onFilterByDate = async (startDate: any, endDate: any) => {
+    setDateEndTime(endDate);
+    setDateStartTime(startDate);
+    // TODO: Pass startDate and endDate to anomlay API once backend is ready
+    await anomaliesRefetch();
   };
 
+  if (isLoading) {
+    return (
+      <Box className={classes.loadingBox}>
+        <LoadingIcon className={clsx(classes.icon, classes.inProgressIcon)} />
+      </Box>
+    );
+  }
+  if (isError || (isIdle && anomalyList === null)) {
+    return (
+      <Box className={helperClasses.recommendation}>
+        <YBErrorIndicator
+          customErrorMessage={'Failed to fetch anomalies list, please try again.'}
+        />
+      </Box>
+    );
+  }
   return (
-    // This dialog is shown is when the last run API fails with 404
-    <Box className={classes.troubleshootAdvisorBox}>
-      {displayedRecomendations.map((rec: any) => (
-        <>
-          <DiagnosticBox
-            key={rec.key}
-            idKey={rec.key}
-            uuid={rec.uuid}
-            type={rec.data.type}
-            data={rec.data}
-            resolved={!!rec.isResolved}
-            onResolve={handleResolve}
-          />
-        </>
-      ))}
+    <Box sx={{ width: '100%' }}>
+      <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
+        <Box m={2}>
+          {isNonEmptyArray(anomalyList) ? (
+            <PrimaryDashboardData
+              anomalyData={anomalyList}
+              appName={appName}
+              timezone={timezone}
+              universeUuid={universeUuid}
+              onFilterByDate={onFilterByDate}
+              onSelectedIssue={onSelectedIssue}
+            />
+          ) : (
+            <Box className={helperClasses.recommendation}>
+              <span>{'There are no issues with the current universe'}</span>
+            </Box>
+          )}
+        </Box>
+      </Box>
     </Box>
   );
 };

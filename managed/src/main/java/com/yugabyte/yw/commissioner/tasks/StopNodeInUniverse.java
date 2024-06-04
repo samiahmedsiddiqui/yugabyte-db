@@ -67,16 +67,23 @@ public class StopNodeInUniverse extends UniverseDefinitionTaskBase {
   @Override
   protected void createPrecheckTasks(Universe universe) {
     NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " found in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
     if (currentNode.isTserver) {
       createNodePrecheckTasks(
           currentNode,
-          EnumSet.of(ServerType.TSERVER),
+          currentNode.getAllProcesses(),
           SubTaskGroupType.StoppingNodeProcesses,
+          false,
           null);
+    } else {
+      createCheckNodesAreSafeToTakeDownTask(
+          Collections.singletonList(currentNode), Collections.emptyList(), null);
     }
-    if (isFirstTry()) {
-      verifyClustersConsistency();
-    }
+    addBasicPrecheckTasks();
   }
 
   private void freezeUniverseInTxn(Universe universe) {
@@ -127,8 +134,8 @@ public class StopNodeInUniverse extends UniverseDefinitionTaskBase {
           stopProcessesOnNode(
               currentNode,
               EnumSet.of(ServerType.TSERVER),
-              true,
-              false,
+              false /* remove master from quorum */,
+              true /* deconfigure */,
               SubTaskGroupType.StoppingNodeProcesses);
           // Remove leader blacklist.
           removeFromLeaderBlackListIfAvailable(nodeList, SubTaskGroupType.StoppingNodeProcesses);
@@ -150,7 +157,8 @@ public class StopNodeInUniverse extends UniverseDefinitionTaskBase {
           universe,
           currentNode,
           () -> findNewMasterIfApplicable(universe, currentNode),
-          instanceExists);
+          instanceExists,
+          false /* ignore stop error */);
 
       // Update Node State to Stopped
       createSetNodeStateTask(currentNode, NodeState.Stopped)

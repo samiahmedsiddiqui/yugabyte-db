@@ -32,6 +32,7 @@
 package org.yb.client;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -46,6 +47,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -95,9 +97,6 @@ public class YBClient implements AutoCloseable {
 
   // Redis key column name.
   public static final String REDIS_KEY_COLUMN_NAME = "key";
-
-  // Number of response errors to tolerate.
-  private static final int MAX_ERRORS_TO_IGNORE = 2500;
 
   // Log errors every so many errors.
   private static final int LOG_ERRORS_EVERY_NUM_ITERS = 100;
@@ -335,6 +334,17 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+   * Get information about master heartbeat delays as seen by the master leader.
+   *
+   * @return rpc response object containing the master heartbeat delays and rpc error if any
+   * @throws Exception when the rpc fails
+   */
+  public GetMasterHeartbeatDelaysResponse getMasterHeartbeatDelays() throws Exception {
+    Deferred<GetMasterHeartbeatDelaysResponse> d = asyncClient.getMasterHeartbeatDelays();
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
    * Helper method that checks and waits until the completion of an alter command.
    * It will block until the alter command is done or the timeout is reached.
    * @param keyspace CQL keyspace to which this table belongs
@@ -446,6 +456,29 @@ public class YBClient implements AutoCloseable {
     } while (resp.hasRetriableError() && numTries++ < MAX_NUM_RETRIES);
     return resp;
   }
+
+  public AreNodesSafeToTakeDownResponse areNodesSafeToTakeDown(Set<String> masterIps,
+                                                               Set<String> tserverIps,
+                                                               long followerLagBoundMs)
+      throws Exception {
+    ListTabletServersResponse tabletServers = listTabletServers();
+    Collection<String> tserverUUIDs = tabletServers.getTabletServersList().stream()
+        .filter(ts -> tserverIps.contains(ts.getHost()))
+        .map(ts -> ts.getUuid())
+        .collect(Collectors.toSet());
+
+    ListMastersResponse masters = listMasters();
+    Collection<String> masterUUIDs = masters.getMasters().stream()
+        .filter(m -> masterIps.contains(m.getHost()))
+        .map(m -> m.getUuid())
+        .collect(Collectors.toSet());
+
+    Deferred<AreNodesSafeToTakeDownResponse> d = asyncClient.areNodesSafeToTakeDown(
+        masterUUIDs, tserverUUIDs, followerLagBoundMs
+    );
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
 
   /**
    * Get the tablet load move completion percentage for blacklisted nodes, if any.
@@ -1208,12 +1241,12 @@ public class YBClient implements AutoCloseable {
    * @return true if the condition is true within the time frame, false otherwise.
    */
   private boolean waitForCondition(Condition condition, final long timeoutMs) {
-    Exception finalException = null;
-    long start = System.currentTimeMillis();
     int numErrors = 0;
     int numIters = 0;
-    String errorMessage = null;
+    Exception exception = null;
+    long start = System.currentTimeMillis();
     do {
+      exception = null;
       try {
         if (injectWaitError) {
           Thread.sleep(AsyncYBClient.sleepTime);
@@ -1226,39 +1259,27 @@ public class YBClient implements AutoCloseable {
           return true;
         }
       } catch (Exception e) {
-        // We will get exceptions if we cannot connect to the other end. Catch them and save for
-        // final debug if we never succeed.
-        finalException = e;
         numErrors++;
         if (numErrors % LOG_ERRORS_EVERY_NUM_ITERS == 0) {
-          LOG.warn("Hit {} errors so far. Latest is : {}.", numErrors, finalException.toString());
+          LOG.warn("Hit {} errors so far. Latest is : {}.", numErrors, e.getMessage());
         }
-        if (numErrors >= MAX_ERRORS_TO_IGNORE) {
-          errorMessage = "Hit too many errors, final exception is " + finalException.toString();
-          break;
-        }
+        exception = e;
       }
-
       numIters++;
       if (numIters % LOG_EVERY_NUM_ITERS == 0) {
         LOG.info("Tried operation {} times so far.", numIters);
       }
-
-      // Need to wait even when ping has an exception, so the sleep is outside the above try block.
+      // Sleep before next retry.
       try {
         Thread.sleep(AsyncYBClient.sleepTime);
       } catch (Exception e) {}
-    } while (System.currentTimeMillis() - start < timeoutMs);
-
-    if (errorMessage == null) {
-      LOG.error("Timed out waiting for operation. Final exception was {}.",
-                finalException != null ? finalException.toString() : "none");
+    } while(System.currentTimeMillis() - start < timeoutMs);
+    if (exception == null) {
+      LOG.error("Timed out waiting for condition");
     } else {
-      LOG.error(errorMessage);
+      LOG.error("Hit too many errors, final exception is {}.", exception.getMessage());
     }
-
     LOG.error("Returning failure after {} iterations, num errors = {}.", numIters, numErrors);
-
     return false;
   }
 
@@ -1670,6 +1691,16 @@ public class YBClient implements AutoCloseable {
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
+  public AlterUniverseReplicationResponse alterUniverseReplicationRemoveTables(
+    String replicationGroupName,
+    Set<String> sourceTableIdsToRemove,
+    boolean removeTableIgnoreErrors) throws Exception {
+    Deferred<AlterUniverseReplicationResponse> d =
+      asyncClient.alterUniverseReplicationRemoveTables(
+        replicationGroupName, sourceTableIdsToRemove, removeTableIgnoreErrors);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
   public AlterUniverseReplicationResponse alterUniverseReplicationSourceMasterAddresses(
     String replicationGroupName,
     Set<CommonNet.HostPortPB> sourceMasterAddresses) throws Exception {
@@ -2046,6 +2077,84 @@ public class YBClient implements AutoCloseable {
   public WaitForReplicationDrainResponse waitForReplicationDrain(
       List<String> streamIds) throws Exception {
     return waitForReplicationDrain(streamIds, null /* targetTime */);
+  }
+
+  // DB Scoped replication methods.
+  // --------------------------------------------------------------------------------
+
+  /**
+   * @see AsyncYBClient#xClusterCreateOutboundReplicationGroup(String, Set<String>)
+   */
+  public XClusterCreateOutboundReplicationGroupResponse xClusterCreateOutboundReplicationGroup(
+      String replicationGroupId, Set<String> namespaceIds) throws Exception {
+    Deferred<XClusterCreateOutboundReplicationGroupResponse> d =
+        asyncClient.xClusterCreateOutboundReplicationGroup(replicationGroupId, namespaceIds);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * @see AsyncYBClient#isXClusterBootstrapRequired(String, String)
+   */
+  public IsXClusterBootstrapRequiredResponse isXClusterBootstrapRequired(
+      String replicationGroupId, String namespaceId) throws Exception {
+    Deferred<IsXClusterBootstrapRequiredResponse> d =
+        asyncClient.isXClusterBootstrapRequired(replicationGroupId, namespaceId);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * @see AsyncYBClient#createXClusterReplication(String, Set<CommonNet.HostPortPB>)
+   */
+  public CreateXClusterReplicationResponse createXClusterReplication(
+      String replicationGroupId, Set<CommonNet.HostPortPB> targetMasterAddresses) throws Exception {
+    Deferred<CreateXClusterReplicationResponse> d =
+        asyncClient.createXClusterReplication(replicationGroupId, targetMasterAddresses);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * @see AsyncYBClient#isCreateXClusterReplicationDone(String, Set<CommonNet.HostPortPB>)
+   */
+  public IsCreateXClusterReplicationDoneResponse isCreateXClusterReplicationDone(
+      String replicationGroupId, Set<CommonNet.HostPortPB> targetMasterAddresses) throws Exception {
+    Deferred<IsCreateXClusterReplicationDoneResponse> d =
+        asyncClient.isCreateXClusterReplicationDone(replicationGroupId, targetMasterAddresses);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  // Used by YBA to delete outbound replication from the source universe,
+  public XClusterDeleteOutboundReplicationGroupResponse xClusterDeleteOutboundReplicationGroup(
+      String replicationGroupId) throws Exception {
+    Deferred<XClusterDeleteOutboundReplicationGroupResponse> d =
+        asyncClient.xClusterDeleteOutboundReplicationGroup(replicationGroupId, null);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * @see AsyncYBClient#xClusterDeleteOutboundReplicationGroup(String, Set<CommonNet.HostPortPB>)
+   */
+  public XClusterDeleteOutboundReplicationGroupResponse xClusterDeleteOutboundReplicationGroup(
+    String replicationGroupId, @Nullable Set<CommonNet.HostPortPB> targetMasterAddresses)
+    throws Exception {
+  Deferred<XClusterDeleteOutboundReplicationGroupResponse> d =
+      asyncClient.xClusterDeleteOutboundReplicationGroup(replicationGroupId, targetMasterAddresses);
+  return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  // --------------------------------------------------------------------------------
+  // End of DB Scoped replication methods.
+
+  /**
+   * Get information about the namespace/database.
+   * @param keyspaceName namespace name to get details about.
+   * @param databaseType database type the database belongs to.
+   * @return details for the namespace.
+   * @throws Exception
+   */
+  public GetNamespaceInfoResponse getNamespaceInfo(String keyspaceName,
+      YQLDatabase databaseType) throws Exception {
+    Deferred<GetNamespaceInfoResponse> d = asyncClient.getNamespaceInfo(keyspaceName, databaseType);
+    return d.join(getDefaultOperationTimeoutMs());
   }
 
   /**

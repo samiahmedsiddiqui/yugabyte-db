@@ -21,9 +21,6 @@
 #include "yb/cdc/cdc_service.service.h"
 #include "yb/cdc/cdc_types.h"
 #include "yb/cdc/cdc_util.h"
-#include "yb/client/async_initializer.h"
-
-#include "yb/common/schema.h"
 
 #include "yb/master/master_client.fwd.h"
 
@@ -31,10 +28,8 @@
 
 #include "yb/rpc/rpc.h"
 #include "yb/rpc/rpc_context.h"
-#include "yb/rpc/rpc_controller.h"
 
 #include "yb/util/net/net_util.h"
-#include "yb/util/service_util.h"
 #include "yb/util/semaphore.h"
 
 #include <boost/optional.hpp>
@@ -51,6 +46,8 @@ class Thread;
 namespace cdc {
 
 class CDCServiceContext;
+class CDCSDKVirtualWAL;
+class CDCStateTableRange;
 
 }  // namespace cdc
 
@@ -76,14 +73,8 @@ typedef std::unordered_map<HostPort, std::shared_ptr<CDCServiceProxy>, HostPortH
 
 YB_STRONGLY_TYPED_BOOL(CreateMetricsEntityIfNotFound);
 
-static const char* const kRecordType = "record_type";
-static const char* const kRecordFormat = "record_format";
-static const char* const kRetentionSec = "retention_sec";
-static const char* const kSourceType = "source_type";
-static const char* const kCheckpointType = "checkpoint_type";
-static const char* const kStreamState = "state";
-static const char* const kNamespaceId = "NAMESPACEID";
 static const char* const kCDCSDKSnapshotDoneKey = "snapshot_done_key";
+
 struct TabletCheckpoint {
   OpId op_id;
   // Timestamp at which the op ID was last updated.
@@ -108,6 +99,7 @@ struct TabletCDCCheckpointInfo {
 
 using TabletIdCDCCheckpointMap = std::unordered_map<TabletId, TabletCDCCheckpointInfo>;
 using TabletIdStreamIdSet = std::set<std::pair<TabletId, xrepl::StreamId>>;
+using StreamIdSet = std::set<xrepl::StreamId>;
 using RollBackTabletIdCheckpointMap =
     std::unordered_map<const std::string*, std::pair<int64_t, OpId>>;
 class CDCServiceImpl : public CDCServiceIf {
@@ -139,6 +131,32 @@ class CDCServiceImpl : public CDCServiceIf {
       const GetCheckpointRequestPB* req,
       GetCheckpointResponsePB* resp,
       rpc::RpcContext rpc) override;
+
+  // Walsender StartReplication RPCs
+  void InitVirtualWALForCDC(
+      const InitVirtualWALForCDCRequestPB* req, InitVirtualWALForCDCResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void GetConsistentChanges(
+      const GetConsistentChangesRequestPB* req, GetConsistentChangesResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void DestroyVirtualWALForCDC(
+      const DestroyVirtualWALForCDCRequestPB* req, DestroyVirtualWALForCDCResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  // Destroy a batch of Virtual WAL instances managed by this CDC service.
+  // Intended to be called from background jobs and hence only logs warnings in case of errors.
+  void DestroyVirtualWALBatchForCDC(const std::vector<uint64_t>& session_ids);
+
+  void UpdateAndPersistLSN(
+      const UpdateAndPersistLSNRequestPB* req, UpdateAndPersistLSNResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void UpdatePublicationTableList(
+    const UpdatePublicationTableListRequestPB* req,
+    UpdatePublicationTableListResponsePB* resp, rpc::RpcContext context) override;
+
 
   Result<TabletCheckpoint> TEST_GetTabletInfoFromCache(const TabletStreamInfo& producer_tablet);
 
@@ -245,6 +263,7 @@ class CDCServiceImpl : public CDCServiceIf {
 
  private:
   friend class XClusterProducerBootstrap;
+  friend class CDCSDKVirtualWAL;
   FRIEND_TEST(CDCServiceTest, TestMetricsOnDeletedReplication);
   FRIEND_TEST(CDCServiceTestMultipleServersOneTablet, TestMetricsAfterServerFailure);
   FRIEND_TEST(CDCServiceTestMultipleServersOneTablet, TestMetricsUponRegainingLeadership);
@@ -277,14 +296,14 @@ class CDCServiceImpl : public CDCServiceIf {
 
   Status InsertRowForColocatedTableInCDCStateTable(
       const TabletStreamInfo& producer_tablet, const TableId& colocated_table_id,
-      const OpId& commit_op_id, const HybridTime& cdc_sdk_safe_time);
+      const OpId& commit_op_id, const std::optional<HybridTime>& cdc_sdk_safe_time);
 
   Status UpdateCheckpointAndActiveTime(
       const TabletStreamInfo& producer_tablet, const OpId& sent_op_id, const OpId& commit_op_id,
-      uint64_t last_record_hybrid_time,
+      uint64_t last_record_hybrid_time, const std::optional<HybridTime>& cdc_sdk_safe_time,
       const CDCRequestSource& request_source = CDCRequestSource::CDCSDK, bool force_update = false,
-      const HybridTime& cdc_sdk_safe_time = HybridTime::kInvalid, const bool is_snapshot = false,
-      const std::string& snapshot_key = "", const TableId& colocated_table_id = "");
+      const bool is_snapshot = false, const std::string& snapshot_key = "",
+      const TableId& colocated_table_id = "");
 
   Status UpdateSnapshotDone(
       const xrepl::StreamId& stream_id, const TabletId& tablet_id,
@@ -308,10 +327,6 @@ class CDCServiceImpl : public CDCServiceIf {
       EXCLUDES(mutex_);
 
   void RemoveStreamFromCache(const xrepl::StreamId& stream_id);
-
-  void AddStreamMetadataToCache(
-      const xrepl::StreamId& stream_id, const std::shared_ptr<StreamMetadata>& stream_metadata)
-      EXCLUDES(mutex_);
 
   Status CheckTabletValidForStream(const TabletStreamInfo& producer_info);
 
@@ -344,6 +359,8 @@ class CDCServiceImpl : public CDCServiceIf {
                      std::vector<client::internal::RemoteTabletServer*>* servers);
 
   std::shared_ptr<CDCServiceProxy> GetCDCServiceProxy(client::internal::RemoteTabletServer* ts);
+
+  std::shared_ptr<CDCServiceProxy> GetCDCServiceProxy(HostPort hostport);
 
   OpId GetMinSentCheckpointForTablet(const std::string& tablet_id);
 
@@ -391,7 +408,8 @@ class CDCServiceImpl : public CDCServiceIf {
   // This method deletes entries from the cdc_state table that are contained in the set.
   Status DeleteCDCStateTableMetadata(
       const TabletIdStreamIdSet& cdc_state_entries_to_delete,
-      const std::unordered_set<TabletId>& failed_tablet_ids);
+      const std::unordered_set<TabletId>& failed_tablet_ids,
+      const StreamIdSet& slot_entries_to_be_deleted);
 
   MicrosTime GetLastReplicatedTime(const std::shared_ptr<tablet::TabletPeer>& tablet_peer);
 
@@ -414,9 +432,18 @@ class CDCServiceImpl : public CDCServiceIf {
       TabletIdCDCCheckpointMap* tablet_checkpoint_map,
       std::unordered_set<TabletId>* tablet_ids_with_max_checkpoint);
 
+  Result<bool> CheckBeforeImageActive(
+      const TabletId& tablet_id, const StreamMetadata& stream_metadata,
+      const tablet::TabletPeerPtr& tablet_peer);
+
+  Result<std::unordered_map<NamespaceId, uint64_t>> GetNamespaceMinRecordIdCommitTimeMap(
+      const CDCStateTableRange& table_range, Status* iteration_status,
+      StreamIdSet* slot_entries_to_be_deleted);
+
   Result<TabletIdCDCCheckpointMap> PopulateTabletCheckPointInfo(
       const TabletId& input_tablet_id = "",
-      TabletIdStreamIdSet* tablet_stream_to_be_deleted = nullptr);
+      TabletIdStreamIdSet* tablet_stream_to_be_deleted = nullptr,
+      StreamIdSet* slot_entries_to_be_deleted = nullptr);
 
   Status SetInitialCheckPoint(
       const OpId& checkpoint, const std::string& tablet_id,
@@ -459,6 +486,9 @@ class CDCServiceImpl : public CDCServiceIf {
   // when the config version does not match.
   bool ValidateAutoFlagsConfigVersion(
       const GetChangesRequestPB& req, GetChangesResponsePB& resp, rpc::RpcContext& context);
+
+  void LogGetChangesLagForCDCSDK(
+      const xrepl::StreamId& stream_id, const GetChangesResponsePB& resp);
 
   rpc::Rpcs rpcs_;
 
@@ -515,6 +545,10 @@ class CDCServiceImpl : public CDCServiceIf {
   std::unordered_set<std::string> paused_xcluster_producer_streams_ GUARDED_BY(mutex_);
 
   uint32_t xcluster_config_version_ GUARDED_BY(mutex_) = 0;
+
+  // Map of session_id (uint64) to VirtualWAL instance.
+  std::unordered_map<uint64_t, std::shared_ptr<CDCSDKVirtualWAL>> session_virtual_wal_
+      GUARDED_BY(mutex_);
 };
 
 }  // namespace cdc

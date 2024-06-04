@@ -66,6 +66,7 @@
 
 #include "yb/tablet/operations/change_auto_flags_config_operation.h"
 #include "yb/tablet/operations/change_metadata_operation.h"
+#include "yb/tablet/operations/clone_operation.h"
 #include "yb/tablet/operations/history_cutoff_operation.h"
 #include "yb/tablet/operations/operation_driver.h"
 #include "yb/tablet/operations/snapshot_operation.h"
@@ -125,6 +126,8 @@ DEFINE_test_flag(double, fault_crash_leader_before_changing_role, 0.0,
                  "bootstrapping.");
 
 DECLARE_int32(ysql_transaction_abort_timeout_ms);
+
+DECLARE_bool(cdc_immediate_transaction_cleanup);
 
 DECLARE_int64(cdc_intent_retention_ms);
 
@@ -212,6 +215,7 @@ Status TabletPeer::InitTabletPeer(
     const scoped_refptr<MetricEntity>& table_metric_entity,
     const scoped_refptr<MetricEntity>& tablet_metric_entity,
     ThreadPool* raft_pool,
+    rpc::ThreadPool* raft_notifications_pool,
     ThreadPool* tablet_prepare_pool,
     consensus::RetryableRequestsManager* retryable_requests_manager,
     std::unique_ptr<ConsensusMetadata> consensus_meta,
@@ -304,6 +308,7 @@ Status TabletPeer::InitTabletPeer(
         mark_dirty_clbk_,
         tablet_->table_type(),
         raft_pool,
+        raft_notifications_pool,
         retryable_requests_manager,
         multi_raft_manager);
     has_consensus_.store(true, std::memory_order_release);
@@ -889,6 +894,9 @@ consensus::OperationType MapOperationTypeToPB(OperationType operation_type) {
     case OperationType::kChangeAutoFlagsConfig:
       return consensus::CHANGE_AUTO_FLAGS_CONFIG_OP;
 
+    case OperationType::kClone:
+      return consensus::CLONE_OP;
+
     case OperationType::kEmpty:
       LOG(FATAL) << "OperationType::kEmpty cannot be converted to consensus::OperationType";
   }
@@ -1225,6 +1233,9 @@ Status TabletPeer::SetCDCSDKRetainOpIdAndTime(
     auto txn_participant = tablet_->transaction_participant();
     if (txn_participant) {
       txn_participant->SetIntentRetainOpIdAndTime(cdc_sdk_op_id, cdc_sdk_op_id_expiration);
+      if (GetAtomicFlag(&FLAGS_cdc_immediate_transaction_cleanup)) {
+        tablet_->CleanupIntentFiles();
+      }
     }
   }
   return Status::OK();
@@ -1360,6 +1371,11 @@ std::unique_ptr<Operation> TabletPeer::CreateOperation(consensus::LWReplicateMsg
              " operation must receive an AutoFlagsConfigPB";
       return std::make_unique<ChangeAutoFlagsConfigOperation>(
           tablet, replicate_msg->mutable_auto_flags_config());
+
+    case consensus::CLONE_OP:
+       DCHECK(replicate_msg->has_clone_tablet()) << "CLONE_OP replica"
+          " operation must receive a CloneOpRequestPB";
+      return std::make_unique<CloneOperation>(tablet, tablet_splitter_);
 
     case consensus::UNKNOWN_OP: FALLTHROUGH_INTENDED;
     case consensus::NO_OP: FALLTHROUGH_INTENDED;

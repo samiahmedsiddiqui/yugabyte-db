@@ -322,6 +322,8 @@ public class NodeConfigValidator {
       case CHRONYC:
       case GSUTIL:
       case S3CMD:
+      case YB_HOME_DIR_CLEAN:
+      case DATA_DIR_CLEAN:
         {
           return Boolean.parseBoolean(nodeConfig.getValue());
         }
@@ -369,7 +371,9 @@ public class NodeConfigValidator {
       case GSUTIL:
       case S3CMD:
       case SWAPPINESS:
+      case LOCALE_PRESENT:
       case SYSTEMD_SUDOER_ENTRY:
+      case YB_HOME_DIR_CLEAN:
         {
           return false;
         }

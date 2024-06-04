@@ -46,6 +46,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
@@ -71,6 +72,12 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
   private AvailabilityZone az1, az2, az3;
 
   private YBClient mockClient;
+
+  @Before
+  public void setUp() {
+    super.setUp();
+    when(mockOperatorStatusUpdaterFactory.create()).thenReturn(mockOperatorStatusUpdater);
+  }
 
   private void setupUniverse(boolean updateInProgress) {
     config.put("KUBECONFIG", "test");
@@ -155,14 +162,28 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
           Json.toJson(ImmutableMap.of()));
 
   private void assertTaskSequence(Map<Integer, List<TaskInfo>> subTasksByPosition, int numTasks) {
-    assertTaskSequence(subTasksByPosition, numTasks, numTasks);
+    assertTaskSequence(subTasksByPosition, numTasks, numTasks, false);
   }
 
   private void assertTaskSequence(
-      Map<Integer, List<TaskInfo>> subTasksByPosition, int numTasks, int numNamespaceDelete) {
+      Map<Integer, List<TaskInfo>> subTasksByPosition, int numTasks, boolean forceDelete) {
+    assertTaskSequence(subTasksByPosition, numTasks, numTasks, forceDelete);
+  }
+
+  private void assertTaskSequence(
+      Map<Integer, List<TaskInfo>> subTasksByPosition,
+      int numTasks,
+      int numNamespaceDelete,
+      boolean forceDelete) {
     int position = 0;
-    for (TaskType taskType : KUBERNETES_DESTROY_UNIVERSE_TASKS) {
-      JsonNode expectedResults = KUBERNETES_DESTROY_UNIVERSE_EXPECTED_RESULTS.get(position);
+    if (!forceDelete) {
+      // Shift by 1 subtask due to FreezeUniverse.
+      assertEquals(
+          TaskType.FreezeUniverse, subTasksByPosition.get(position++).get(0).getTaskType());
+    }
+    for (int i = 0; i < KUBERNETES_DESTROY_UNIVERSE_TASKS.size(); i++) {
+      TaskType taskType = KUBERNETES_DESTROY_UNIVERSE_TASKS.get(i);
+      JsonNode expectedResults = KUBERNETES_DESTROY_UNIVERSE_EXPECTED_RESULTS.get(i);
       List<TaskInfo> tasks = subTasksByPosition.get(position);
 
       if (expectedResults.equals(
@@ -184,7 +205,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
 
       assertEquals(taskType, tasks.get(0).getTaskType());
       List<JsonNode> taskDetails =
-          tasks.stream().map(TaskInfo::getDetails).collect(Collectors.toList());
+          tasks.stream().map(TaskInfo::getTaskParams).collect(Collectors.toList());
       assertJsonEqual(expectedResults, taskDetails.get(0));
       position++;
     }
@@ -344,7 +365,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
-    assertTaskSequence(subTasksByPosition, 1);
+    assertTaskSequence(subTasksByPosition, 1, true);
     assertEquals(Success, taskInfo.getTaskState());
     assertFalse(defaultCustomer.getUniverseUUIDs().contains(defaultUniverse.getUniverseUUID()));
   }
@@ -437,7 +458,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
-    assertTaskSequence(subTasksByPosition, 3, 1);
+    assertTaskSequence(subTasksByPosition, 3, 1, false);
     assertEquals(Success, taskInfo.getTaskState());
     assertFalse(defaultCustomer.getUniverseUUIDs().contains(defaultUniverse.getUniverseUUID()));
   }

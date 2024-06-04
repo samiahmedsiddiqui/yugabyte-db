@@ -76,7 +76,7 @@ class PgDocReadOpCached : private PgDocReadOpCachedHelper, public PgDocOp {
   }
 
  protected:
-  Status DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) override {
+  Status DoPopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder keep_order) override {
     return Status::OK();
   }
 
@@ -373,8 +373,27 @@ void PgDocOp::RecordRequestMetrics() {
   auto& metrics = pg_session_->metrics();
   for (const auto& op : pgsql_ops_) {
     auto* response = op->response();
-    if (response && response->has_metrics()) {
+    if (op->is_active() && response && response->has_metrics()) {
       metrics.RecordRequestMetrics(op->response()->metrics());
+
+      // Record the number of DocDB rows read.
+      // Index Scans on secondary indexes in colocated tables need special handling: the target
+      // table for such ops is the secondary index, however the scanned_table_rows field returns
+      // the number of main table rows scanned scanned. Hence, if a request has both table and index
+      // rows_scanned set, then we do not resolve the target table type. In all other cases, the
+      // index_rows_scanned field is not populated and the table type can be resolved to figure out
+      // the kind of rows scanned.
+      if (!response->metrics().has_scanned_table_rows()) {
+        continue;
+      }
+
+      if (table_->IsColocated() && response->metrics().has_scanned_index_rows()) {
+        metrics.RecordStorageRowsRead(TableType::USER, response->metrics().scanned_table_rows());
+        metrics.RecordStorageRowsRead(TableType::INDEX, response->metrics().scanned_index_rows());
+      } else {
+        metrics.RecordStorageRowsRead(
+            ResolveRelationType(*op, table_), response->metrics().scanned_table_rows());
+      }
     }
   }
 }
@@ -477,8 +496,8 @@ Status PgDocOp::CreateRequests() {
   return CompleteRequests();
 }
 
-Status PgDocOp::PopulateDmlByYbctidOps(const YbctidGenerator& generator) {
-  RETURN_NOT_OK(DoPopulateDmlByYbctidOps(generator));
+Status PgDocOp::PopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder keep_order) {
+  RETURN_NOT_OK(DoPopulateByYbctidOps(generator, keep_order));
   request_population_completed_ = true;
   return CompleteRequests();
 }
@@ -511,7 +530,7 @@ PgDocReadOp::PgDocReadOp(const PgSession::ScopedRefPtr& pg_session,
     : PgDocOp(pg_session, table, sender), read_op_(std::move(read_op)) {}
 
 Status PgDocReadOp::ExecuteInit(const PgExecParameters *exec_params) {
-  SCHECK(pgsql_ops_.empty(),
+  SCHECK(pgsql_ops_.empty() || !exec_params,
          IllegalState,
          "Exec params can't be changed for already created operations");
   RETURN_NOT_OK(PgDocOp::ExecuteInit(exec_params));
@@ -581,7 +600,7 @@ Result<bool> PgDocReadOp::DoCreateRequests() {
   }
 }
 
-Status PgDocReadOp::DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) {
+Status PgDocReadOp::DoPopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder keep_order) {
   // NOTE on a typical process.
   // 1- Statement:
   //    SELECT xxx FROM <table> WHERE ybctid IN (SELECT ybctid FROM INDEX);
@@ -600,12 +619,12 @@ Status PgDocReadOp::DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) {
   // 6- Repeat step 2 thru 5 for the next batch of 1024 ybctids till done.
   InitializeYbctidOperators();
   end_of_data_ = false;
-  VLOG(1) << "Row order " << (generator.keep_order ? "is" : "is not") << " important";
-  if (generator.keep_order) {
+  VLOG(1) << "Row order " << (keep_order ? "is" : "is not") << " important";
+  if (keep_order) {
     batch_row_orders_.reserve(generator.capacity);
   }
   while (true) {
-    auto ybctid = generator.next();
+    const auto ybctid = generator.next();
     if (ybctid.empty()) {
       break;
     }
@@ -622,7 +641,7 @@ Status PgDocReadOp::DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) {
     // The "ybctid" values are returned in the same order as the row in the IndexTable. To keep
     // track of this order, each argument is assigned an order-number.
     auto* batch_arg = read_req.add_batch_arguments();
-    if (generator.keep_order) {
+    if (keep_order) {
       batch_arg->set_order(batch_row_ordering_counter_);
       // Remember the order number for each request.
       batch_row_orders_.emplace_back(pgsql_ops_[partition], batch_row_ordering_counter_++);

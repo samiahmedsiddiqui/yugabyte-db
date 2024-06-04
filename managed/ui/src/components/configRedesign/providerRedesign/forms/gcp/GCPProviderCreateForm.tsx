@@ -4,6 +4,7 @@ import { Box, CircularProgress, FormHelperText, Typography } from '@material-ui/
 import { yupResolver } from '@hookform/resolvers/yup';
 import { useQuery } from 'react-query';
 import { array, mixed, object, string } from 'yup';
+import { useTranslation } from 'react-i18next';
 
 import {
   OptionProps,
@@ -27,17 +28,21 @@ import {
   KEY_PAIR_MANAGEMENT_OPTIONS,
   NTPSetupType,
   ProviderCode,
+  ProviderOperation,
   VPCSetupType,
   VPCSetupTypeLabel
 } from '../../constants';
 import { FieldGroup } from '../components/FieldGroup';
+import { SubmitInProgress } from '../components/SubmitInProgress';
 import {
+  UseProviderValidationEnabled,
   addItem,
   constructAccessKeysCreatePayload,
   deleteItem,
   editItem,
   generateLowerCaseAlphanumericId,
   getIsFormDisabled,
+  handleFormSubmitServerError,
   readFileAsText
 } from '../utils';
 import { FormContainer } from '../components/FormContainer';
@@ -56,18 +61,23 @@ import { NTP_SERVER_REGEX } from '../constants';
 
 import { GCPRegionMutation, GCPAvailabilityZoneMutation, YBProviderMutation } from '../../types';
 import { RbacValidator } from '../../../../../redesign/features/rbac/common/RbacApiPermValidator';
-import { constructImageBundlePayload } from '../../components/linuxVersionCatalog/LinuxVersionUtils';
+import {
+  ConfigureSSHDetailsMsg,
+  IsOsPatchingEnabled,
+  constructImageBundlePayload
+} from '../../components/linuxVersionCatalog/LinuxVersionUtils';
 import { ApiPermissionMap } from '../../../../../redesign/features/rbac/ApiAndUserPermMapping';
 import { LinuxVersionCatalog } from '../../components/linuxVersionCatalog/LinuxVersionCatalog';
 import { CloudType } from '../../../../../redesign/helpers/dtos';
 import { ImageBundle } from '../../../../../redesign/features/universe/universe-form/utils/dto';
+import { GCPCreateFormErrFields } from './constants';
 
 interface GCPProviderCreateFormProps {
   createInfraProvider: CreateInfraProvider;
   onBack: () => void;
 }
 
-interface GCPProviderCreateFormFieldValues {
+export interface GCPProviderCreateFormFieldValues {
   dbNodePublicInternetAccess: boolean;
   destVpcId: string;
   gceProject: string;
@@ -140,6 +150,8 @@ export const GCPProviderCreateForm = ({
   const [isDeleteRegionModalOpen, setIsDeleteRegionModalOpen] = useState<boolean>(false);
   const [regionSelection, setRegionSelection] = useState<CloudVendorRegionField>();
   const [regionOperation, setRegionOperation] = useState<RegionOperation>(RegionOperation.ADD);
+  const [isValidationErrorExist, setValidationErrorExist] = useState(false);
+  const { t } = useTranslation();
 
   const defaultValues: Partial<GCPProviderCreateFormFieldValues> = {
     dbNodePublicInternetAccess: true,
@@ -159,14 +171,29 @@ export const GCPProviderCreateForm = ({
 
   const hostInfoQuery = useQuery(hostInfoQueryKey.ALL, () => api.fetchHostInfo());
 
-  if (hostInfoQuery.isLoading || hostInfoQuery.isIdle) {
+  const isOsPatchingEnabled = IsOsPatchingEnabled();
+  const sshConfigureMsg = ConfigureSSHDetailsMsg();
+  const {
+    isLoading: isProviderValidationLoading,
+    isValidationEnabled
+  } = UseProviderValidationEnabled(CloudType.gcp);
+
+  if (hostInfoQuery.isLoading || hostInfoQuery.isIdle || isProviderValidationLoading) {
     return <YBLoading />;
   }
   if (hostInfoQuery.isError) {
-    return <YBErrorIndicator customErrorMessage="Error fetching host info." />;
+    return (
+      <YBErrorIndicator
+        customErrorMessage={t('failedToFetchHostInfo', { keyPrefix: 'queryError' })}
+      />
+    );
   }
 
-  const onFormSubmit: SubmitHandler<GCPProviderCreateFormFieldValues> = async (formValues) => {
+  const onFormSubmit = async (
+    formValues: GCPProviderCreateFormFieldValues,
+    shouldValidate: boolean,
+    ignoreValidationErrors = false
+  ) => {
     if (formValues.ntpSetupType === NTPSetupType.SPECIFIED && !formValues.ntpServers.length) {
       formMethods.setError('ntpServers', {
         type: 'min',
@@ -281,11 +308,35 @@ export const GCPProviderCreateForm = ({
       })),
       imageBundles
     };
+    setValidationErrorExist(false);
     try {
-      await createInfraProvider(providerPayload);
+      await createInfraProvider(providerPayload, {
+        shouldValidate: shouldValidate,
+        ignoreValidationErrors: ignoreValidationErrors,
+        mutateOptions: {
+          onError: (err) => {
+            handleFormSubmitServerError(
+              (err as any)?.response?.data,
+              formMethods,
+              GCPCreateFormErrFields
+            );
+            setValidationErrorExist(true);
+          }
+        }
+      });
     } catch (_) {
       // Request errors are handled by the onError callback
     }
+  };
+
+  const onFormValidateAndSubmit: SubmitHandler<GCPProviderCreateFormFieldValues> = async (
+    formValues
+  ) => await onFormSubmit(formValues, isValidationEnabled);
+  const onFormForceSubmit: SubmitHandler<GCPProviderCreateFormFieldValues> = async (formValues) =>
+    await onFormSubmit(formValues, isValidationEnabled, true);
+
+  const skipValidationAndSubmit = () => {
+    onFormForceSubmit(formMethods.getValues());
   };
 
   const showAddRegionFormModal = () => {
@@ -360,7 +411,10 @@ export const GCPProviderCreateForm = ({
   return (
     <Box display="flex" justifyContent="center">
       <FormProvider {...formMethods}>
-        <FormContainer name={FORM_NAME} onSubmit={formMethods.handleSubmit(onFormSubmit)}>
+        <FormContainer
+          name={FORM_NAME}
+          onSubmit={formMethods.handleSubmit(onFormValidateAndSubmit)}
+        >
           <Typography variant="h3">Create GCP Provider Configuration</Typography>
           <FormField providerNameField={true}>
             <FieldLabel>Provider Name</FieldLabel>
@@ -444,10 +498,7 @@ export const GCPProviderCreateForm = ({
               heading="Regions"
               headerAccessories={
                 regions.length > 0 ? (
-                  <RbacValidator
-                    accessRequiredOn={ApiPermissionMap.CREATE_REGION_BY_PROVIDER}
-                    isControl
-                  >
+                  <RbacValidator accessRequiredOn={ApiPermissionMap.CREATE_PROVIDER} isControl>
                     <YBButton
                       btnIcon="fa fa-plus"
                       btnText="Add Region"
@@ -463,13 +514,15 @@ export const GCPProviderCreateForm = ({
             >
               <RegionList
                 providerCode={ProviderCode.GCP}
+                providerOperation={ProviderOperation.CREATE}
                 regions={regions}
                 setRegionSelection={setRegionSelection}
                 showAddRegionFormModal={showAddRegionFormModal}
                 showEditRegionFormModal={showEditRegionFormModal}
                 showDeleteRegionModal={showDeleteRegionModal}
-                disabled={isFormDisabled}
+                isDisabled={isFormDisabled}
                 isError={!!formMethods.formState.errors.regions}
+                errors={formMethods.formState.errors.regions as any}
               />
               {formMethods.formState.errors.regions?.message && (
                 <FormHelperText error={true}>
@@ -479,16 +532,18 @@ export const GCPProviderCreateForm = ({
             </FieldGroup>
             <LinuxVersionCatalog
               control={formMethods.control as any}
-              providerType={CloudType.gcp}
-              viewMode="CREATE"
+              providerType={ProviderCode.GCP}
+              providerOperation={ProviderOperation.CREATE}
+              isDisabled={isFormDisabled}
             />
             <FieldGroup heading="SSH Key Pairs">
+              {sshConfigureMsg}
               <FormField>
                 <FieldLabel>SSH User</FieldLabel>
                 <YBInputField
                   control={formMethods.control}
                   name="sshUser"
-                  disabled={isFormDisabled}
+                  disabled={isFormDisabled || isOsPatchingEnabled}
                   fullWidth
                 />
               </FormField>
@@ -499,7 +554,7 @@ export const GCPProviderCreateForm = ({
                   name="sshPort"
                   type="number"
                   inputProps={{ min: 1, max: 65535 }}
-                  disabled={isFormDisabled}
+                  disabled={isFormDisabled || isOsPatchingEnabled}
                   fullWidth
                 />
               </FormField>
@@ -567,19 +622,30 @@ export const GCPProviderCreateForm = ({
               </FormField>
             </FieldGroup>
             {(formMethods.formState.isValidating || formMethods.formState.isSubmitting) && (
-              <Box display="flex" gridGap="5px" marginLeft="auto">
-                <CircularProgress size={16} color="primary" thickness={5} />
-              </Box>
+              <SubmitInProgress isValidationEnabled={isValidationEnabled} />
             )}
           </Box>
           <Box marginTop="16px">
             <YBButton
-              btnText="Create Provider Configuration"
+              btnText={
+                isValidationEnabled
+                  ? 'Validate and Save Configuration'
+                  : 'Create Provider Configuration'
+              }
               btnClass="btn btn-default save-btn"
               btnType="submit"
               disabled={isFormDisabled || formMethods.formState.isValidating}
               data-testid={`${FORM_NAME}-SubmitButton`}
             />
+            {isValidationEnabled && isValidationErrorExist && (
+              <YBButton
+                btnText="Ignore and save provider configuration anyway"
+                btnClass="btn btn-default float-right mr-10"
+                onClick={skipValidationAndSubmit}
+                disabled={isFormDisabled || formMethods.formState.isValidating}
+                data-testid={`${FORM_NAME}-IgnoreAndSave`}
+              />
+            )}
             <YBButton
               btnText="Back"
               btnClass="btn btn-default"

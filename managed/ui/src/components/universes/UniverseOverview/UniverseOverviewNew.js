@@ -474,11 +474,13 @@ export default class UniverseOverviewNew extends Component {
 
   getPrimaryClusterWidget = (currentUniverse, isRollBackFeatureEnabled) => {
     const isDedicatedNodes = isDedicatedNodePlacement(currentUniverse);
-
     if (isNullOrEmpty(currentUniverse)) return;
+
+    const clusterWidgetSize = isDedicatedNodes ? 4 : this.hasReadReplica(currentUniverse) ? 3 : 4;
+
     if (isRollBackFeatureEnabled) {
       return (
-        <Col lg={4} sm={8} md={8} xs={12}>
+        <Col lg={clusterWidgetSize} sm={8} md={6} xs={12}>
           <ClusterInfoPanelContainer
             type={'primary'}
             universeInfo={currentUniverse}
@@ -489,7 +491,7 @@ export default class UniverseOverviewNew extends Component {
       );
     } else {
       return isDedicatedNodes ? (
-        <Col lg={4} sm={8} md={8} xs={12}>
+        <Col lg={clusterWidgetSize} sm={8} md={6} xs={12}>
           <ClusterInfoPanelContainer
             type={'primary'}
             universeInfo={currentUniverse}
@@ -498,7 +500,7 @@ export default class UniverseOverviewNew extends Component {
           />
         </Col>
       ) : (
-        <Col lg={4} sm={6} md={4} xs={8}>
+        <Col lg={clusterWidgetSize} sm={6} md={6} xs={12}>
           <ClusterInfoPanelContainer
             type={'primary'}
             universeInfo={currentUniverse}
@@ -513,7 +515,7 @@ export default class UniverseOverviewNew extends Component {
   getReadReplicaClusterWidget = (currentUniverse) => {
     if (isNullOrEmpty(currentUniverse)) return;
     return (
-      <Col lg={2} sm={6} md={4} xs={8}>
+      <Col lg={3} sm={6} md={6} xs={12}>
         <ClusterInfoPanelContainer
           type={'read-replica'}
           universeInfo={currentUniverse}
@@ -574,7 +576,7 @@ export default class UniverseOverviewNew extends Component {
     const hasReadReplicaCluster = this.hasReadReplica(universeInfo);
 
     return (
-      <Col lg={isDedicatedNodes && hasReadReplicaCluster ? 2 : 4} md={6} sm={8} xs={12}>
+      <Col lg={isDedicatedNodes && hasReadReplicaCluster ? 3 : 4} md={6} sm={8} xs={12}>
         <HealthInfoPanel healthCheck={healthCheck} universeInfo={universeInfo} />
       </Col>
     );
@@ -841,7 +843,6 @@ export default class UniverseOverviewNew extends Component {
       currentCustomer,
       runtimeConfigs
     } = this.props;
-
     const universeInfo = currentUniverse.data;
     const nodePrefixes = [universeInfo.universeDetails.nodePrefix];
     const isItKubernetesUniverse = isKubernetesUniverse(universeInfo);
@@ -886,11 +887,14 @@ export default class UniverseOverviewNew extends Component {
           {isEnabled(currentCustomer.data.features, 'universes.details.overview.costs') &&
             this.getCostWidget(universeInfo)}
           <Col lg={4} md={6} sm={8} xs={12}>
-            <DBVersionWidget
-              higherVersionCount={updateAvailable}
-              isRollBackFeatureEnabled={isRollBackFeatureEnabled}
-              failedTaskDetails={failedTask}
-            />
+            {getPromiseState(currentUniverse).isSuccess() && (
+              <DBVersionWidget
+                higherVersionCount={updateAvailable}
+                isRollBackFeatureEnabled={isRollBackFeatureEnabled}
+                failedTaskDetails={failedTask}
+                isReleasesEnabled={this.props.isReleasesEnabled}
+              />
+            )}
           </Col>
         </Row>
         <Row>

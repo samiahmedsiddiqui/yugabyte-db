@@ -5,6 +5,8 @@ linkTitle: Alerts and monitoring
 description: Set alerts and monitor your YugabyteDB Managed clusters.
 image: /images/section_icons/explore/monitoring.png
 headcontent: Set alerts and monitor cluster performance and activity
+aliases:
+  - /preview/yugabyte-cloud/cloud-monitor/logging-export/
 menu:
   preview_yugabyte-cloud:
     parent: yugabytedb-managed
@@ -22,7 +24,7 @@ Use YugabyteDB Managed alerts and monitoring to monitor cluster performance and 
   - [Live queries](cloud-queries-live/). The cluster **Live Queries** tab shows the queries that are currently "in-flight" on your cluster.
   - [Slow queries](cloud-queries-slow/). The cluster **YSQL Slow  Queries** tab shows queries run on the cluster, sorted by running time. Evaluate the slowest running YSQL queries that have been run on the cluster.
   - [Performance advisor](cloud-advisor/). Scan clusters for performance optimizations, including index and schema changes, and detect potentially hot nodes.
-  - [Metrics export](metrics-export/). Export metrics to third-party monitoring tools such as Datadog and Grafana.
+  - [Metrics export](metrics-export/). Export metrics to third-party monitoring tools such as Datadog and Grafana Cloud.
 
   Access performance monitoring from the cluster **Performance** tab.
 

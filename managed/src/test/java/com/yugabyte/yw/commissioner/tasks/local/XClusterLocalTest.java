@@ -9,7 +9,6 @@ import static org.junit.Assert.assertTrue;
 import static play.test.Helpers.contentAsString;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.yugabyte.yw.commissioner.tasks.CommissionerBaseTest;
 import com.yugabyte.yw.common.FakeApiHelper;
 import com.yugabyte.yw.common.LocalNodeManager;
 import com.yugabyte.yw.common.ModelFactory;
@@ -66,6 +65,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
     userIntent.ybcFlags = getYbcGFlags(userIntent);
     Universe source = createUniverseWithYbc(userIntent);
     initYSQL(source);
+    initAndStartPayload(source);
 
     userIntent = getDefaultUserIntent("target-universe", false);
     userIntent.specificGFlags = SpecificGFlags.construct(GFLAGS, GFLAGS);
@@ -74,7 +74,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
 
     // Set up the storage config.
     CustomerConfig customerConfig =
-        ModelFactory.createNfsStorageConfig(customer, "test_nfs_storage", baseDir);
+        ModelFactory.createNfsStorageConfig(customer, "test_nfs_storage", getBackupBaseDirectory());
     log.info("Customer config here: {}", customerConfig.toString());
 
     // Get the table info for the source universe.
@@ -99,8 +99,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
     Result result = createXClusterConfig(formData);
     assertOk(result);
     JsonNode json = Json.parse(contentAsString(result));
-    TaskInfo taskInfo =
-        CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    TaskInfo taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), source, target);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     verifyUniverseState(Universe.getOrBadRequest(source.getUniverseUUID()));
     verifyUniverseState(Universe.getOrBadRequest(target.getUniverseUUID()));
@@ -112,17 +111,18 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
             details,
             source,
             YUGABYTE_DB,
-            "insert into some_table values (4, 'xcluster1', 200), " + "(5, 'xCluster2', 180)",
+            "insert into some_table values (4, 'xcluster1', 200), (5, 'xCluster2', 180)",
             10);
     assertTrue(ysqlResponse.isSuccess());
 
-    Thread.sleep(300);
+    Thread.sleep(2000);
     details = target.getUniverseDetails().nodeDetailsSet.iterator().next();
     ysqlResponse =
         localNodeUniverseManager.runYsqlCommand(
             details, target, YUGABYTE_DB, "select count(*) from some_table", 10);
     assertTrue(ysqlResponse.isSuccess());
     assertEquals("5", LocalNodeManager.getRawCommandOutput(ysqlResponse.getMessage()));
+    verifyPayload();
   }
 
   @Test
@@ -133,6 +133,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
     userIntent.ybcFlags = getYbcGFlags(userIntent);
     Universe source = createUniverseWithYbc(userIntent);
     initYSQL(source);
+    initAndStartPayload(source);
 
     userIntent = getDefaultUserIntent("target-universe", false);
     userIntent.specificGFlags = SpecificGFlags.construct(GFLAGS, GFLAGS);
@@ -141,7 +142,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
 
     // Set up the storage config.
     CustomerConfig customerConfig =
-        ModelFactory.createNfsStorageConfig(customer, "test_nfs_storage", baseDir);
+        ModelFactory.createNfsStorageConfig(customer, "test_nfs_storage", getBackupBaseDirectory());
     log.info("Customer config here: {}", customerConfig.toString());
 
     // Get the table info for the source universe.
@@ -166,8 +167,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
     Result result = createXClusterConfig(formData);
     assertOk(result);
     JsonNode json = Json.parse(contentAsString(result));
-    TaskInfo taskInfo =
-        CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    TaskInfo taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), source, target);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     verifyUniverseState(Universe.getOrBadRequest(source.getUniverseUUID()));
     verifyUniverseState(Universe.getOrBadRequest(target.getUniverseUUID()));
@@ -206,7 +206,7 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
     editFormData.bootstrapParams.tables = editFormData.tables;
     result = editXClusterConfig(editFormData, UUID.fromString(json.get("resourceUUID").asText()));
     json = Json.parse(contentAsString(result));
-    taskInfo = CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), source, target);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     verifyUniverseState(Universe.getOrBadRequest(source.getUniverseUUID()));
     verifyUniverseState(Universe.getOrBadRequest(target.getUniverseUUID()));
@@ -215,15 +215,16 @@ public class XClusterLocalTest extends LocalProviderUniverseTestBase {
             sourceNodeDetails,
             source,
             YUGABYTE_DB,
-            "insert into x_cluster values (4, 'xcluster1', 200), " + "(5, 'xCluster2', 180)",
+            "insert into x_cluster values (4, 'xcluster1', 200), (5, 'xCluster2', 180)",
             10);
 
     assertTrue(ysqlResponse.isSuccess());
-    Thread.sleep(500);
+    Thread.sleep(2000);
     ysqlResponse =
         localNodeUniverseManager.runYsqlCommand(
             targetNodeDetails, target, YUGABYTE_DB, "select count(*) from x_cluster", 10);
     assertTrue(ysqlResponse.isSuccess());
     assertEquals("2", LocalNodeManager.getRawCommandOutput(ysqlResponse.getMessage()));
+    verifyPayload();
   }
 }

@@ -725,28 +725,9 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, char relpersistence,
 	Assert(OIDNewHeap != InvalidOid);
 
 	if (IsYugaByteEnabled() && relpersistence != RELPERSISTENCE_TEMP)
-	{
-		CreateStmt *dummyStmt	 = makeNode(CreateStmt);
-		dummyStmt->relation		 = makeRangeVar(NULL, NewHeapName, -1);
-		Relation pg_constraint = heap_open(ConstraintRelationId,
-										   RowExclusiveLock);
-		YbATCopyPrimaryKeyToCreateStmt(OldHeap, pg_constraint, dummyStmt);
-		heap_close(pg_constraint, RowExclusiveLock);
-		if (yb_copy_split_options)
-		{
-			YbGetTableProperties(OldHeap);
-			dummyStmt->split_options = YbGetSplitOptions(OldHeap);
-		}
-		YBCCreateTable(dummyStmt, RelationGetRelationName(OldHeap),
-					   OldHeap->rd_rel->relkind, OldHeapDesc, OIDNewHeap,
-					   namespaceid,
-					   YbGetTableProperties(OldHeap)->tablegroup_oid,
-					   InvalidOid, NewTableSpace, OIDOldHeap,
-					   OldHeap->rd_rel->relfilenode);
-
-		if (yb_test_fail_table_rewrite_after_creation)
-			elog(ERROR, "Injecting error.");
-	}
+		YbRelationSetNewRelfileNode(OldHeap, OIDNewHeap,
+									yb_copy_split_options,
+									false /* is_truncate */);
 
 	ReleaseSysCache(tuple);
 
@@ -1685,7 +1666,8 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	 * The new relation is local to our transaction and we know nothing
 	 * depends on it, so DROP_RESTRICT should be OK.
 	 */
-	performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+	if (!(IsYugaByteEnabled() && yb_test_table_rewrite_keep_old_table))
+		performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
 
 	/* performDeletion does CommandCounterIncrement at end */
 

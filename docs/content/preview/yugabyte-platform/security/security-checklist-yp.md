@@ -26,9 +26,9 @@ For information on configuring ports, refer to [Configure ports](../customize-po
 
 Authentication requires that all clients provide valid credentials before they can connect to a YugabyteDB universe. The authentication credentials in YugabyteDB are stored internally in the YB-Master system tables. The authentication mechanisms available to users depends on what is supported and exposed by the YSQL and YCQL APIs.
 
-You enable authentication for the YSQL and YCQL APIs when you deploy a universe. See [Create YugabyteDB universe deployments](../../create-deployments/).
+You enable authentication for the YSQL and YCQL APIs when you deploy a universe. See [Enable database authentication](../authorization-platform/#enable-database-authentication).
 
-YugabyteDB Anywhere and YugabyteDB also support LDAP and OIDC for managing authentication. See [Authentication](../authentication/)
+YugabyteDB Anywhere and YugabyteDB also support LDAP and OIDC for managing authentication. See [Database authentication](../authentication/).
 
 For more information on authentication in YugabyteDB, see [Enable authentication](../../../secure/enable-authentication/).
 
@@ -36,7 +36,7 @@ For more information on authentication in YugabyteDB, see [Enable authentication
 
 Roles can be assigned to grant users only the essential privileges based on the operations they need to perform in YugabyteDB Anywhere, and in YugabyteDB universes.
 
-To manage access to your YugabyteDB Anywhere instance, typically you create a [Super Admin role first](../../configure-yugabyte-platform/create-admin-user/). The Super Admin can create additional admins and other users with fewer privileges. For information on how to manage YugabyteDB Anywhere users and roles, see [Manage YugabyteDB Anywhere users](../../administer-yugabyte-platform/anywhere-rbac/).
+To manage access to your YugabyteDB Anywhere instance, typically you create a [Super Admin role first](../../install-yugabyte-platform/create-admin-user/). The Super Admin can create additional admins and other users with fewer privileges. For information on how to manage YugabyteDB Anywhere users and roles, see [Manage YugabyteDB Anywhere users](../../administer-yugabyte-platform/anywhere-rbac/).
 
 For information on how to manage database roles and users, see [Database authorization](../authorization-platform).
 

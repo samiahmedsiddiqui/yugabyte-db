@@ -1,3 +1,5 @@
+SET enable_bitmapscan = false; -- TODO(#20573): update bitmap scan cost model
+
 -- This file is meant to test and track the optimizer's plan choices with BNL
 -- enabled. yb_join_batching on the other hand is meant to test BNL execution
 -- and planning when we force the creation of a BNL.
@@ -26,6 +28,7 @@ ANALYZE p5;
 
 SET yb_enable_optimizer_statistics = on;
 SET yb_enable_base_scans_cost_model = on;
+SET yb_prefer_bnl = off;
 
 -- We're testing nested loop join batching in this file
 SET yb_bnl_batch_size = 1024;
@@ -201,6 +204,8 @@ analyze q2;
 -- Make sure a sort node is inserted above a batched NL join when appropriate
 
 explain (costs off) select q1.c1 from q1 join q2 on q1.c2 = q2.c2 order by q1.c1 limit 10;
+
+explain (costs off) select q2.c1, q1.c1 from q1 join q2 on q1.c2 = q2.c2 order by q1.c1 limit 10;
 
 create table q3(a int, b int, c name, primary key(a,b));
 create index q3_range on q3(a asc);

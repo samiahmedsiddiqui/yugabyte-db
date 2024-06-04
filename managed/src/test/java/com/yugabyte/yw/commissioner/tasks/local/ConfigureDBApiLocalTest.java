@@ -58,7 +58,6 @@ public class ConfigureDBApiLocalTest extends LocalProviderUniverseTestBase {
     // Enable YSQL Auth for the universe.
     userIntent.specificGFlags = SpecificGFlags.construct(GFLAGS, GFLAGS);
     Universe universe = createUniverse(userIntent);
-
     // Enable YSQL Auth for the universe.
     ConfigureYSQLFormData formData = new ConfigureYSQLFormData();
     formData.enableYSQL = true;
@@ -68,8 +67,7 @@ public class ConfigureDBApiLocalTest extends LocalProviderUniverseTestBase {
     Result result = configureYSQL(formData, universe.getUniverseUUID());
     assertOk(result);
     JsonNode json = Json.parse(contentAsString(result));
-    TaskInfo taskInfo =
-        CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    TaskInfo taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), universe);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     universe = Universe.getOrBadRequest(universe.getUniverseUUID());
     initYSQL(universe, "", true);
@@ -81,7 +79,7 @@ public class ConfigureDBApiLocalTest extends LocalProviderUniverseTestBase {
     result = configureYSQL(formData, universe.getUniverseUUID());
     assertOk(result);
     json = Json.parse(contentAsString(result));
-    taskInfo = CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), universe);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     universe = Universe.getOrBadRequest(universe.getUniverseUUID());
     verifyYSQL(universe);
@@ -94,7 +92,7 @@ public class ConfigureDBApiLocalTest extends LocalProviderUniverseTestBase {
     result = configureYSQL(formData, universe.getUniverseUUID());
     assertOk(result);
     json = Json.parse(contentAsString(result));
-    taskInfo = CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), universe);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     universe = Universe.getOrBadRequest(universe.getUniverseUUID());
     verifyYSQL(universe);
@@ -111,7 +109,6 @@ public class ConfigureDBApiLocalTest extends LocalProviderUniverseTestBase {
   @Test
   public void testConfigureYCQL() throws InterruptedException {
     UniverseDefinitionTaskParams.UserIntent userIntent = getDefaultUserIntent();
-    // Enable YSQL Auth for the universe.
     userIntent.specificGFlags = SpecificGFlags.construct(GFLAGS, GFLAGS);
     Universe universe = createUniverse(userIntent);
 
@@ -124,20 +121,19 @@ public class ConfigureDBApiLocalTest extends LocalProviderUniverseTestBase {
     Result result = configureYCQL(formData, universe.getUniverseUUID());
     assertOk(result);
     JsonNode json = Json.parse(contentAsString(result));
-    TaskInfo taskInfo =
-        CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    TaskInfo taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), universe);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     universe = Universe.getOrBadRequest(universe.getUniverseUUID());
     initYCQL(universe, true, YCQL_PASSWORD);
     verifyYCQL(universe, true, YCQL_PASSWORD);
 
-    // Disable YSQL Auth for the universe.
+    // Disable YCQL Auth for the universe.
     formData.enableYCQLAuth = false;
 
     result = configureYCQL(formData, universe.getUniverseUUID());
     assertOk(result);
     json = Json.parse(contentAsString(result));
-    taskInfo = CommissionerBaseTest.waitForTask(UUID.fromString(json.get("taskUUID").asText()));
+    taskInfo = waitForTask(UUID.fromString(json.get("taskUUID").asText()), universe);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     universe = Universe.getOrBadRequest(universe.getUniverseUUID());
     verifyYCQL(universe);

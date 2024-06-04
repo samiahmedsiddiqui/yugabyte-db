@@ -6,10 +6,14 @@ import { Link } from 'react-router';
 import { getAlertConfigurations } from '../../../../actions/universe';
 import { alertConfigQueryKey } from '../../../../redesign/helpers/api';
 import { formatLagMetric } from '../../../../utils/Formatters';
-import { AlertName } from '../../constants';
-import { getStrictestReplicationLagAlertConfig } from '../../ReplicationUtils';
+import { DOCS_URL_SET_UP_REPLICATION_LAG_ALERT } from '../constants';
+import { PollingIntervalMs } from '../../constants';
+import { getStrictestReplicationLagAlertThreshold } from '../../ReplicationUtils';
 
-import { IAlertConfiguration as AlertConfiguration } from '../../../../redesign/features/alerts/TemplateComposer/ICustomVariables';
+import {
+  AlertTemplate,
+  IAlertConfiguration as AlertConfiguration
+} from '../../../../redesign/features/alerts/TemplateComposer/ICustomVariables';
 import { Universe } from '../../../../redesign/helpers/dtos';
 
 interface ConfirmAlertStepProps {
@@ -30,11 +34,11 @@ const useStyles = makeStyles((theme) => ({
   instruction: {
     marginBottom: theme.spacing(4)
   },
-  formSectionDescription: {
-    marginBottom: theme.spacing(3)
-  },
   fieldLabel: {
     marginBottom: theme.spacing(1)
+  },
+  link: {
+    textDecoration: 'underline'
   }
 }));
 
@@ -49,18 +53,19 @@ export const ConfirmAlertStep = ({ sourceUniverse }: ConfirmAlertStepProps) => {
   });
 
   const alertConfigFilter = {
-    name: AlertName.REPLICATION_LAG,
+    template: AlertTemplate.REPLICATION_LAG,
     targetUuid: sourceUniverse.universeUUID
   };
   const alertConfigQuery = useQuery<AlertConfiguration[]>(
     alertConfigQueryKey.list(alertConfigFilter),
-    () => getAlertConfigurations(alertConfigFilter)
+    () => getAlertConfigurations(alertConfigFilter),
+    { refetchInterval: PollingIntervalMs.ALERT_CONFIGURATION }
   );
 
   /**
    * The existing replicaiton lag alert config with the lowest alert threshold.
    */
-  const strictestReplicationLagAlertConfig = getStrictestReplicationLagAlertConfig(
+  const strictestReplicationLagAlertConfig = getStrictestReplicationLagAlertThreshold(
     alertConfigQuery.data
   );
 
@@ -71,9 +76,6 @@ export const ConfirmAlertStep = ({ sourceUniverse }: ConfirmAlertStepProps) => {
           <Typography variant="body1" className={classes.instruction}>
             {t('instruction')}
           </Typography>
-          <div className={classes.formSectionDescription}>
-            <Typography variant="body2">{t('infoText')}</Typography>
-          </div>
           {alertConfigQuery.isLoading ? (
             <i className="fa fa-spinner fa-spin yb-spinner" />
           ) : alertConfigQuery.data?.length ? (
@@ -86,15 +88,22 @@ export const ConfirmAlertStep = ({ sourceUniverse }: ConfirmAlertStepProps) => {
                   />
                 </Typography>
                 <Typography variant="body2">
-                  {formatLagMetric(
-                    strictestReplicationLagAlertConfig?.thresholds?.SEVERE?.threshold
-                  )}
+                  {formatLagMetric(strictestReplicationLagAlertConfig)}
                 </Typography>
               </Box>
               <Typography variant="body2">
                 <Trans
                   i18nKey={`${TRANSLATION_KEY_PREFIX}.editReplicationLagAlertPrompt`}
-                  components={{ manageAlertConfigLink: <Link to={'/admin/alertConfig'} /> }}
+                  components={{
+                    manageAlertConfigLink: (
+                      <Link
+                        to={'/admin/alertConfig'}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={classes.link}
+                      />
+                    )
+                  }}
                 />
               </Typography>
             </Box>
@@ -102,14 +111,36 @@ export const ConfirmAlertStep = ({ sourceUniverse }: ConfirmAlertStepProps) => {
             <Typography variant="body2">
               <Trans
                 i18nKey={`${TRANSLATION_KEY_PREFIX}.setUpReplicationLagAlertPrompt`}
-                values={{ sourceUniverseName: sourceUniverse.name }}
                 components={{
-                  manageAlertConfigLink: <Link to={'/admin/alertConfig'} />,
+                  manageAlertConfigLink: (
+                    <Link
+                      to={'/admin/alertConfig'}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={classes.link}
+                    />
+                  ),
                   paragraph: <p />
                 }}
               />
             </Typography>
           )}
+          <Box marginTop={6}>
+            <Typography variant="body2">
+              <Trans
+                i18nKey={`${TRANSLATION_KEY_PREFIX}.infoText`}
+                components={{
+                  configureReplicationLagAlertDocLink: (
+                    <a
+                      href={DOCS_URL_SET_UP_REPLICATION_LAG_ALERT}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    />
+                  )
+                }}
+              />
+            </Typography>
+          </Box>
         </li>
       </ol>
     </div>

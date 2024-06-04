@@ -12,14 +12,17 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.NodeManager;
@@ -78,24 +81,7 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
       ListMastersResponse listMastersResponse = mock(ListMastersResponse.class);
       when(listMastersResponse.getMasters()).thenReturn(Collections.emptyList());
       when(mockClient.listMasters()).thenReturn(listMastersResponse);
-      when(mockNodeUniverseManager.runCommand(any(), any(), any()))
-          .thenReturn(
-              ShellResponse.create(
-                  ShellResponse.ERROR_CODE_SUCCESS,
-                  ShellResponse.RUN_COMMAND_OUTPUT_PREFIX
-                      + "Reference ID    : A9FEA9FE (metadata.google.internal)\n"
-                      + "    Stratum         : 3\n"
-                      + "    Ref time (UTC)  : Mon Jun 12 16:18:24 2023\n"
-                      + "    System time     : 0.000000003 seconds slow of NTP time\n"
-                      + "    Last offset     : +0.000019514 seconds\n"
-                      + "    RMS offset      : 0.000011283 seconds\n"
-                      + "    Frequency       : 99.154 ppm slow\n"
-                      + "    Residual freq   : +0.009 ppm\n"
-                      + "    Skew            : 0.106 ppm\n"
-                      + "    Root delay      : 0.000162946 seconds\n"
-                      + "    Root dispersion : 0.000101734 seconds\n"
-                      + "    Update interval : 32.3 seconds\n"
-                      + "    Leap status     : Normal"));
+      mockClockSyncResponse(mockNodeUniverseManager);
     } catch (Exception e) {
       fail();
     }
@@ -145,6 +131,15 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
         mockClient, ImmutableList.of("10.0.0.1"), Collections.emptyList());
 
     setFollowerLagMock();
+    when(mockClient.getLeaderMasterHostAndPort()).thenReturn(HostAndPort.fromHost("10.0.0.1"));
+    doAnswer(
+            inv -> {
+              ObjectNode res = Json.mapper().createObjectNode();
+              res.put("response", "success");
+              return res;
+            })
+        .when(mockYsqlQueryExecutor)
+        .executeQueryInNodeShell(any(), any(), any(), anyBoolean());
   }
 
   private TaskInfo submitTask(NodeTaskParams taskParams, String nodeName) {
@@ -183,6 +178,7 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
           TaskType.AnsibleConfigureServers,
           TaskType.AnsibleClusterServerCtl,
           TaskType.WaitForServer,
+          TaskType.WaitForServer,
           TaskType.CheckFollowerLag,
           TaskType.SetNodeState,
           TaskType.SwamperTargetsFileUpdate,
@@ -195,7 +191,8 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of("process", "tserver", "command", "start")),
-          Json.toJson(ImmutableMap.of()),
+          Json.toJson(ImmutableMap.of("serverType", "TSERVER")),
+          Json.toJson(ImmutableMap.of("serverType", "YSQLSERVER")),
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of("state", "Live")),
           Json.toJson(ImmutableMap.of()),
@@ -226,6 +223,7 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
           TaskType.AnsibleConfigureServers,
           TaskType.AnsibleClusterServerCtl,
           TaskType.WaitForServer,
+          TaskType.WaitForServer,
           TaskType.CheckFollowerLag,
           TaskType.SetNodeState,
           TaskType.SwamperTargetsFileUpdate,
@@ -251,6 +249,7 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of("process", "tserver", "command", "start")),
           Json.toJson(ImmutableMap.of("serverType", "TSERVER")),
+          Json.toJson(ImmutableMap.of("serverType", "YSQLSERVER")),
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of("state", "Live")),
           Json.toJson(ImmutableMap.of()),
@@ -265,7 +264,7 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
         assertEquals("At position: " + position, taskType, tasks.get(0).getTaskType());
         JsonNode expectedResults = WITH_MASTER_UNDER_REPLICATED_RESULTS.get(position);
         List<JsonNode> taskDetails =
-            tasks.stream().map(TaskInfo::getDetails).collect(Collectors.toList());
+            tasks.stream().map(TaskInfo::getTaskParams).collect(Collectors.toList());
         assertJsonEqual(expectedResults, taskDetails.get(0));
         position++;
       }
@@ -276,7 +275,7 @@ public class StartNodeInUniverseTest extends CommissionerBaseTest {
         assertEquals("At position: " + position, taskType, tasks.get(0).getTaskType());
         JsonNode expectedResults = START_NODE_TASK_EXPECTED_RESULTS.get(position);
         List<JsonNode> taskDetails =
-            tasks.stream().map(TaskInfo::getDetails).collect(Collectors.toList());
+            tasks.stream().map(TaskInfo::getTaskParams).collect(Collectors.toList());
         assertJsonEqual(expectedResults, taskDetails.get(0));
         position++;
       }

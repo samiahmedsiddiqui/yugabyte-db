@@ -88,6 +88,7 @@ import java.security.cert.X509Certificate;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -398,6 +399,13 @@ public class AsyncYBClient implements AutoCloseable {
     rpc.attempt++;
     client.sendRpc(rpc);
     return d;
+  }
+
+  public Deferred<GetMasterHeartbeatDelaysResponse> getMasterHeartbeatDelays() {
+    checkIsClosed();
+    GetMasterHeartbeatDelaysRequest request = new GetMasterHeartbeatDelaysRequest(this.masterTable);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
   }
 
   /**
@@ -1249,6 +1257,19 @@ public class AsyncYBClient implements AutoCloseable {
       null);
   }
 
+  public Deferred<AlterUniverseReplicationResponse> alterUniverseReplicationRemoveTables(
+    String replicationGroupName,
+    Set<String> sourceTableIdsToRemove,
+    boolean removeTableIgnoreErrors) {
+    return alterUniverseReplication(
+      replicationGroupName,
+      new HashMap<>(),
+      sourceTableIdsToRemove,
+      new HashSet<>(),
+      null,
+      removeTableIgnoreErrors);
+  }
+
   public Deferred<AlterUniverseReplicationResponse>
   alterUniverseReplicationSourceMasterAddresses(
     String replicationGroupName,
@@ -1272,6 +1293,20 @@ public class AsyncYBClient implements AutoCloseable {
       newReplicationGroupName);
   }
 
+  private Deferred<AlterUniverseReplicationResponse> alterUniverseReplication(
+    String replicationGroupName,
+    Map<String, String> sourceTableIdsToAddBootstrapIdMap,
+    Set<String> sourceTableIdsToRemove,
+    Set<CommonNet.HostPortPB> sourceMasterAddresses,
+    String newReplicationGroupName) {
+      return alterUniverseReplication(replicationGroupName,
+      sourceTableIdsToAddBootstrapIdMap,
+      sourceTableIdsToRemove,
+      sourceMasterAddresses,
+      newReplicationGroupName,
+      false);
+    }
+
   /**
    * Alter existing xCluster replication relationships by modifying which tables to replicate from a
    * source universe, as well as the master addresses of the source universe
@@ -1289,6 +1324,7 @@ public class AsyncYBClient implements AutoCloseable {
    * @param sourceMasterAddresses New list of master addresses for the source universe
    * @param newReplicationGroupName The new source universe's UUID and the config name if desired to
    *                                be changed (format: sourceUniverseUUID_configName)
+   * @param removeTableIgnoreErrors Ignore errors while removing tables
    * @return a deferred object that yields an alter xCluster replication response.
    */
   private Deferred<AlterUniverseReplicationResponse> alterUniverseReplication(
@@ -1296,7 +1332,8 @@ public class AsyncYBClient implements AutoCloseable {
     Map<String, String> sourceTableIdsToAddBootstrapIdMap,
     Set<String> sourceTableIdsToRemove,
     Set<CommonNet.HostPortPB> sourceMasterAddresses,
-    String newReplicationGroupName) {
+    String newReplicationGroupName,
+    boolean removeTableIgnoreErrors) {
     int addedTables = sourceTableIdsToAddBootstrapIdMap.isEmpty() ? 0 : 1;
     int removedTables = sourceTableIdsToRemove.isEmpty() ? 0 : 1;
     int changedMasterAddresses = sourceMasterAddresses.isEmpty() ? 0 : 1;
@@ -1314,7 +1351,8 @@ public class AsyncYBClient implements AutoCloseable {
         sourceTableIdsToAddBootstrapIdMap,
         sourceTableIdsToRemove,
         sourceMasterAddresses,
-        newReplicationGroupName);
+        newReplicationGroupName,
+        removeTableIgnoreErrors);
     request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(request);
   }
@@ -1468,6 +1506,117 @@ public class AsyncYBClient implements AutoCloseable {
     checkIsClosed();
     WaitForReplicationDrainRequest request = new WaitForReplicationDrainRequest(
         this.masterTable, streamIds, targetTime);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  // DB Scoped replication methods.
+  // --------------------------------------------------------------------------------
+
+  /**
+   *  Checkpoints the source universe's databases.
+   *
+   * @param replicationGroupId name of the replication group to create
+   * @param namespaceIds set of namespace ids to checkpoint.
+   * @return A deferred object that yields a {@link XClusterCreateOutboundReplicationGroupResponse}
+   */
+  public Deferred<XClusterCreateOutboundReplicationGroupResponse>
+      xClusterCreateOutboundReplicationGroup(String replicationGroupId, Set<String> namespaceIds) {
+    checkIsClosed();
+    XClusterCreateOutboundReplicationGroupRequest request =
+        new XClusterCreateOutboundReplicationGroupRequest(
+          this.masterTable, replicationGroupId, namespaceIds);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   *  Checks whether checkpointing one of the source universe's namespaces from
+   *    xClusterCreateOutboundReplicationGroup is complete with 'notReady' boolean and
+   *    also whether or not the database requires bootstrapping.
+   * @param replicationGroupId name of the replication group to check
+   * @param namespaceId name of database to validate.
+   * @return A deferred object that yields a {@link IsXClusterBootstrapRequiredResponse}
+   *   which contains whether checkpointing is complete with 'notReady' and whether
+   *   bootstrapping is required with initialBootstrapRequired
+   */
+  public Deferred<IsXClusterBootstrapRequiredResponse> isXClusterBootstrapRequired(
+        String replicationGroupId, String namespaceId) {
+    checkIsClosed();
+    IsXClusterBootstrapRequiredRequest request = new IsXClusterBootstrapRequiredRequest(
+        this.masterTable, replicationGroupId, namespaceId);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   * Set up replication with specified replication group name and target universe.
+   * @param replicationGroupId name of the replication group to set up
+   * @param targetMasterAddresses target univere's master addresses
+   * @return  A deferred object that yields a {@link CreateXClusterReplicationResponse}
+   */
+  public Deferred<CreateXClusterReplicationResponse> createXClusterReplication(
+      String replicationGroupId, Set<CommonNet.HostPortPB> targetMasterAddresses) {
+    checkIsClosed();
+    CreateXClusterReplicationRequest request = new CreateXClusterReplicationRequest(
+        this.masterTable, replicationGroupId, targetMasterAddresses);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   * Checks whether the set up replication has succeeded.
+   * @param replicationGroupId name of the replication group to validate
+   * @param targetMasterAddresses target univere's master addresses used to set up replicaiton
+   * @return A deferred object that yields a {@link IsCreateXClusterReplicationDoneResponse}
+   *   containing whether the the replication has succeeded with 'done' bit, along with
+   *   replicationError errors
+   */
+  public Deferred<IsCreateXClusterReplicationDoneResponse> isCreateXClusterReplicationDone(
+      String replicationGroupId, Set<CommonNet.HostPortPB> targetMasterAddresses) {
+    checkIsClosed();
+    IsCreateXClusterReplicationDoneRequest request = new IsCreateXClusterReplicationDoneRequest(
+        this.masterTable, replicationGroupId, targetMasterAddresses);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   * Deletes the replication by running on the source universe. If target universe master
+   *   addresses are set, will delete both outbound and inbound replication. If target universe
+   *   master addresses are not set, will only delete the outbound replication on the source
+   *   universe.
+   * @param replicationGroupId name of the replication group to delete
+   * @param targetMasterAddresses target universe master addresses correcponding to replication.
+   * @return A deferred object that yields a {@link XClusterDeleteOutboundReplicationGroupResponse}
+   *
+   */
+  public Deferred<XClusterDeleteOutboundReplicationGroupResponse>
+      xClusterDeleteOutboundReplicationGroup(
+      String replicationGroupId, @Nullable Set<CommonNet.HostPortPB> targetMasterAddresses) {
+    checkIsClosed();
+    XClusterDeleteOutboundReplicationGroupRequest request =
+        new XClusterDeleteOutboundReplicationGroupRequest(
+        this.masterTable, replicationGroupId, targetMasterAddresses);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  // --------------------------------------------------------------------------------
+  // End of DB Scoped replication methods.
+
+  /**
+   * It returns information about a database/namespace after we pass in the databse name.
+   * @param keyspaceName database name to get details about.
+   * @param databaseType the type of database the database name is in.
+   * @return details about the database, including the namespace id, etc.
+   */
+  public Deferred<GetNamespaceInfoResponse> getNamespaceInfo(
+      String keyspaceName,
+      YQLDatabase databaseType) {
+    checkIsClosed();
+    GetNamespaceInfoRequest request = new GetNamespaceInfoRequest(
+        this.masterTable, keyspaceName, databaseType);
     request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(request);
   }
@@ -1786,6 +1935,20 @@ public class AsyncYBClient implements AutoCloseable {
     });
   }
 
+  public Deferred<AreNodesSafeToTakeDownResponse> areNodesSafeToTakeDown(
+      Collection<String> masters,
+      Collection<String> tservers,
+      long followerLagBoundMs
+  ) {
+    checkIsClosed();
+    AreNodesSafeToTakeDownRequest rpc = new AreNodesSafeToTakeDownRequest(this.masterTable,
+        masters,
+        tservers,
+        followerLagBoundMs);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
   /**
    * Open the table with the given name. If the table was just created, the Deferred will only get
    * called back when all the tablets have been successfully created.
@@ -2046,7 +2209,7 @@ public class AsyncYBClient implements AutoCloseable {
     if (request instanceof GetTabletListToPollForCDCRequest ||
         request instanceof SplitTabletRequest ||
         request instanceof FlushTableRequest) {
-      tablet = getFirstTablet(tableId);
+      tablet = getRandomActiveTablet(tableId);
     }
     // Set the propagated timestamp so that the next time we send a message to
     // the server the message includes the last propagated timestamp.
@@ -2409,7 +2572,7 @@ public class AsyncYBClient implements AutoCloseable {
       YBTable table, byte[] partitionKey, boolean includeInactive) {
     final boolean has_permit = acquireMasterLookupPermit();
     String tableId = table.getTableId();
-    if (!has_permit) {
+    if (!has_permit && partitionKey != null) {
       // If we failed to acquire a permit, it's worth checking if someone
       // looked up the tablet we're interested in.  Every once in a while
       // this will save us a Master lookup.
@@ -2786,6 +2949,33 @@ public class AsyncYBClient implements AutoCloseable {
 
   }
 
+  /**
+   * @param tableId table UUID to which the {@link RemoteTablet} should belong
+   * @return a {@link RemoteTablet} for which there are active tservers available
+   */
+  RemoteTablet getRandomActiveTablet(String tableId) {
+    ConcurrentSkipListMap<byte[], RemoteTablet> tablets = tabletsCache.get(tableId);
+
+    if (tablets == null) {
+      LOG.debug("Tablets cache does not have any information for table " + tableId);
+      return null;
+    }
+
+    if (tablets.firstEntry() == null) {
+      LOG.debug("Tablets cache map empty for table " + tableId);
+      return null;
+    }
+
+    for (Map.Entry<byte[], RemoteTablet> entry : tablets.entrySet()) {
+      if (!entry.getValue().tabletServers.isEmpty()) {
+        return entry.getValue();
+      }
+    }
+
+    LOG.debug("No remote tablet found with a tablet server for table " + tableId);
+    return null;
+  }
+
   RemoteTablet getTablet(String tableId, String tabletId) {
     ConcurrentSkipListMap<byte[], RemoteTablet> tablets = tabletsCache.get(tableId);
     if (tablets == null) {
@@ -3034,13 +3224,13 @@ public class AsyncYBClient implements AutoCloseable {
       synchronized (ip2client) {
         copy = new HashMap<String, TabletClient>(ip2client);
       }
-      LOG.error("WTF?  Should never happen!  Couldn't find " + client
+      LOG.error("Should never happen! Couldn't find " + client
           + " in " + copy);
       return null;
     }
     final int colon = hostport.indexOf(':', 1);
     if (colon < 1) {
-      LOG.error("WTF?  Should never happen!  No `:' found in " + hostport);
+      LOG.error("Should never happen! No `:' found in " + hostport);
       return null;
     }
     final String host = getIP(hostport.substring(0, colon));
@@ -3054,7 +3244,7 @@ public class AsyncYBClient implements AutoCloseable {
       port = parsePortNumber(hostport.substring(colon + 1,
           hostport.length()));
     } catch (NumberFormatException e) {
-      LOG.error("WTF?  Should never happen!  Bad port in " + hostport, e);
+      LOG.error("Should never happen! Bad port in " + hostport, e);
       return null;
     }
     return new InetSocketAddress(host, port);
@@ -3077,15 +3267,15 @@ public class AsyncYBClient implements AutoCloseable {
       final InetSocketAddress sock = (InetSocketAddress) remote;
       final InetAddress addr = sock.getAddress();
       if (addr == null) {
-        LOG.error("WTF?  Unresolved IP for " + remote
-            + ".  This shouldn't happen.");
+        LOG.error("Unresolved IP for " + remote
+            + ". This shouldn't happen.");
         return;
       } else {
         hostport = addr.getHostAddress() + ':' + sock.getPort();
       }
     } else {
-      LOG.error("WTF?  Found a non-InetSocketAddress remote: " + remote
-          + ".  This shouldn't happen.");
+      LOG.error("Found a non-InetSocketAddress remote: " + remote
+          + ". This shouldn't happen.");
       return;
     }
 

@@ -1,6 +1,6 @@
 ---
 title: Install and upgrade issues on Kubernetes
-headerTitle: Install and upgrade issues on Kubernetes
+headerTitle: Install and upgrade issues
 linkTitle: Install and upgrade issues
 description: Troubleshoot issues encountered when installing or upgrading YugabyteDB Anywhere on Kubernetes.
 menu:
@@ -13,13 +13,19 @@ type: docs
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
- <li>
-    <a href="../vm/" class="nav-link">
+  <li>
+    <a href="../installer/" class="nav-link">
       <i class="fa-solid fa-building"></i>
+      YBA Installer</a>
+  </li>
+
+  <li>
+    <a href="../vm/" class="nav-link">
+      <i class="fa-solid fa-cloud"></i>
       Virtual machine </a>
   </li>
 
-<li>
+  <li>
     <a href="../kubernetes/" class="nav-link active">
       <i class="fa-regular fa-dharmachakra" aria-hidden="true"></i>
       Kubernetes
@@ -30,7 +36,7 @@ type: docs
 
 Occasionally, you might encounter issues during installation and upgrade of YugabyteDB Anywhere on Kubernetes. You can troubleshoot most of these issues.
 
-If you experience difficulties while troubleshooting, contact {{% support-platform %}}.
+If you have problems while troubleshooting, contact {{% support-platform %}}.
 
 For more information, see the following:
 
@@ -334,7 +340,7 @@ A number of other issue can occur while installing and upgrading YugabyteDB Anyw
 
 ### Cross-Origin Resource Sharing (CORS) error
 
-You might encounter a CORS error while accessing YugabyteDB Anywhere through a load balancer. The condition can manifest itself by the initial setup or any login attempts not working or resulting in a blank screen.
+You might encounter a CORS error while accessing YugabyteDB Anywhere through a load balancer. The condition can manifest itself by the initial setup or any sign in attempts not working or resulting in a blank screen.
 
 To start diagnostics, check the developer tools of your browser for any errors. In addition, check the logs of the YugabyteDB Anywhere pod by executing the following command:
 

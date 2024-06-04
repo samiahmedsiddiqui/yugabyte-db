@@ -1,12 +1,30 @@
 package com.yugabyte.troubleshoot.ts;
 
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.util.StreamUtils;
 
 @Slf4j
 public class CommonUtils {
+
+  public static final DateTimeFormatter PG_TIMESTAMP_FORMAT =
+      new DateTimeFormatterBuilder()
+          .append(DateTimeFormatter.ISO_LOCAL_DATE)
+          .appendLiteral('T')
+          .appendPattern("HH:mm:ss")
+          .appendFraction(ChronoField.NANO_OF_SECOND, 1, 9, true)
+          .appendPattern("xxx")
+          .toFormatter();
+
+  public static final String SYSTEM_PLATFORM = "system_platform";
 
   private static final Pattern RELEASE_REGEX =
       Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)(.+)?$");
@@ -79,6 +97,15 @@ public class CommonUtils {
     } catch (Exception e) {
       // Same logic as above.
       return threshold ? 0 : Integer.MAX_VALUE;
+    }
+  }
+
+  public static String readResource(String path) {
+    try {
+      return StreamUtils.copyToString(
+          new ClassPathResource(path).getInputStream(), Charset.defaultCharset());
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to read resource: " + path, e);
     }
   }
 }

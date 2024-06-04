@@ -34,6 +34,8 @@ public class RedactingService {
           .addAll(SECRET_PATHS_FOR_APIS)
           .add("$..password")
           .add("$..confirmPassword")
+          .add("$..newPassword")
+          .add("$..currentPassword")
           .add("$..['config.AWS_ACCESS_KEY_ID']")
           .add("$..['config.AWS_SECRET_ACCESS_KEY']")
           // GCP private key
@@ -83,6 +85,9 @@ public class RedactingService {
           // Custom hooks
           .add("$..hook.hookText")
           .add("$..hook.runtimeArgs")
+          // LDAP - DB Universe Sync
+          .add("$..dbuserPassword")
+          .add("$..ldapBindPassword")
           .build();
 
   // List of json paths to any secret fields we want to redact.

@@ -269,6 +269,15 @@ func main() {
     // GetClusterConnections - Get the node address for the current node
     e.GET("/api/node_address", c.GetNodeAddress)
 
+    // Get Backup Details
+    e.GET("/api/backup", c.GetBackupDetails)
+
+    // Get Restore Details
+    e.GET("/api/restore", c.GetRestoreDetails)
+
+    // GetPITRConfig - Get the PITR configuration for YugabyteDB cluster
+    e.GET("/api/pitr", c.GetPITRConfigurations)
+
     render_htmls := templates.NewTemplate()
 
     // Code for rendering UI Without embedding the files
@@ -284,6 +293,9 @@ func main() {
     e.GET("/", handlers.IndexHandler)
 
     // Start server
-    uiBindAddress := helpers.HOST + port
+    if helpers.BindAddr == "" {
+        helpers.BindAddr = helpers.HOST
+    }
+    uiBindAddress := helpers.BindAddr + port
     e.Logger.Fatal(e.Start(uiBindAddress))
 }

@@ -58,6 +58,8 @@ func readConfigAndTemplate(configYmlFileName string, service common.Component) (
 		"installRoot":       common.GetSoftwareRoot,
 		"installVersionDir": common.GetInstallerSoftwareDir,
 		"baseInstall":       common.GetBaseInstall,
+		"splitInput": 	     common.SplitInput,
+		"removeQuotes":		 common.RemoveQuotes,
 	}
 
 	tmpl, err := template.New(configYmlFileName).
@@ -120,11 +122,17 @@ func WriteBytes(byteSlice []byte, fileName []byte) ([]byte, error) {
 }
 
 // GenerateTemplate of a particular component.
-func GenerateTemplate(component common.Component) {
+func GenerateTemplate(component common.Component) error {
 	log.Debug("Generating config files for " + component.Name())
-	createdBytes, _ := readConfigAndTemplate(component.TemplateFile(), component)
+	createdBytes, err := readConfigAndTemplate(component.TemplateFile(), component)
+	if err != nil {
+		return err
+	}
 
-	jsonData, _ := readYAMLtoJSON(createdBytes)
+	jsonData, err := readYAMLtoJSON(createdBytes)
+	if err != nil {
+		return err
+	}
 
 	numberOfServices := len(jsonData["services"].([]interface{}))
 
@@ -145,13 +153,17 @@ func GenerateTemplate(component common.Component) {
 
 			if !strings.Contains(serviceName, "Service") {
 
-				WriteBytes([]byte(serviceContents), []byte(serviceFileName))
+				if _, err := WriteBytes([]byte(serviceContents), []byte(serviceFileName)); err != nil {
+					return err
+				}
 
 			}
 
 		} else {
 
-			WriteBytes([]byte(serviceContents), []byte(serviceFileName))
+			if _, err := WriteBytes([]byte(serviceContents), []byte(serviceFileName)); err != nil {
+				return err
+			}
 
 		}
 
@@ -160,7 +172,7 @@ func GenerateTemplate(component common.Component) {
 
 			file, err := os.OpenFile(serviceFileName, os.O_APPEND|os.O_WRONLY, 0644)
 			if err != nil {
-				log.Fatal("Error: " + err.Error() + ".")
+				return err
 			}
 			defer file.Close()
 
@@ -169,7 +181,7 @@ func GenerateTemplate(component common.Component) {
 
 			log.DebugLF("Writing addition data to yb-platform config: " + additionalEntryString)
 			if _, err := file.WriteString(additionalEntryString); err != nil {
-				log.Fatal("Error: " + err.Error() + ".")
+				return err
 			}
 
 		}
@@ -178,4 +190,5 @@ func GenerateTemplate(component common.Component) {
 			" succesfully applied.")
 
 	}
+	return nil
 }

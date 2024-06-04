@@ -26,7 +26,7 @@ import (
 type prometheusDirectories struct {
 	SystemdFileLocation string
 	ConfFileLocation    string // This is used during config generation
-	WebConfFile					string
+	WebConfFile         string
 	templateFileName    string
 	DataDir             string
 	PromDir             string
@@ -37,7 +37,7 @@ func newPrometheusDirectories() prometheusDirectories {
 	return prometheusDirectories{
 		SystemdFileLocation: common.SystemdDir + "/prometheus.service",
 		ConfFileLocation:    common.GetSoftwareRoot() + "/prometheus/conf/prometheus.yml",
-		WebConfFile:				 common.GetSoftwareRoot() + "/prometheus/conf/web.yml",
+		WebConfFile:         common.GetSoftwareRoot() + "/prometheus/conf/web.yml",
 		templateFileName:    "yba-installer-prometheus.yml",
 		DataDir:             common.GetBaseInstall() + "/data/prometheus",
 		PromDir:             common.GetSoftwareRoot() + "/prometheus",
@@ -74,6 +74,10 @@ func (prom Prometheus) getConfFile() string {
 // TemplateFile returns service's templated config file path
 func (prom Prometheus) TemplateFile() string {
 	return prom.templateFileName
+}
+
+func (prom Prometheus) SystemdFile() string {
+	return prom.SystemdFileLocation
 }
 
 // Name returns the name of the service.
@@ -209,6 +213,11 @@ func (prom Prometheus) Restart() error {
 	log.Info("Restarting prometheus..")
 
 	if common.HasSudoAccess() {
+		// reload systemd daemon
+		if out := shell.Run(common.Systemctl, "daemon-reload"); !out.SucceededOrLog() {
+			return out.Error
+		}
+
 		if out := shell.Run(common.Systemctl, "restart", "prometheus"); !out.SucceededOrLog() {
 			return out.Error
 		}
@@ -261,11 +270,15 @@ func (prom Prometheus) Uninstall(removeData bool) error {
 // Upgrade will NOT restart the service, the old version is expected to still be runnins
 func (prom Prometheus) Upgrade() error {
 	prom.prometheusDirectories = newPrometheusDirectories()
-	config.GenerateTemplate(prom) // No need to reload systemd, start takes care of that for us.
+	if err := config.GenerateTemplate(prom); err != nil {
+		return err
+	}
 	if err := prom.FixBasicAuth(); err != nil {
 		return err
 	}
-	prom.moveAndExtractPrometheusPackage()
+	if err := prom.moveAndExtractPrometheusPackage(); err != nil {
+		return err
+	}
 	if err := prom.createPrometheusSymlinks(); err != nil {
 		return err
 	}
@@ -273,7 +286,9 @@ func (prom Prometheus) Upgrade() error {
 	//have the necessary access.
 	if common.HasSudoAccess() {
 		userName := viper.GetString("service_username")
-		common.Chown(common.GetSoftwareRoot()+"/prometheus", userName, userName, true)
+		if err := common.Chown(common.GetSoftwareRoot()+"/prometheus", userName, userName, true); err != nil {
+			return err
+		}
 	}
 
 	//Crontab based monitoring for non-root installs.
@@ -304,15 +319,18 @@ func (prom Prometheus) Status() (common.Status, error) {
 	// Get the service status
 	if common.HasSudoAccess() {
 		props := systemd.Show(filepath.Base(prom.SystemdFileLocation), "LoadState", "SubState",
-			"ActiveState")
+			"ActiveState", "ActiveEnterTimestamp", "ActiveExitTimestamp")
 		if props["LoadState"] == "not-found" {
 			status.Status = common.StatusNotInstalled
 		} else if props["SubState"] == "running" {
 			status.Status = common.StatusRunning
+			status.Since = common.StatusSince(props["ActiveEnterTimestamp"])
 		} else if props["ActiveState"] == "inactive" {
 			status.Status = common.StatusStopped
+			status.Since = common.StatusSince(props["ActiveExitTimestamp"])
 		} else {
 			status.Status = common.StatusErrored
+			status.Since = common.StatusSince(props["ActiveExitTimestamp"])
 		}
 	} else {
 		out := shell.Run("pgrep", "prometheus")
@@ -387,14 +405,27 @@ func (prom Prometheus) FixBasicAuth() error {
 
 // FinishReplicatedMigrate completest the replicated migration prometheus specific tasks
 func (prom Prometheus) FinishReplicatedMigrate() error {
-	links := []string{
-		filepath.Join(prom.DataDir, "storage"),
-		filepath.Join(prom.DataDir, "swamper_targets"),
-		filepath.Join(prom.DataDir, "swamper_rules"),
+	rootDir := common.GetReplicatedBaseDir()
+	linkDirs := []struct {
+		src  string
+		dest string
+	}{
+		{
+			filepath.Join(rootDir, "prometheusv2"),
+			filepath.Join(prom.DataDir, "storage"),
+		},
+		{
+			filepath.Join(rootDir, "/yugaware/swamper_targets"),
+			filepath.Join(prom.DataDir, "swamper_targets"),
+		},
+		{
+			filepath.Join(rootDir, "yugaware/swamper_rules"),
+			filepath.Join(prom.DataDir, "swamper_rules"),
+		},
 	}
 
-	for _, link := range links {
-		if err := common.ResolveSymlink(link); err != nil {
+	for _, link := range linkDirs {
+		if err := common.ResolveSymlink(link.src, link.dest); err != nil {
 			return fmt.Errorf("could not complete prometheus migration: %w", err)
 		}
 	}

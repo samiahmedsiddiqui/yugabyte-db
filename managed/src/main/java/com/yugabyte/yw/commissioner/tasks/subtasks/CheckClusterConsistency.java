@@ -9,14 +9,20 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.commissioner.tasks.params.ServerSubTaskParams;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.config.CustomerConfKeys;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.client.ListLiveTabletServersResponse;
@@ -34,6 +40,7 @@ public class CheckClusterConsistency extends ServerSubTaskBase {
   }
 
   public static class Params extends ServerSubTaskParams {
+    public Set<String> skipMayBeRunning = new HashSet<>();
     public boolean skipToBeRemoved = true;
   }
 
@@ -53,20 +60,44 @@ public class CheckClusterConsistency extends ServerSubTaskBase {
     String certificate = universe.getCertificateNodetoNode();
     log.info("Running {} on masterAddress = {}.", getName(), masterAddresses);
     Set<String> errors;
+    boolean cloudEnabled =
+        confGetter.getConfForScope(
+            Customer.get(universe.getCustomerId()), CustomerConfKeys.cloudEnabled);
+    if (cloudEnabled) {
+      log.debug("Skipping check for ybm");
+      return;
+    }
+    String softwareVersion =
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.ybSoftwareVersion;
+    if (CommonUtils.isReleaseBefore(CommonUtils.MIN_LIVE_TABLET_SERVERS_RELEASE, softwareVersion)) {
+      log.debug("ListLiveTabletServers is not supported for {} version", softwareVersion);
+      return;
+    }
+    String runtimeConfigInfo =
+        "Please contact Yugabyte Support. To override"
+            + " this check (not recommended), briefly disable the runtime config "
+            + UniverseConfKeys.verifyClusterStateBeforeTask.getKey()
+            + ".";
     try (YBClient ybClient = ybService.getClient(masterAddresses, certificate)) {
-      errors = doCheckServers(ybClient, universe);
+      errors = doCheckServers(ybClient, universe, cloudEnabled);
     } catch (Exception e) {
-      throw new RuntimeException("Failed to compare current state", e);
+      throw new RuntimeException(
+          "Unable to verify cluster consistency (CheckClusterConsistency). "
+              + runtimeConfigInfo
+              + " Encountered error: "
+              + e);
     }
     if (!errors.isEmpty()) {
       throw new PlatformServiceException(
           BAD_REQUEST,
-          "Current cluster state doesn't correspond to desired state: "
+          "YBA metadata seems inconsistent with actual universe state. "
+              + runtimeConfigInfo
+              + " Error list: "
               + errors.stream().collect(Collectors.joining(",")));
     }
   }
 
-  private Set<String> doCheckServers(YBClient ybClient, Universe universe) {
+  private Set<String> doCheckServers(YBClient ybClient, Universe universe, boolean cloudEnabled) {
     Set<String> errors = new HashSet<>();
     doWithConstTimeout(
         DELAY_BETWEEN_RETRIES_MS,
@@ -74,29 +105,9 @@ public class CheckClusterConsistency extends ServerSubTaskBase {
         () -> {
           errors.clear();
           try {
-            ListMastersResponse listMastersResponse = ybClient.listMasters();
-            Set<String> masterIps =
-                listMastersResponse.getMasters().stream()
-                    .map(m -> m.getHost())
-                    .collect(Collectors.toSet());
-
-            errors.addAll(checkServers(masterIps, universe, UniverseTaskBase.ServerType.MASTER));
-
-            boolean hasLeader =
-                listMastersResponse.getMasters().stream()
-                    .filter(m -> m.isLeader())
-                    .findFirst()
-                    .isPresent();
-            if (!hasLeader) {
-              errors.add("No master leader!");
-            }
-            ListLiveTabletServersResponse liveTabletServersResponse =
-                ybClient.listLiveTabletServers();
-            Set<String> tserverIps =
-                liveTabletServersResponse.getTabletServers().stream()
-                    .map(ts -> ts.getPrivateAddress().getHost())
-                    .collect(Collectors.toSet());
-            errors.addAll(checkServers(tserverIps, universe, UniverseTaskBase.ServerType.TSERVER));
+            errors.addAll(
+                checkCurrentServers(
+                    ybClient, universe, taskParams().skipMayBeRunning, false, cloudEnabled));
           } catch (Exception e) {
             throw new PlatformServiceException(INTERNAL_SERVER_ERROR, e.getMessage());
           }
@@ -108,25 +119,89 @@ public class CheckClusterConsistency extends ServerSubTaskBase {
     return errors;
   }
 
-  private Set<String> checkServers(
-      Set<String> currentIPs, Universe universe, UniverseTaskBase.ServerType serverType) {
+  public static List<String> checkCurrentServers(
+      YBClient ybClient,
+      Universe universe,
+      @Nullable Set<String> skipMaybeRunning,
+      boolean strict,
+      boolean cloudEnabled)
+      throws Exception {
+    List<String> errors = new ArrayList<>();
+    ListMastersResponse listMastersResponse = ybClient.listMasters();
+    Set<String> masterIps =
+        listMastersResponse.getMasters().stream().map(m -> m.getHost()).collect(Collectors.toSet());
+
+    errors.addAll(
+        checkServers(
+            masterIps,
+            skipMaybeRunning,
+            universe,
+            UniverseTaskBase.ServerType.MASTER,
+            strict,
+            cloudEnabled));
+
+    boolean hasLeader =
+        listMastersResponse.getMasters().stream().filter(m -> m.isLeader()).findFirst().isPresent();
+    if (!hasLeader) {
+      errors.add("No master leader!");
+    }
+    ListLiveTabletServersResponse liveTabletServersResponse = ybClient.listLiveTabletServers();
+    Set<String> tserverIps =
+        liveTabletServersResponse.getTabletServers().stream()
+            .map(ts -> ts.getPrivateAddress().getHost())
+            .collect(Collectors.toSet());
+    errors.addAll(
+        checkServers(
+            tserverIps,
+            skipMaybeRunning,
+            universe,
+            UniverseTaskBase.ServerType.TSERVER,
+            strict,
+            cloudEnabled));
+    return errors;
+  }
+
+  private static Set<String> checkServers(
+      Set<String> currentIPs,
+      Set<String> skipMaybeRunningNodes,
+      Universe universe,
+      UniverseTaskBase.ServerType serverType,
+      boolean strict,
+      boolean cloudEnabled) {
     Set<String> errors = new HashSet<>();
     List<NodeDetails> neededServers =
         universe.getUniverseDetails().nodeDetailsSet.stream()
-            .filter(this::isInActiveState)
+            .filter(CheckClusterConsistency::isInActiveState)
             .filter(
                 n -> serverType == UniverseTaskBase.ServerType.MASTER ? n.isMaster : n.isTserver)
             .collect(Collectors.toList());
 
     Set<String> expectedIPs =
-        neededServers.stream().map(n -> n.cloudInfo.private_ip).collect(Collectors.toSet());
+        neededServers.stream()
+            .map(
+                n -> {
+                  if (GFlagsUtil.isUseSecondaryIP(universe, n, cloudEnabled)) {
+                    return n.cloudInfo.secondary_private_ip;
+                  } else {
+                    return n.cloudInfo.private_ip;
+                  }
+                })
+            .collect(Collectors.toSet());
 
     log.debug("Checking {}: expected {} actual {}", serverType, expectedIPs, currentIPs);
 
     for (String currentIP : currentIPs) {
       if (!expectedIPs.remove(currentIP)) {
-        NodeDetails nodeDetails = universe.getNodeByPrivateIP(currentIP);
+        NodeDetails nodeDetails = universe.getNodeByAnyIP(currentIP);
         if (nodeDetails != null) {
+          if (skipMaybeRunningNodes != null
+              && skipMaybeRunningNodes.contains(nodeDetails.nodeName)) {
+            log.warn(
+                "{} is running on {} but not expected, skipping because may be running",
+                serverType.name(),
+                currentIP);
+            continue;
+          }
           errors.add(
               String.format(
                   "Unexpected %s: %s, node %s is not marked as %s",
@@ -139,16 +214,21 @@ public class CheckClusterConsistency extends ServerSubTaskBase {
         }
       }
     }
+    if (strict) {
+      for (String expectedIP : expectedIPs) {
+        errors.add(
+            String.format("Expected, but not present %s: %s", serverType.name(), expectedIP));
+      }
+    }
     return errors;
   }
 
-  private boolean isInActiveState(NodeDetails nodeDetails) {
+  private static boolean isInActiveState(NodeDetails nodeDetails) {
     return nodeDetails.state != NodeDetails.NodeState.ToBeAdded
         && nodeDetails.state != NodeDetails.NodeState.Stopped
         && nodeDetails.state != NodeDetails.NodeState.Stopping
         && nodeDetails.state != NodeDetails.NodeState.Removed
         && nodeDetails.state != NodeDetails.NodeState.Removing
-        && nodeDetails.state != NodeDetails.NodeState.Terminated
         && nodeDetails.state != NodeDetails.NodeState.Terminating
         && nodeDetails.state != NodeDetails.NodeState.Decommissioned;
   }

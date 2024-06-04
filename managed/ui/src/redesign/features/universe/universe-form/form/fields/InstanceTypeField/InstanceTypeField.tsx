@@ -1,8 +1,8 @@
-import { ChangeEvent, ReactElement, useState } from 'react';
+import { ChangeEvent, ReactElement } from 'react';
 import pluralize from 'pluralize';
 import { useQuery } from 'react-query';
-import { useUpdateEffect } from 'react-use';
 import { useTranslation } from 'react-i18next';
+import { useUpdateEffect } from 'react-use';
 import { Controller, useFormContext, useWatch } from 'react-hook-form';
 import { Box } from '@material-ui/core';
 import {
@@ -21,13 +21,14 @@ import {
 } from './InstanceTypeFieldHelper';
 import { NodeType } from '../../../../../../utils/dtos';
 import { IsOsPatchingEnabled } from '../../../../../../../components/configRedesign/providerRedesign/components/linuxVersionCatalog/LinuxVersionUtils';
+import { useGetAllZones } from '../PlacementsField/PlacementsFieldHelper';
 
 import {
-  AvailabilityZone,
   CloudType,
   InstanceType,
   InstanceTypeWithGroup,
   MasterPlacementMode,
+  Placement,
   StorageType,
   UniverseFormData
 } from '../../../utils/dto';
@@ -39,7 +40,6 @@ import {
   MASTER_DEVICE_INFO_FIELD,
   MASTER_PLACEMENT_FIELD,
   SPOT_INSTANCE_FIELD,
-  PLACEMENTS_FIELD,
   CPU_ARCHITECTURE_FIELD
 } from '../../../utils/constants';
 import { useFormFieldStyles } from '../../../universeMainStyle';
@@ -87,8 +87,7 @@ export const InstanceTypeField = ({
     ? useWatch({ name: MASTER_DEVICE_INFO_FIELD })
     : useWatch({ name: DEVICE_INFO_FIELD });
   const masterPlacement = useWatch({ name: MASTER_PLACEMENT_FIELD });
-  const zones = useWatch({ name: PLACEMENTS_FIELD }).map((zone: AvailabilityZone) => zone.name);
-
+  const zones = useGetAllZones().map((zone: Placement) => zone.name);
   const handleChange = (e: ChangeEvent<{}>, option: any) => {
     setValue(UPDATE_FIELD, option?.instanceTypeCode, { shouldValidate: true });
   };
@@ -104,7 +103,12 @@ export const InstanceTypeField = ({
   const isOsPatchingEnabled = IsOsPatchingEnabled();
 
   const { data, isLoading, refetch } = useQuery(
-    [QUERY_KEY.getInstanceTypes, provider?.uuid, JSON.stringify(zones), isOsPatchingEnabled ? cpuArch : null],
+    [
+      QUERY_KEY.getInstanceTypes,
+      provider?.uuid,
+      JSON.stringify(zones),
+      isOsPatchingEnabled ? cpuArch : null
+    ],
     () => api.getInstanceTypes(provider?.uuid, zones, isOsPatchingEnabled ? cpuArch : null),
     {
       enabled: !!provider?.uuid && zones.length > 0,

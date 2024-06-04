@@ -12,23 +12,30 @@
 //
 #pragma once
 
+#include <sys/socket.h>
+
 #include <atomic>
 #include <string>
+
+#include "yb/ash/wait_state_fwd.h"
 
 #include "yb/common/entity_ids_types.h"
 #include "yb/common/wire_protocol.h"
 
 #include "yb/gutil/casts.h"
 
+#include "yb/util/atomic.h"
 #include "yb/util/enums.h"
 #include "yb/util/locks.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/uuid.h"
 
-DECLARE_bool(TEST_export_wait_state_names);
+DECLARE_bool(ysql_yb_enable_ash);
 
+#define SET_WAIT_STATUS_TO_CODE(ptr, code) \
+  if ((ptr)) (ptr)->set_code(code, __PRETTY_FUNCTION__)
 #define SET_WAIT_STATUS_TO(ptr, code) \
-  if ((ptr)) (ptr)->set_code(BOOST_PP_CAT(yb::ash::WaitStateCode::k, code))
+  SET_WAIT_STATUS_TO_CODE(ptr, BOOST_PP_CAT(yb::ash::WaitStateCode::k, code))
 #define SET_WAIT_STATUS(code) \
   SET_WAIT_STATUS_TO(yb::ash::WaitStateInfo::CurrentWaitState(), code)
 
@@ -36,8 +43,18 @@ DECLARE_bool(TEST_export_wait_state_names);
   yb::ash::ScopedAdoptWaitState _scoped_state { (ptr) }
 
 #define SCOPED_WAIT_STATUS(code) \
-  yb::ash::ScopedWaitStatus _scoped_status(BOOST_PP_CAT(yb::ash::WaitStateCode::k, code))
+  yb::ash::ScopedWaitStatus _scoped_status( \
+      BOOST_PP_CAT(yb::ash::WaitStateCode::k, code), __PRETTY_FUNCTION__)
 
+#define ASH_ENABLE_CONCURRENT_UPDATES_FOR(ptr) \
+  yb::ash::EnableConcurrentUpdates(ptr)
+#define ASH_ENABLE_CONCURRENT_UPDATES() \
+  ASH_ENABLE_CONCURRENT_UPDATES_FOR(yb::ash::WaitStateInfo::CurrentWaitState())
+
+
+namespace yb {
+class Trace;
+}  // namespace yb
 namespace yb::ash {
 
 // Wait components refer to which process the specific wait event is part of.
@@ -59,17 +76,11 @@ namespace yb::ash {
 //   a specific wait event component.
 // - The next 8 bits are set to 0, and reserved for future use.
 // - Each wait event class may have up to 2^16 wait events.
-//
-// Note that it's not possible to get the wait event class solely from the 'class'
-// bits because those bits are reused for each component. You need the first 8 bits
-// to get the wait event class. Similar thing applies for wait event.
 
 #define YB_ASH_CLASS_BITS          4U
 #define YB_ASH_CLASS_POSITION      24U
-
-#define YB_ASH_MAKE_CLASS(comp) \
-    (yb::to_underlying(BOOST_PP_CAT(yb::ash::Component::k, comp)) << \
-     YB_ASH_CLASS_BITS)
+#define YB_ASH_COMPONENT_POSITION  (YB_ASH_CLASS_POSITION + YB_ASH_CLASS_BITS)
+#define YB_ASH_COMPONENT_BITS      4U
 
 #define YB_ASH_MAKE_EVENT(class) \
     (static_cast<uint32_t>(yb::to_underlying(BOOST_PP_CAT(yb::ash::Class::k, class))) << \
@@ -78,36 +89,46 @@ namespace yb::ash {
 // YB ASH Wait Components (4 bits)
 // Don't reorder this enum
 YB_DEFINE_TYPED_ENUM(Component, uint8_t,
-    (kPostgres)
-    (kYbClient)
-    (kTServer));
+    (kYSQL)
+    (kYCQL)
+    (kTServer)
+    (kMaster));
 
-// YB ASH Wait Classes (8 bits)
+// YB ASH Wait Classes (4 bits)
 // Don't reorder this enum
 YB_DEFINE_TYPED_ENUM(Class, uint8_t,
     // PG classes
-    ((kTServerWait, YB_ASH_MAKE_CLASS(Postgres)))
+    (kTServerWait)
 
-    // YB Client classes
-    ((kPgClientService, YB_ASH_MAKE_CLASS(YbClient)))
-    (kCqlWaitState)
+    // QL/YB Client classes
+    (kYCQLQueryProcessing)
     (kClient)
 
-    // Tserver classes
-    ((kRpc, YB_ASH_MAKE_CLASS(TServer)))
-    (kFlushAndCompaction)
+    // Docdb related classes
+    (kRpc)
     (kConsensus)
     (kTabletWait)
     (kRocksDB)
     (kCommon));
 
+// This is YB equivalent of wait events from pgstat.h, the term wait event and wait state
+// is used interchangeably in the code. The uint32_t values of all the wait events across PG
+// and WaitStateCode is distinct, so PG can use these wait events as well.
+//
+// The difference between PG and us is that this enum is only 28 bits long. 4 bits (component bits)
+// are prepended while fetching the wait events so that we can reuse some wait events across
+// components. Another difference is that if a PG wait event were casted/interpreted as an
+// ASH wait event, the bits where we expect to see class information would actually contain type
+// information.
+//
+// The wait event type is not directly encoded in our wait events.
 YB_DEFINE_TYPED_ENUM(WaitStateCode, uint32_t,
     // Don't change the value of kUnused
     ((kUnused, 0xFFFFFFFFU))
 
     // Wait states related to postgres
-    // Don't change the position of kPostgresReserved
-    ((kPostgresReserved, YB_ASH_MAKE_EVENT(TServerWait)))
+    // Don't change the position of kYSQLReserved
+    ((kYSQLReserved, YB_ASH_MAKE_EVENT(TServerWait)))
     (kCatalogRead)
     (kIndexRead)
     (kStorageRead)
@@ -116,6 +137,7 @@ YB_DEFINE_TYPED_ENUM(WaitStateCode, uint32_t,
     // Common wait states
     ((kOnCpu_Active, YB_ASH_MAKE_EVENT(Common)))
     (kOnCpu_Passive)
+    (kIdle)
     (kRpc_Done)
     (kRpcs_WaitOnMutexInShutdown)
     (kRetryableRequests_SaveToDisk)
@@ -127,40 +149,75 @@ YB_DEFINE_TYPED_ENUM(WaitStateCode, uint32_t,
     (kCreatingNewTablet)
     (kSaveRaftGroupMetadataToDisk)
     (kTransactionStatusCache_DoGetCommitData)
-    (kWaitForYsqlBackendsCatalogVersion)
-    (kWriteAutoFlagsConfigToDisk)
-    (kWriteInstanceMetadataToDisk)
+    (kWaitForYSQLBackendsCatalogVersion)
     (kWriteSysCatalogSnapshotToDisk)
     (kDumpRunningRpc_WaitOnReactor)
     (kConflictResolution_ResolveConficts)
     (kConflictResolution_WaitOnConflictingTxns)
 
     // Wait states related to consensus
-    ((kWAL_Open, YB_ASH_MAKE_EVENT(Consensus))) // waiting for WALEdits to be persisted.
-    (kWAL_Close)
-    (kWAL_Write)
-    (kWAL_AllocateNewSegment)
-    (kWAL_Sync)
-    (kWAL_Wait)
-    (kWaitOnWAL)
-    (kRaft_WaitingForQuorum)
+    ((kRaft_WaitingForReplication, YB_ASH_MAKE_EVENT(Consensus)))
     (kRaft_ApplyingEdits)
+    (kWAL_Append)
+    (kWAL_Sync)
     (kConsensusMeta_Flush)
     (kReplicaState_TakeUpdateLock)
-    (kReplicaState_WaitForMajorityReplicatedHtLeaseExpiration)
 
     // Wait states related to RocksDB
-    ((kRocksDB_OnCpu_Active, YB_ASH_MAKE_EVENT(RocksDB)))
-    (kRocksDB_ReadBlockFromFile)
-    (kRocksDB_ReadIO));
+    ((kRocksDB_ReadBlockFromFile, YB_ASH_MAKE_EVENT(RocksDB)))
+    (kRocksDB_OpenFile)
+    (kRocksDB_WriteToFile)
+    (kRocksDB_Flush)
+    (kRocksDB_Compaction)
+    (kRocksDB_PriorityThreadPoolTaskPaused)
+    (kRocksDB_CloseFile)
+    (kRocksDB_RateLimiter)
+    (kRocksDB_WaitForSubcompaction)
+    (kRocksDB_NewIterator)
+
+    // Wait states related to YCQL
+    ((kYCQL_Parse, YB_ASH_MAKE_EVENT(YCQLQueryProcessing)))
+    (kYCQL_Read)
+    (kYCQL_Write)
+    (kYCQL_Analyze)
+    (kYCQL_Execute)
+
+    // Wait states related to YBClient
+    ((kYBClient_WaitingOnDocDB, YB_ASH_MAKE_EVENT(Client)))
+    (kYBClient_LookingUpTablet)
+);
+
+// We also want to track background operations such as, log-append
+// flush and compactions. However, as they are not user-generated, they
+// do not have an automatic query id from the ql layer. We use these
+// fixed query-ids to identify these background tasks.
+YB_DEFINE_TYPED_ENUM(FixedQueryId, uint8_t,
+  ((kQueryIdForLogAppender, 1))
+  ((kQueryIdForFlush, 2))
+  ((kQueryIdForCompaction, 3))
+  ((kQueryIdForRaftUpdateConsensus, 4))
+  ((kQueryIdForCatalogRequests, 5))
+  ((kQueryIdForLogBackgroundSync, 6))
+);
+
+YB_DEFINE_TYPED_ENUM(WaitStateType, uint8_t,
+  (kCpu)
+  (kDiskIO)
+  (kNetwork)
+  (kWaitOnCondition)
+);
+
+WaitStateType GetWaitStateType(WaitStateCode code);
 
 struct AshMetadata {
   Uuid root_request_id = Uuid::Nil();
   Uuid yql_endpoint_tserver_uuid = Uuid::Nil();
   uint64_t query_id = 0;
   uint64_t session_id = 0;
+  uint32_t database_id = 0;
   int64_t rpc_request_id = 0;
   HostPort client_host_port{};
+  uint8_t addr_family = AF_UNSPEC;
 
   void set_client_host_port(const HostPort& host_port);
 
@@ -179,11 +236,17 @@ struct AshMetadata {
     if (other.session_id != 0) {
       session_id = other.session_id;
     }
+    if (other.database_id != 0) {
+      database_id = other.database_id;
+    }
     if (other.rpc_request_id != 0) {
       rpc_request_id = other.rpc_request_id;
     }
     if (other.client_host_port != HostPort()) {
       client_host_port = other.client_host_port;
+    }
+    if (other.addr_family != AF_UNSPEC) {
+      addr_family = other.addr_family;
     }
   }
 
@@ -209,6 +272,11 @@ struct AshMetadata {
     } else { // valid PgClient session id cannot be zero
       pb->clear_session_id();
     }
+    if (database_id != 0) {
+      pb->set_database_id(database_id);
+    } else {
+      pb->clear_database_id();
+    }
     if (rpc_request_id != 0) {
       pb->set_rpc_request_id(rpc_request_id);
     } else {
@@ -218,6 +286,11 @@ struct AshMetadata {
       HostPortToPB(client_host_port, pb->mutable_client_host_port());
     } else {
       pb->clear_client_host_port();
+    }
+    if (addr_family != AF_UNSPEC) {
+      pb->set_addr_family(addr_family);
+    } else {
+      pb->clear_addr_family();
     }
   }
 
@@ -244,16 +317,18 @@ struct AshMetadata {
         yql_endpoint_tserver_uuid,             // yql_endpoint_tserver_uuid
         pb.query_id(),                         // query_id
         pb.session_id(),                       // session_id
+        pb.database_id(),                      // database_id
         pb.rpc_request_id(),                   // rpc_request_id
-        HostPortFromPB(pb.client_host_port())  // client_host_port
+        HostPortFromPB(pb.client_host_port()), // client_host_port
+        static_cast<uint8_t>(pb.addr_family()) // addr_family
     };
   }
 };
 
 struct AshAuxInfo {
-  TableId table_id = "";
-  TabletId tablet_id = "";
-  std::string method = "";
+  TableId table_id{};
+  TabletId tablet_id{};
+  std::string method{};
 
   std::string ToString() const;
 
@@ -272,15 +347,12 @@ struct AshAuxInfo {
   }
 };
 
-class WaitStateInfo;
-using WaitStateInfoPtr = std::shared_ptr<WaitStateInfo>;
-
 class WaitStateInfo {
  public:
-  WaitStateInfo() = default;
-  explicit WaitStateInfo(AshMetadata&& meta);
+  WaitStateInfo();
+  virtual ~WaitStateInfo() = default;
 
-  void set_code(WaitStateCode c);
+  void set_code(WaitStateCode c, const char* location);
   WaitStateCode code() const;
   std::atomic<WaitStateCode>& mutable_code();
 
@@ -290,6 +362,7 @@ class WaitStateInfo {
   void set_query_id(uint64_t query_id) EXCLUDES(mutex_);
   uint64_t session_id() EXCLUDES(mutex_);
   void set_session_id(uint64_t session_id) EXCLUDES(mutex_);
+  int64_t rpc_request_id() EXCLUDES(mutex_);
   void set_rpc_request_id(int64_t id) EXCLUDES(mutex_);
   void set_client_host_port(const HostPort& host_port) EXCLUDES(mutex_);
 
@@ -314,18 +387,42 @@ class WaitStateInfo {
   }
 
   template <class PB>
-  void ToPB(PB* pb) EXCLUDES(mutex_) {
+  void ToPB(PB* pb, bool export_wait_state_names) EXCLUDES(mutex_) {
     std::lock_guard lock(mutex_);
     metadata_.ToPB(pb->mutable_metadata());
     WaitStateCode code = this->code();
-    pb->set_wait_status_code(yb::to_underlying(code));
-    if (FLAGS_TEST_export_wait_state_names) {
-      pb->set_wait_status_code_as_string(yb::ToString(code));
+    pb->set_wait_state_code(yb::to_underlying(code));
+    if (export_wait_state_names) {
+      pb->set_wait_state_code_as_string(yb::ToString(code));
     }
     aux_info_.ToPB(pb->mutable_aux_info());
   }
 
   std::string ToString() const EXCLUDES(mutex_);
+
+  void TEST_SleepForTests(uint32_t sleep_time_ms);
+  static bool TEST_EnteredSleep();
+
+  template <class T>
+  static std::shared_ptr<T> CreateIfAshIsEnabled() {
+    return FLAGS_ysql_yb_enable_ash
+              ? std::make_shared<T>()
+              : nullptr;
+  }
+
+  virtual void VTrace(int level, GStringPiece data) {
+    VTraceTo(nullptr, level, data);
+  }
+
+  virtual std::string DumpTraceToString() {
+    return "n/a";
+  }
+
+  void EnableConcurrentUpdates();
+  bool IsConcurrentUpdatesEnabled();
+
+ protected:
+  void VTraceTo(Trace* trace, int level, GStringPiece data);
 
  private:
   std::atomic<WaitStateCode> code_{WaitStateCode::kUnused};
@@ -333,7 +430,12 @@ class WaitStateInfo {
   mutable simple_spinlock mutex_;
   AshMetadata metadata_ GUARDED_BY(mutex_);
   AshAuxInfo aux_info_ GUARDED_BY(mutex_);
+
+  std::atomic_bool concurrent_updates_allowed_{false};
+  std::atomic<uint8_t> TEST_num_sleeps_{0};
 };
+
+void EnableConcurrentUpdates(const WaitStateInfoPtr& ptr);
 
 // A helper to adopt a WaitState and revert to the previous WaitState based on RAII.
 // This should only be used on the stack (and thus created and destroyed
@@ -364,14 +466,32 @@ class ScopedAdoptWaitState {
 // be reverted back to the previous state.
 class ScopedWaitStatus {
  public:
-  explicit ScopedWaitStatus(WaitStateCode code);
+  ScopedWaitStatus(WaitStateCode code, const char* location);
   ~ScopedWaitStatus();
 
  private:
   const WaitStateCode code_;
+  // The location where the scoped wait state is created. Used for printing useful debug messages.
+  const char* location_;
   const WaitStateCode prev_code_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedWaitStatus);
 };
+
+// Used to track wait-states for Flush/Compaction and LocalInboundCalls.
+class WaitStateTracker {
+ public:
+  void Track(const WaitStateInfoPtr&) EXCLUDES(mutex_);
+  void Untrack(const WaitStateInfoPtr&) EXCLUDES(mutex_);
+  std::vector<yb::ash::WaitStateInfoPtr> GetWaitStates() const EXCLUDES(mutex_);
+
+ private:
+  mutable std::mutex mutex_;
+  std::unordered_set<yb::ash::WaitStateInfoPtr> entries_ GUARDED_BY(mutex_);
+};
+
+WaitStateTracker& FlushAndCompactionWaitStatesTracker();
+WaitStateTracker& RaftLogAppenderWaitStatesTracker();
+WaitStateTracker& SharedMemoryPgPerformTracker();
 
 }  // namespace yb::ash

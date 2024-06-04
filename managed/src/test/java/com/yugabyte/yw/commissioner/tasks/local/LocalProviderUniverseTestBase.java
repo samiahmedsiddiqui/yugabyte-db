@@ -2,22 +2,24 @@
 
 package com.yugabyte.yw.commissioner.tasks.local;
 
-import static com.yugabyte.yw.commissioner.tasks.CommissionerBaseTest.waitForTask;
 import static com.yugabyte.yw.common.TestHelper.testDatabase;
 import static com.yugabyte.yw.common.Util.YUGABYTE_DB;
 import static com.yugabyte.yw.forms.UniverseConfigureTaskParams.ClusterOperationType.CREATE;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.lessThan;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.google.common.collect.ImmutableList;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.cloud.PublicCloudConstants;
+import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.tasks.CommissionerBaseTest;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
+import com.yugabyte.yw.commissioner.tasks.subtasks.CheckClusterConsistency;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.LocalNodeManager;
 import com.yugabyte.yw.common.LocalNodeUniverseManager;
@@ -26,12 +28,16 @@ import com.yugabyte.yw.common.NodeUIApiHelper;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.PlatformGuiceApplicationBaseTest;
 import com.yugabyte.yw.common.ReleaseManager;
+import com.yugabyte.yw.common.RetryTaskUntilCondition;
 import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.YcqlQueryExecutor;
 import com.yugabyte.yw.common.backuprestore.BackupHelper;
+import com.yugabyte.yw.common.certmgmt.CertificateHelper;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.RuntimeConfService;
+import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.common.services.YBClientService;
@@ -43,6 +49,7 @@ import com.yugabyte.yw.forms.RestartTaskParams;
 import com.yugabyte.yw.forms.RunQueryFormData;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseResp;
+import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.forms.UpgradeTaskParams;
 import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.AvailabilityZone;
@@ -81,6 +88,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import kamon.instrumentation.play.GuiceModule;
@@ -94,6 +102,7 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
 import org.junit.runner.Description;
 import org.yb.CommonTypes.TableType;
 import org.yb.client.GetMasterClusterConfigResponse;
@@ -108,25 +117,27 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
   private static final boolean IS_LINUX = System.getProperty("os.name").equalsIgnoreCase("linux");
   private static final Set<String> CONTROL_FILES =
       Set.of(LocalNodeManager.MASTER_EXECUTABLE, LocalNodeManager.TSERVER_EXECUTABLE);
-  private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyyMMdd'T'HHmmss.SSS");
+  private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyMMdd'T'HHmmss");
 
   protected static final String INSTANCE_TYPE_CODE = "c3.xlarge";
   protected static final String INSTANCE_TYPE_CODE_2 = "c5.xlarge";
 
   private static final String YB_PATH_ENV_KEY = "YB_PATH";
   private static final String BASE_DIR_ENV_KEY = "TEST_BASE_DIR";
+  private static final String SKIP_WAIT_FOR_CLUSTER_ENV_KEY = "YB_SKIP_WAIT_FOR_CLUSTER";
 
-  private static final String DEFAULT_BASE_DIR = "/tmp/testing";
+  private static final String DEFAULT_BASE_DIR = "/tmp/local";
   protected static String YBC_VERSION;
-  public static String DB_VERSION = "2.20.0.2-b1";
+  public static String DB_VERSION = "2.20.1.3-b3";
   private static final String DOWNLOAD_URL =
-      "https://downloads.yugabyte.com/releases/2.20.0.2/" + "yugabyte-2.20.0.2-b1-%s-%s.tar.gz";
+      "https://downloads.yugabyte.com/releases/2.20.1.3/" + "yugabyte-2.20.1.3-b3-%s-%s.tar.gz";
   private static final String YBC_BASE_S3_URL = "https://downloads.yugabyte.com/ybc/";
   private static final String YBC_BIN_ENV_KEY = "YBC_PATH";
-  private static final boolean KEEP_FAILED_UNIVERSE = false;
-  private static List<String> toCleanDirectories = ImmutableList.of("yugabyte_backup");
+  private static final boolean KEEP_FAILED_UNIVERSE = true;
 
   public static Map<String, String> GFLAGS = new HashMap<>();
+
+  private SimpleSqlPayload simpleSqlPayload;
 
   static {
     GFLAGS.put("load_balancer_max_over_replicated_tablets", "15");
@@ -134,7 +145,7 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     GFLAGS.put("load_balancer_max_concurrent_removals", "15");
     GFLAGS.put("transaction_table_num_tablets", "3");
     GFLAGS.put(GFlagsUtil.LOAD_BALANCER_INITIAL_DELAY_SECS, "120");
-    GFLAGS.put("tmp_dir", "/tmp/testing");
+    GFLAGS.put(GFlagsUtil.TMP_DIRECTORY, "");
   }
 
   public Map<String, String> getYbcGFlags(UniverseDefinitionTaskParams.UserIntent userIntent) {
@@ -174,6 +185,8 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
   protected static String os;
   protected static String subDir;
   protected static String testName;
+  // Whether to wait until all old tservers are removed from quorum and new ones are added.
+  protected static boolean waitForClusterToStabilize;
 
   protected LocalNodeManager localNodeManager;
   protected LocalNodeUniverseManager localNodeUniverseManager;
@@ -185,6 +198,10 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
   protected BackupHelper backupHelper;
   protected YcqlQueryExecutor ycqlQueryExecutor;
   protected UniverseTableHandler tableHandler;
+  protected CertificateHelper certificateHelper;
+  protected Commissioner commissioner;
+  protected SettableRuntimeConfigFactory settableRuntimeConfigFactory;
+  protected RuntimeConfService runtimeConfService;
 
   @BeforeClass
   public static void setUpEnv() {
@@ -199,9 +216,13 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
       arch = "x86_64";
     }
 
+    waitForClusterToStabilize = System.getenv(SKIP_WAIT_FOR_CLUSTER_ENV_KEY) == null;
     setUpYBSoftware(os, arch);
+    ybcBinPath = System.getenv(YBC_BIN_ENV_KEY);
     subDir = DATE_FORMAT.format(new Date());
   }
+
+  @Rule public Timeout globalTimeout = Timeout.seconds(600);
 
   private static void setUpBaseDir() {
     if (System.getenv(BASE_DIR_ENV_KEY) != null) {
@@ -226,7 +247,6 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
   }
 
   private void setUpYBCSoftware(String os, String arch) {
-    ybcBinPath = System.getenv(YBC_BIN_ENV_KEY);
     if (ybcBinPath == null) {
       String ybcVersion = confGetter.getGlobalConf(GlobalConfKeys.ybcStableVersion);
       YBC_VERSION = ybcVersion;
@@ -369,8 +389,7 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     return build.substring(0, build.indexOf("-"));
   }
 
-  @Before
-  public void setUp() {
+  private void injectDependencies() {
     universeCRUDHandler = app.injector().instanceOf(UniverseCRUDHandler.class);
     upgradeUniverseHandler = app.injector().instanceOf(UpgradeUniverseHandler.class);
     nodeUIApiHelper = app.injector().instanceOf(NodeUIApiHelper.class);
@@ -381,7 +400,17 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     backupHelper = app.injector().instanceOf(BackupHelper.class);
     ycqlQueryExecutor = app.injector().instanceOf(YcqlQueryExecutor.class);
     tableHandler = app.injector().instanceOf(UniverseTableHandler.class);
+    certificateHelper = app.injector().instanceOf(CertificateHelper.class);
+    commissioner = app.injector().instanceOf(Commissioner.class);
+    settableRuntimeConfigFactory = app.injector().instanceOf(SettableRuntimeConfigFactory.class);
+    runtimeConfService = app.injector().instanceOf(RuntimeConfService.class);
+  }
 
+  @Before
+  public void setUp() {
+    injectDependencies();
+
+    settableRuntimeConfigFactory.globalRuntimeConf().setValue("yb.releases.use_redesign", "false");
     Pair<Integer, Integer> ipRange = getIpRange();
     localNodeManager.setIpRangeStart(ipRange.getFirst());
     localNodeManager.setIpRangeEnd(ipRange.getSecond());
@@ -399,7 +428,7 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     testDir.mkdirs();
 
     YugawareProperty.addConfigProperty(
-        ReleaseManager.CONFIG_TYPE.name(), getMetadataJson(DB_VERSION, false), "release");
+        ReleaseManager.CONFIG_TYPE.name(), getMetadataJson(ybVersion, false), "release");
     YugawareProperty.addConfigProperty(
         ReleaseManager.YBC_CONFIG_TYPE.name(),
         getMetadataJson("ybc-" + YBC_VERSION, true),
@@ -422,11 +451,11 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     keyInfo.sshPort = 22;
     accessKey = AccessKey.create(provider.getUuid(), keyCode, keyInfo);
 
-    region = Region.create(provider, "region-1", "PlacementRegion 1", "default-image");
-    az1 = AvailabilityZone.createOrThrow(region, "az-1", "PlacementAZ 1", "subnet-1");
-    az2 = AvailabilityZone.createOrThrow(region, "az-2", "PlacementAZ 2", "subnet-2");
-    az3 = AvailabilityZone.createOrThrow(region, "az-3", "PlacementAZ 3", "subnet-3");
-    az4 = AvailabilityZone.createOrThrow(region, "az-4", "PlacementAZ 4", "subnet-4");
+    region = Region.create(provider, "region-1", "region-1", "default-image");
+    az1 = AvailabilityZone.createOrThrow(region, "az-1", "az-1", "subnet-1");
+    az2 = AvailabilityZone.createOrThrow(region, "az-2", "az-2", "subnet-2");
+    az3 = AvailabilityZone.createOrThrow(region, "az-3", "az-3", "subnet-3");
+    az4 = AvailabilityZone.createOrThrow(region, "az-4", "az-4", "subnet-4");
 
     instanceType =
         InstanceType.upsert(
@@ -498,20 +527,16 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
       };
 
   private void tearDown(boolean failed) {
-    log.error("tear down " + testName + " failed " + failed);
+    log.info("tear down " + testName + " failed " + failed);
+    if (simpleSqlPayload != null) {
+      simpleSqlPayload.stop();
+    }
     if (!failed || !KEEP_FAILED_UNIVERSE) {
-      localNodeManager.shutdown();
       try {
-        for (String dirName : toCleanDirectories) {
-          String path = baseDir + "/" + dirName;
-          File directory = new File(path);
-          if (directory.exists()) {
-            FileUtils.deleteDirectory(directory);
-          }
-        }
         FileUtils.deleteDirectory(new File(new File(new File(baseDir), subDir), testName));
       } catch (Exception ignored) {
       }
+      localNodeManager.shutdown();
     }
   }
 
@@ -593,7 +618,8 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     paramsCustomizer.accept(taskParams);
     // CREATE
     UniverseResp universeResp = universeCRUDHandler.createUniverse(customer, taskParams);
-    TaskInfo taskInfo = waitForTask(universeResp.taskUUID);
+    TaskInfo taskInfo =
+        waitForTask(universeResp.taskUUID, Universe.getOrBadRequest(universeResp.universeUUID));
     verifyUniverseTaskSuccess(taskInfo);
     Universe result = Universe.getOrBadRequest(universeResp.universeUUID);
     assertEquals(
@@ -620,7 +646,11 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
   }
 
   protected void initYSQL(Universe universe, String tableName, boolean authEnabled) {
-    NodeDetails nodeDetails = universe.getUniverseDetails().nodeDetailsSet.iterator().next();
+    NodeDetails nodeDetails =
+        universe.getUniverseDetails().nodeDetailsSet.stream()
+            .filter(n -> n.state.equals(NodeDetails.NodeState.Live))
+            .findFirst()
+            .orElse(null);
     if (StringUtils.isBlank(tableName)) {
       tableName = "some_table";
     }
@@ -677,7 +707,7 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
             : universe.getUniverseDetails().getPrimaryCluster().uuid;
     NodeDetails nodeDetails =
         universe.getUniverseDetails().nodeDetailsSet.stream()
-            .filter(n -> n.isInPlacement(cluserUUID))
+            .filter(n -> n.isInPlacement(cluserUUID) && n.state.equals(NodeDetails.NodeState.Live))
             .findFirst()
             .get();
     ShellResponse response =
@@ -787,14 +817,15 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     TaskInfo taskInfo =
         waitForTask(
             universeCRUDHandler.createCluster(
-                customer, Universe.getOrBadRequest(universe.getUniverseUUID()), taskParams));
+                customer, Universe.getOrBadRequest(universe.getUniverseUUID()), taskParams),
+            Universe.getOrBadRequest(universe.getUniverseUUID()));
     return taskInfo;
   }
 
   protected TaskInfo destroyUniverse(Universe universe, Customer customer)
       throws InterruptedException {
     UUID taskID = universeCRUDHandler.destroy(customer, universe, true, false, false);
-    TaskInfo taskInfo = waitForTask(taskID);
+    TaskInfo taskInfo = waitForTask(taskID, universe);
     return taskInfo;
   }
 
@@ -808,11 +839,26 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
       CatalogEntityInfo.ReplicationInfoPB replicationInfo = config.getReplicationInfo();
       CatalogEntityInfo.PlacementInfoPB liveReplicas = replicationInfo.getLiveReplicas();
       verifyCluster(primaryCluster, liveReplicas);
+      verifyMasterAddresses(universe);
       if (!universeDetails.getReadOnlyClusters().isEmpty()) {
         UniverseDefinitionTaskParams.Cluster asyncCluster =
             universeDetails.getReadOnlyClusters().get(0);
         CatalogEntityInfo.PlacementInfoPB readReplicas = replicationInfo.getReadReplicas(0);
         verifyCluster(asyncCluster, readReplicas);
+      }
+      if (waitForClusterToStabilize) {
+        RetryTaskUntilCondition condition =
+            new RetryTaskUntilCondition<>(
+                () -> {
+                  try {
+                    return CheckClusterConsistency.checkCurrentServers(
+                        client, universe, null, true, false);
+                  } catch (Exception e) {
+                    return Collections.singletonList("Got error: " + e.getMessage());
+                  }
+                },
+                List::isEmpty);
+        condition.retryUntilCond(10, TimeUnit.MINUTES.toSeconds(2));
       }
     } catch (Exception e) {
       throw new RuntimeException(e);
@@ -840,6 +886,41 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     assertEquals(zones, placementZones);
   }
 
+  protected void verifyMasterAddresses(Universe universe) {
+    List<String> masterAddresses = new ArrayList<>();
+    for (NodeDetails node : universe.getNodes()) {
+      if (node.state.equals(NodeDetails.NodeState.Live) && node.isMaster) {
+        masterAddresses.add(node.cloudInfo.private_ip + ":7100");
+      }
+    }
+
+    for (NodeDetails node : universe.getNodes()) {
+      if (node.state.equals(NodeDetails.NodeState.Live)) {
+        Map<String, String> varz = getVarz(node, universe, UniverseTaskBase.ServerType.TSERVER);
+        String masterAddress = varz.getOrDefault("tserver_master_addrs", "");
+        String[] gFlagMasterAddress = masterAddress.split(",");
+        assertEquals(gFlagMasterAddress.length, masterAddresses.size());
+      }
+    }
+  }
+
+  protected Map<String, String> getVarz(
+      NodeDetails nodeDetails, Universe universe, UniverseTaskBase.ServerType serverType) {
+    UniverseTaskParams.CommunicationPorts ports = universe.getUniverseDetails().communicationPorts;
+    int port =
+        serverType == UniverseTaskBase.ServerType.MASTER
+            ? ports.masterHttpPort
+            : ports.tserverHttpPort;
+    JsonNode varz =
+        nodeUIApiHelper.getRequest(
+            "http://" + nodeDetails.cloudInfo.private_ip + ":" + port + "/api/v1/varz");
+    Map<String, String> result = new HashMap<>();
+    for (JsonNode flag : varz.get("flags")) {
+      result.put(flag.get("name").asText(), flag.get("value").asText());
+    }
+    return result;
+  }
+
   protected void restartUniverse(Universe universe, boolean rolling) throws InterruptedException {
     RestartTaskParams restartTaskParams = new RestartTaskParams();
     restartTaskParams.setUniverseUUID(universe.getUniverseUUID());
@@ -850,14 +931,14 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
             : UpgradeTaskParams.UpgradeOption.NON_ROLLING_UPGRADE;
     restartTaskParams.clusters = universe.getUniverseDetails().clusters;
     UUID taskUUID = upgradeUniverseHandler.restartUniverse(restartTaskParams, customer, universe);
-    TaskInfo taskInfo = waitForTask(taskUUID);
+    TaskInfo taskInfo = waitForTask(taskUUID, universe);
     verifyUniverseTaskSuccess(taskInfo);
   }
 
   protected void verifyUniverseTaskSuccess(TaskInfo taskInfo) {
     Universe universe =
         Universe.getOrBadRequest(
-            UUID.fromString(taskInfo.getDetails().get("universeUUID").textValue()));
+            UUID.fromString(taskInfo.getTaskParams().get("universeUUID").textValue()));
     String separator = System.getProperty("line.separator");
     StringBuilder errorBuilder = new StringBuilder();
     if (taskInfo.getTaskState() != TaskInfo.State.Success) {
@@ -867,10 +948,10 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
         if (subTask.getTaskState() == TaskInfo.State.Failure) {
           if (subTask.getTaskType() == TaskType.WaitForServer
               || subTask.getTaskType() == TaskType.WaitForServerReady) {
-            String nodeName = subTask.getDetails().get("nodeName").textValue();
+            String nodeName = subTask.getTaskParams().get("nodeName").textValue();
             UniverseTaskBase.ServerType serverType =
                 UniverseTaskBase.ServerType.valueOf(
-                    subTask.getDetails().get("serverType").asText());
+                    subTask.getTaskParams().get("serverType").asText());
             localNodeManager.dumpProcessOutput(universe, nodeName, serverType);
           } else {
             failedTasksMessages.add(
@@ -879,6 +960,13 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
         }
       }
       failedTasksMessages.forEach(t -> errorBuilder.append(separator).append(t));
+    }
+    if (taskInfo.getTaskState() != TaskInfo.State.Success) {
+      try {
+        log.debug("Dumping to log");
+        dumpToLog(universe);
+      } catch (InterruptedException e) {
+      }
     }
     assertEquals(errorBuilder.toString(), TaskInfo.State.Success, taskInfo.getTaskState());
   }
@@ -892,5 +980,60 @@ public abstract class LocalProviderUniverseTestBase extends PlatformGuiceApplica
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
+  }
+
+  protected void initAndStartPayload(Universe universe) {
+    simpleSqlPayload = new SimpleSqlPayload(5, 2, 200, universe);
+    simpleSqlPayload.init();
+    simpleSqlPayload.start();
+  }
+
+  protected void verifyPayload() {
+    simpleSqlPayload.stop();
+    assertThat("Low percent errors", simpleSqlPayload.getErrorPercent(), lessThan(0.3d));
+  }
+
+  protected SpecificGFlags getGFlags(String... additional) {
+    Map<String, String> gflags = new HashMap<>(GFLAGS);
+    for (int i = 0; i < additional.length / 2; i++) {
+      gflags.put(additional[i], additional[i + 1]);
+    }
+    return SpecificGFlags.construct(gflags, gflags);
+  }
+
+  protected String getAllErrorsStr(TaskInfo taskInfo) {
+    StringBuilder sb = new StringBuilder(taskInfo.getErrorMessage());
+    for (TaskInfo subTask : taskInfo.getSubTasks()) {
+      if (!StringUtils.isEmpty(subTask.getErrorMessage())) {
+        sb.append("\n").append(subTask.getErrorMessage());
+      }
+    }
+    return sb.toString();
+  }
+
+  protected TaskInfo waitForTask(UUID taskUUID, Universe... universes) throws InterruptedException {
+    try {
+      return CommissionerBaseTest.waitForTask(taskUUID);
+    } catch (Exception e) {
+      dumpToLog(universes);
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void dumpToLog(Universe... universes) throws InterruptedException {
+    localNodeManager.checkAllProcessesAlive();
+    for (Universe universe : universes) {
+      Universe u = Universe.getOrBadRequest(universe.getUniverseUUID());
+      for (NodeDetails node : u.getNodes()) {
+        for (UniverseTaskBase.ServerType serverType : node.getAllProcesses()) {
+          localNodeManager.dumpProcessOutput(u, node.getNodeName(), serverType);
+        }
+      }
+    }
+    Thread.sleep(1000);
+  }
+
+  protected String getBackupBaseDirectory() {
+    return String.format("%s/%s/%s", baseDir, subDir, testName);
   }
 }

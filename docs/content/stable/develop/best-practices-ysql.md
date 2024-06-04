@@ -16,7 +16,7 @@ type: docs
 
 ## Use application patterns
 
-Running applications in multiple data centers with data split across them is not a trivial task. When designing global applications, choose a suitable design pattern for your application from a suite of battle-tested design paradigms, including [Global database](../build-global-apps/global-database), [Multi-master](../build-global-apps/active-active-multi-master), [Standby cluster](../build-global-apps/active-active-single-master), [Duplicate indexes](../build-global-apps/duplicate-indexes), and more. You can also combine these patterns as per your needs.
+Running applications in multiple data centers with data split across them is not a trivial task. When designing global applications, choose a suitable design pattern for your application from a suite of battle-tested design paradigms, including [Global database](../build-global-apps/global-database), [Multi-master](../build-global-apps/active-active-multi-master), [Standby cluster](../build-global-apps/active-active-single-master), [Duplicate indexes](../build-global-apps/duplicate-indexes), [Follower reads](../build-global-apps/follower-reads), and more. You can also combine these patterns as per your needs.
 
 {{<tip>}}
 For more details, see [Build global applications](../build-global-apps).
@@ -34,7 +34,7 @@ For more details, see [colocation](../../architecture/docdb-sharding/colocated-t
 
 When a query uses an index to look up rows faster, the columns that are not present in the index are fetched from the original table. This results in additional round trips to the main table leading to increased latency.
 
-Use [covering indexes](../../explore/indexes-constraints/covering-index-ysql/) to store all the required columns needed for your queries in the index. Indexing converts a standard Index-Scan to an [Index-Only-Scan](https://dev.to/yugabyte/boosts-secondary-index-queries-with-index-only-scan-5e7j).
+Use [covering indexes](../../explore/ysql-language-features/indexes-constraints/covering-index-ysql/) to store all the required columns needed for your queries in the index. Indexing converts a standard Index-Scan to an [Index-Only-Scan](https://dev.to/yugabyte/boosts-secondary-index-queries-with-index-only-scan-5e7j).
 
 {{<tip>}}
 For more details, see [Avoid trips to the table with covering indexes](https://www.yugabyte.com/blog/multi-region-database-deployment-best-practices/#avoid-trips-to-the-table-with-covering-indexes).
@@ -45,7 +45,7 @@ For more details, see [Avoid trips to the table with covering indexes](https://w
 A partial index is an index that is built on a subset of a table and includes only rows that satisfy the condition specified in the `WHERE` clause. This speeds up any writes to the table and reduces the size of the index, thereby improving speed for read queries that use the index.
 
 {{<tip>}}
-For more details, see [Partial indexes](../../explore/indexes-constraints/partial-index-ysql/).
+For more details, see [Partial indexes](../../explore/ysql-language-features/indexes-constraints/partial-index-ysql/).
 {{</tip>}}
 
 ## Distinct keys with unique indexes
@@ -55,7 +55,7 @@ If you need values in some of the columns to be unique, you can specify your ind
 When a unique index is applied to two or more columns, the combined values in these columns can't be duplicated in multiple rows. Note that because a NULL value is treated as a distinct value, you can have multiple NULL values in a column with a unique index.
 
 {{<tip>}}
-For more details, see [Unique indexes](../../explore/indexes-constraints/unique-index-ysql/).
+For more details, see [Unique indexes](../../explore/ysql-language-features/indexes-constraints/unique-index-ysql/).
 {{</tip>}}
 
 ## Faster sequences with server-level caching
@@ -252,7 +252,11 @@ For consistent latency or performance, it is recommended to size columns in the 
 
 ## TRUNCATE tables instead of DELETE
 
-[TRUNCATE](../../api/ysql/the-sql-language/statements/ddl_truncate/) deletes the database files that store the table and is much faster than [DELETE](../../api/ysql/the-sql-language/statements/dml_delete/) which inserts a _delete marker_ for each row in transactions that are later removed from storage during compaction runs.
+[TRUNCATE](../../api/ysql/the-sql-language/statements/ddl_truncate/) deletes the database files that store the table data and is much faster than [DELETE](../../api/ysql/the-sql-language/statements/dml_delete/), which inserts a _delete marker_ for each row in transactions that are later removed from storage during compaction runs.
+
+{{<warning>}}
+Currently, TRUNCATE is not transactional. Also, similar to PostgreSQL, TRUNCATE is not MVCC-safe. For more details, see [TRUNCATE](../../api/ysql/the-sql-language/statements/ddl_truncate/).
+{{</warning>}}
 
 ## Number of tables and indexes
 
@@ -262,11 +266,15 @@ Each table and index is split into tablets and each tablet has overhead. See [ta
 
 Each table and index consists of several tablets based on the [`--ysql_num_shards_per_tserver`](../../reference/configuration/yb-tserver/#yb-num-shards-per-tserver) flag.
 
-For a cluster with RF3, 1000 tablets have an overhead of 0.4vCPU for raft heartbeats (assuming 0.5s heartbeat interval), 300MB memory, 128GB disk-space for WAL (write-ahead log).
+For a cluster with RF3, 1000 tablets imply 3000 tablet replicas. If the cluster has three nodes, then each node has on average 1000 tablet replicas. A six node cluster would have on average 500 tablet replicas per-node and so on.
 
-You need to keep this number in mind depending on the number of tables and number of tablets per server that you intend to create. Note that each tablet can contain 100GB+ of data.
+Each 1000 tablet replicas on a node impose an overhead of 0.4 vCPUs for Raft heartbeats (assuming a 0.5 second heartbeat interval), 800 MiB of memory, and 128 GB of storage space for write-ahead logs (WALs). 
 
-An effort to increase this limit is currently in progress. See GitHub issue [#1317](https://github.com/yugabyte/yugabyte-db/issues/1317).
+The overhead is proportional to the number of tablet replicas so 500 tablet replicas would need half as much.
+
+Additional memory will be required for supporting caches and the like if the tablets are being actively used. We recommend provisioning an extra 6200 MiB of memory for each 1000 tablet replicas on a node to handle these cases; that is, a TServer should have 7000 MiB of RAM allocated to it for each 1000 tablet replicas it may be expected to support.
+
+An effort to lower this overhead is currently in progress. See GitHub issue [#1317](https://github.com/yugabyte/yugabyte-db/issues/1317).
 
 You can try one of the following methods to reduce the number of tablets:
 

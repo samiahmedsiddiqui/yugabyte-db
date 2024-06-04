@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Box, Typography, useTheme } from '@material-ui/core';
 import { AxiosError } from 'axios';
 import { FormProvider, SubmitHandler, useForm } from 'react-hook-form';
@@ -24,13 +24,14 @@ import { YBErrorIndicator, YBLoading } from '../../../common/indicators';
 import {
   BOOTSTRAP_MIN_FREE_DISK_SPACE_GB,
   XClusterConfigAction,
+  XClusterConfigType,
   XCLUSTER_UNIVERSE_TABLE_FILTERS
 } from '../../constants';
 import {
-  formatUuidForXCluster,
   getTablesForBootstrapping,
   getXClusterConfigTableType,
-  parseFloatIfDefined
+  parseFloatIfDefined,
+  shouldAutoIncludeIndexTables
 } from '../../ReplicationUtils';
 import { StorageConfigOption } from '../../sharedComponents/ReactSelectStorageConfig';
 import { CurrentFormStep } from './CurrentFormStep';
@@ -50,6 +51,7 @@ type EditTablesModalProps =
   | (CommonEditTablesModalProps & {
       isDrInterface: true;
       drConfigUuid: string;
+      storageConfigUuid: string;
     })
   | (CommonEditTablesModalProps & { isDrInterface: false });
 
@@ -66,13 +68,14 @@ export const FormStep = {
 } as const;
 export type FormStep = typeof FormStep[keyof typeof FormStep];
 
-const FIRST_FORM_STEP = FormStep.SELECT_TABLES;
 const MODAL_NAME = 'EditTablesModal';
 const TRANSLATION_KEY_PREFIX = 'clusterDetail.disasterRecovery.config.editTablesModal';
-const SELECT_TABLE_TRANSLATION_KEY_PREFIX = 'clusterDetail.xCluster.selectTable';
+const TRANSLATION_KEY_PREFIX_SELECT_TABLE = 'clusterDetail.xCluster.selectTable';
+const TRANSLATION_KEY_PREFIX_XCLUSTER = 'clusterDetail.xCluster';
+const FIRST_FORM_STEP = FormStep.SELECT_TABLES;
 
 export const EditTablesModal = (props: EditTablesModalProps) => {
-  const [currentFormStep, setCurrentFormStep] = useState<FormStep>(FIRST_FORM_STEP);
+  const [currentFormStep, setCurrentFormStep] = useState<FormStep>(FormStep.SELECT_TABLES);
   const [selectionError, setSelectionError] = useState<{ title: string; body: string }>();
   const [selectionWarning, setSelectionWarning] = useState<{ title: string; body: string }>();
   const [bootstrapRequiredTableUUIDs, setBootstrapRequiredTableUUIDs] = useState<string[]>([]);
@@ -81,13 +84,15 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
   const theme = useTheme();
   const queryClient = useQueryClient();
   const { t } = useTranslation('translation', { keyPrefix: TRANSLATION_KEY_PREFIX });
+  const formMethods = useForm<EditTablesFormValues>({
+    defaultValues: {}
+  });
 
   const { modalProps, xClusterConfig } = props;
   const sourceUniverseQuery = useQuery<Universe>(
     universeQueryKey.detail(xClusterConfig.sourceUniverseUUID),
     () => api.fetchUniverse(xClusterConfig.sourceUniverseUUID)
   );
-
   const sourceUniverseTablesQuery = useQuery<YBTable[]>(
     universeQueryKey.tables(xClusterConfig.sourceUniverseUUID, XCLUSTER_UNIVERSE_TABLE_FILTERS),
     () =>
@@ -96,24 +101,30 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
         XCLUSTER_UNIVERSE_TABLE_FILTERS
       ).then((response) => response.data)
   );
-
   const sourceUniverseNamespacesQuery = useQuery<UniverseNamespace[]>(
     universeQueryKey.namespaces(xClusterConfig.sourceUniverseUUID),
     () => api.fetchUniverseNamespaces(xClusterConfig.sourceUniverseUUID)
   );
-
   const editTableMutation = useMutation(
     (formValues: EditTablesFormValues) => {
+      const bootstrapParams =
+        bootstrapRequiredTableUUIDs.length > 0
+          ? {
+              tables: bootstrapRequiredTableUUIDs,
+              backupRequestParams: {
+                storageConfigUUID: formValues.storageConfig?.value.uuid
+              }
+            }
+          : undefined;
       return props.isDrInterface
         ? api.updateTablesInDr(props.drConfigUuid, {
-            tables: formValues.tableUuids,
-            ...(formValues.storageConfig && {
-              bootstrapParams: {
-                backupRequestParams: { storageConfigUUID: formValues.storageConfig.value.uuid }
-              }
-            })
+            tables: formValues.tableUuids
           })
-        : editXClusterConfigTables(xClusterConfig.uuid, formValues.tableUuids);
+        : editXClusterConfigTables(xClusterConfig.uuid, {
+            tables: formValues.tableUuids,
+            autoIncludeIndexTables: shouldAutoIncludeIndexTables(xClusterConfig),
+            bootstrapParams: bootstrapParams
+          });
     },
     {
       onSuccess: (response) => {
@@ -145,26 +156,19 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
           }
           invalidateQueries();
         };
+
         modalProps.onClose();
+        toast.success(
+          <Typography variant="body2" component="span">
+            {t('success.requestSuccess')}
+          </Typography>
+        );
         fetchTaskUntilItCompletes(response.taskUUID, handleTaskCompletion, invalidateQueries);
       },
       onError: (error: Error | AxiosError) =>
         handleServerError(error, { customErrorLabel: t('error.requestFailureLabel') })
     }
   );
-
-  const defaultValues =
-    sourceUniverseTablesQuery.data && sourceUniverseNamespacesQuery.data
-      ? getDefaultFormValues(
-          xClusterConfig,
-          sourceUniverseTablesQuery.data,
-          sourceUniverseNamespacesQuery.data
-        )
-      : {};
-  const formMethods = useForm<EditTablesFormValues>({
-    defaultValues: defaultValues
-  });
-
   const modalTitle = t('title');
   const cancelLabel = t('cancel', { keyPrefix: 'common' });
   if (
@@ -188,7 +192,10 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
     );
   }
 
-  const xClusterConfigTableType = getXClusterConfigTableType(xClusterConfig);
+  const xClusterConfigTableType = getXClusterConfigTableType(
+    xClusterConfig,
+    sourceUniverseTablesQuery.data
+  );
   const sourceUniverseUuid = xClusterConfig.sourceUniverseUUID;
   const targetUniverseUuid = xClusterConfig.targetUniverseUUID;
   if (
@@ -204,7 +211,7 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
       : !xClusterConfig.targetUniverseUUID
       ? t('error.undefinedTargetUniverseUuid')
       : !xClusterConfigTableType
-      ? t('error.undefinedXClusterTableType')
+      ? t('error.undefinedXClusterTableType', { keyPrefix: TRANSLATION_KEY_PREFIX_XCLUSTER })
       : t('error.fetchSourceUniverseDetailsFailure');
     return (
       <YBModal
@@ -221,37 +228,43 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
 
   const sourceUniverseTables = sourceUniverseTablesQuery.data;
   const sourceUniverseNamespaces = sourceUniverseNamespacesQuery.data;
+  const {
+    defaultSelectedTableUuids,
+    defaultSelectedNamespaceUuids,
+    sourceDroppedTableUuids
+  } = classifyTablesAndNamespaces(xClusterConfig, sourceUniverseTables, sourceUniverseNamespaces);
+
   if (
     formMethods.formState.defaultValues &&
     Object.keys(formMethods.formState.defaultValues).length === 0
   ) {
     // react-hook-form caches the defaultValues on first render.
-    // We need to update the defaultValues with reset() after regionMetadataQuery is successful.
+    // We need to update the defaultValues with reset() after the API queries are successful.
     formMethods.reset(
-      getDefaultFormValues(xClusterConfig, sourceUniverseTables, sourceUniverseNamespaces)
+      getDefaultFormValues(defaultSelectedTableUuids, defaultSelectedNamespaceUuids)
     );
   }
-
   const sourceUniverse = sourceUniverseQuery.data;
   const onSubmit: SubmitHandler<EditTablesFormValues> = async (formValues) => {
     switch (currentFormStep) {
       case FormStep.SELECT_TABLES: {
+        setSelectionError(undefined);
         if (formValues.tableUuids.length <= 0) {
           formMethods.setError('tableUuids', {
             type: 'min',
-            message: t('error.validationMinimumTableUuids.title', {
-              keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
+            message: t('error.validationMinimumNamespaceUuids.title', {
+              keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
             })
           });
           // The TableSelect component expects error objects with title and body fields.
           // React-hook-form only allows string error messages.
           // Thus, we need an store these error objects separately.
           setSelectionError({
-            title: t('error.validationMinimumTableUuids.title', {
-              keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
+            title: t('error.validationMinimumNamespaceUuids.title', {
+              keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
             }),
-            body: t('error.validationMinimumTableUuids.body', {
-              keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
+            body: t('error.validationMinimumNamespaceUuids.body', {
+              keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
             })
           });
           return;
@@ -259,48 +272,50 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
 
         if (!isTableSelectionValidated) {
           let bootstrapTableUuids: string[] | null = null;
+          const hasSelectionError = false;
 
-          try {
-            // We pass null as the target universe in the following method because add table does not
-            // support the case where a matching table does not exist on the target universe.
-            bootstrapTableUuids = await getTablesForBootstrapping(
-              formValues.tableUuids,
-              sourceUniverseUuid,
-              null /* targetUniverseUUID */,
-              sourceUniverseTables,
-              xClusterConfig.tables,
-              xClusterConfig.type,
-              xClusterConfig.usedForDr
-            );
-          } catch (error: any) {
-            toast.error(
-              <Box display="flex" flexDirection="column" gridGap={theme.spacing(1)}>
-                <div className={toastStyles.toastMessage}>
-                  <i className="fa fa-exclamation-circle" />
-                  <Typography variant="body2" component="span">
-                    {t('error.failedToFetchIsBootstrapRequired.title', {
-                      keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
+          const tableUuidsToAdd = formValues.tableUuids.filter(
+            (tableUuid) => !props.xClusterConfig.tables.includes(tableUuid)
+          );
+          if (tableUuidsToAdd.length) {
+            try {
+              bootstrapTableUuids = await getTablesForBootstrapping(
+                tableUuidsToAdd,
+                sourceUniverseUuid,
+                targetUniverseUuid,
+                sourceUniverseTables,
+                xClusterConfig.type
+              );
+            } catch (error: any) {
+              toast.error(
+                <Box display="flex" flexDirection="column" gridGap={theme.spacing(1)}>
+                  <div className={toastStyles.toastMessage}>
+                    <i className="fa fa-exclamation-circle" />
+                    <Typography variant="body2" component="span">
+                      {t('error.failedToFetchIsBootstrapRequired.title', {
+                        keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
+                      })}
+                    </Typography>
+                  </div>
+                  <Typography variant="body2" component="div">
+                    {t('error.failedToFetchIsBootstrapRequired.body', {
+                      keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
                     })}
                   </Typography>
-                </div>
-                <Typography variant="body2" component="div">
-                  {t('error.failedToFetchIsBootstrapRequired.body', {
-                    keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
-                  })}
-                </Typography>
-                <Typography variant="body2" component="div">
-                  {error.message}
-                </Typography>
-              </Box>
-            );
-            setSelectionWarning({
-              title: t('error.failedToFetchIsBootstrapRequired.title', {
-                keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
-              }),
-              body: t('error.failedToFetchIsBootstrapRequired.body', {
-                keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
-              })
-            });
+                  <Typography variant="body2" component="div">
+                    {error.message}
+                  </Typography>
+                </Box>
+              );
+              setSelectionWarning({
+                title: t('error.failedToFetchIsBootstrapRequired.title', {
+                  keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
+                }),
+                body: t('error.failedToFetchIsBootstrapRequired.body', {
+                  keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
+                })
+              });
+            }
           }
 
           if (bootstrapTableUuids?.length && bootstrapTableUuids?.length > 0) {
@@ -320,21 +335,21 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
             if (freeDiskSpace !== undefined && freeDiskSpace < BOOTSTRAP_MIN_FREE_DISK_SPACE_GB) {
               setSelectionWarning({
                 title: t('warning.insufficientDiskSpace.title', {
-                  keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX
+                  keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE
                 }),
                 body: t('warning.insufficientDiskSpace.body', {
-                  keyPrefix: SELECT_TABLE_TRANSLATION_KEY_PREFIX,
+                  keyPrefix: TRANSLATION_KEY_PREFIX_SELECT_TABLE,
                   bootstrapMinFreeDiskSpaceGb: BOOTSTRAP_MIN_FREE_DISK_SPACE_GB
                 })
               });
             }
           }
-
-          if (selectionError === undefined) {
+          if (hasSelectionError === false) {
             setIsTableSelectionValidated(true);
           }
           return;
         }
+
         if (bootstrapRequiredTableUUIDs.length > 0) {
           setCurrentFormStep(FormStep.CONFIGURE_BOOTSTRAP);
           return;
@@ -349,18 +364,30 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
     }
   };
 
-  const setSelectedTableUuids = (tableUuids: string[]) => {
-    setIsTableSelectionValidated(false);
-    formMethods.setValue('tableUuids', tableUuids, { shouldValidate: false });
-  };
   const setSelectedNamespaceUuids = (namespaces: string[]) => {
+    // Clear any existing errors.
+    // The new table/namespace selection will need to be (re)validated.
     setIsTableSelectionValidated(false);
+    formMethods.clearErrors('namespaceUuids');
+
+    // We will run any required validation on selected namespaces & tables all at once when the
+    // user clicks on the 'Validate Selection' button.
     formMethods.setValue('namespaceUuids', namespaces, { shouldValidate: false });
+  };
+  const setSelectedTableUuids = (tableUuids: string[]) => {
+    // Clear any existing errors.
+    // The new table/namespace selection will need to be (re)validated.
+    setIsTableSelectionValidated(false);
+    formMethods.clearErrors('tableUuids');
+
+    // We will run any required validation on selected namespaces & tables all at once when the
+    // user clicks on the 'Validate Selection' button.
+    formMethods.setValue('tableUuids', tableUuids, { shouldValidate: false });
   };
 
   const handleBackNavigation = () => {
     switch (currentFormStep) {
-      case FIRST_FORM_STEP:
+      case FormStep.SELECT_TABLES:
         return;
       case FormStep.CONFIGURE_BOOTSTRAP:
         setCurrentFormStep(FormStep.SELECT_TABLES);
@@ -415,22 +442,28 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
         <CurrentFormStep
           currentFormStep={currentFormStep}
           isFormDisabled={isFormDisabled}
+          isDrInterface={props.isDrInterface}
+          storageConfigUuid={props.isDrInterface ? props.storageConfigUuid : undefined}
           tableSelectProps={{
             configAction: XClusterConfigAction.MANAGE_TABLE,
             isDrInterface: props.isDrInterface,
-            isFixedTableType: true, // Users are not allowed to change xCluster table type after creation.
             selectedNamespaceUuids: selectedNamespaceUuids,
-            selectedTableUUIDs: selectedTableUuids,
+            selectedTableUuids: selectedTableUuids,
             selectionError,
             selectionWarning,
-            initialNamespaceUuids: defaultValues.namespaceUuids ?? [],
+            initialNamespaceUuids: defaultSelectedNamespaceUuids ?? [],
             setSelectedNamespaceUuids: setSelectedNamespaceUuids,
-            setSelectedTableUUIDs: setSelectedTableUuids,
-            setTableType: (_) => null, // Users are not allowed to change xCluster table type after creation.
-            sourceUniverseUUID: sourceUniverseUuid,
+            setSelectedTableUuids: setSelectedTableUuids,
+            sourceUniverseUuid: sourceUniverseUuid,
             tableType: xClusterConfigTableType,
-            targetUniverseUUID: targetUniverseUuid,
-            xClusterConfigUUID: xClusterConfig.uuid
+            targetUniverseUuid: targetUniverseUuid,
+            xClusterConfigUuid: xClusterConfig.uuid,
+            isTransactionalConfig: xClusterConfig.type === XClusterConfigType.TXN,
+            sourceDroppedTableUuids: sourceDroppedTableUuids,
+
+            // Users are not allowed to change xCluster table type after creation.
+            isFixedTableType: true,
+            setTableType: (_) => null
           }}
         />
       </FormProvider>
@@ -438,36 +471,45 @@ export const EditTablesModal = (props: EditTablesModalProps) => {
   );
 };
 
-const getXClusterConfigNamespaces = (
+const getDefaultFormValues = (
+  selectedTableUUIDs: string[],
+  selectedNamespaceUuid: string[]
+): Partial<EditTablesFormValues> => {
+  return {
+    tableUuids: selectedTableUUIDs,
+    namespaceUuids: selectedNamespaceUuid
+  };
+};
+
+export const classifyTablesAndNamespaces = (
   xClusterConfig: XClusterConfig,
   sourceUniverseTables: YBTable[],
   sourceUniverseNamespaces: UniverseNamespace[]
-): string[] => {
+) => {
+  const selectedTableUuids = new Set<string>();
+  const sourceDroppedTableUuids = new Set<string>();
+  const selectedNamespaceUuid = new Set<string>();
+  const tableUuidToTable = Object.fromEntries(
+    sourceUniverseTables.map((table) => [getTableUuid(table), table])
+  );
   const namespaceToNamespaceUuid = Object.fromEntries(
     sourceUniverseNamespaces.map((namespace) => [namespace.name, namespace.namespaceUUID])
   );
+  // Classify every table as selected or dropped by checking for a match on the source universe.
+  xClusterConfig.tables.forEach((tableUuid) => {
+    const sourceUniverseTable = tableUuidToTable[tableUuid];
 
-  const selectedTableUuids = new Set<string>(xClusterConfig.tables);
-  const selectedNamespaceUuid = new Set<string>();
-  sourceUniverseTables.forEach((table) => {
-    if (selectedTableUuids.has(formatUuidForXCluster(getTableUuid(table)))) {
-      selectedNamespaceUuid.add(namespaceToNamespaceUuid[table.keySpace]);
+    if (sourceUniverseTable) {
+      // The xCluster config table still exists on the source universe.
+      selectedTableUuids.add(tableUuid);
+      selectedNamespaceUuid.add(namespaceToNamespaceUuid[sourceUniverseTable.keySpace]);
+    } else {
+      sourceDroppedTableUuids.add(tableUuid);
     }
   });
-  return Array.from(selectedNamespaceUuid);
-};
-
-const getDefaultFormValues = (
-  xClusterConfig: XClusterConfig,
-  sourceUniverseTables: YBTable[],
-  sourceUniverseNamespace: UniverseNamespace[]
-): Partial<EditTablesFormValues> => {
   return {
-    tableUuids: xClusterConfig.tables,
-    namespaceUuids: getXClusterConfigNamespaces(
-      xClusterConfig,
-      sourceUniverseTables,
-      sourceUniverseNamespace
-    )
+    defaultSelectedTableUuids: Array.from(selectedTableUuids),
+    sourceDroppedTableUuids: sourceDroppedTableUuids,
+    defaultSelectedNamespaceUuids: Array.from(selectedNamespaceUuid)
   };
 };

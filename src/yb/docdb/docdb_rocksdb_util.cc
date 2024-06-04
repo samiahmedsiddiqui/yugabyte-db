@@ -20,13 +20,15 @@
 
 #include "yb/common/transaction.h"
 
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/value_type.h"
+
 #include "yb/docdb/bounded_rocksdb_iterator.h"
 #include "yb/docdb/consensus_frontier.h"
-#include "yb/dockv/doc_key.h"
+#include "yb/docdb/doc_ql_filefilter.h"
 #include "yb/docdb/docdb_filter_policy.h"
 #include "yb/docdb/intent_aware_iterator.h"
 #include "yb/docdb/key_bounds.h"
-#include "yb/dockv/value_type.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/sysinfo.h"
@@ -41,6 +43,7 @@
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/rate_limiter.h"
 #include "yb/rocksdb/table.h"
+#include "yb/rocksdb/table/block_based_table_reader.h"
 #include "yb/rocksdb/table/filtering_iterator.h"
 #include "yb/rocksdb/types.h"
 #include "yb/rocksdb/util/compression.h"
@@ -269,8 +272,9 @@ rocksdb::ReadOptions PrepareReadOptions(
   if (FLAGS_use_docdb_aware_bloom_filter &&
     bloom_filter_mode == BloomFilterMode::USE_BLOOM_FILTER) {
     DCHECK(user_key_for_filter);
-    read_opts.table_aware_file_filter = rocksdb->GetOptions().table_factory->
-        NewTableAwareReadFileFilter(read_opts, user_key_for_filter.get());
+    static const rocksdb::BloomFilterAwareFileFilter bloom_filter_aware_file_filter;
+    read_opts.table_aware_file_filter = &bloom_filter_aware_file_filter;
+    read_opts.user_key_for_filter = *user_key_for_filter;
   }
   read_opts.file_filter = std::move(file_filter);
   read_opts.iterate_upper_bound = iterate_upper_bound;
@@ -302,14 +306,37 @@ unique_ptr<IntentAwareIterator> CreateIntentAwareIterator(
     const ReadOperationData& read_operation_data,
     std::shared_ptr<rocksdb::ReadFileFilter> file_filter,
     const Slice* iterate_upper_bound,
+    const FastBackwardScan use_fast_backward_scan,
     const DocDBStatistics* statistics) {
   // TODO(dtxn) do we need separate options for intents db?
   rocksdb::ReadOptions read_opts = PrepareReadOptions(doc_db.regular, bloom_filter_mode,
       user_key_for_filter, query_id, std::move(file_filter), iterate_upper_bound,
       statistics ? statistics->RegularDBStatistics() : nullptr);
   return std::make_unique<IntentAwareIterator>(
-      doc_db, read_opts, read_operation_data, txn_op_context,
+      doc_db, read_opts, read_operation_data, txn_op_context, use_fast_backward_scan,
       statistics ? statistics->IntentsDBStatistics() : nullptr);
+}
+
+BoundedRocksDbIterator CreateIntentsIteratorWithHybridTimeFilter(
+    rocksdb::DB* intentsdb,
+    const TransactionStatusManager* status_manager,
+    const KeyBounds* docdb_key_bounds,
+    const Slice* iterate_upper_bound,
+    rocksdb::Statistics* statistics) {
+  auto min_running_ht = status_manager->MinRunningHybridTime();
+  if (min_running_ht == HybridTime::kMax) {
+    VLOG(4) << "No transactions running";
+    return {};
+  }
+  return CreateRocksDBIterator(
+      intentsdb,
+      docdb_key_bounds,
+      docdb::BloomFilterMode::DONT_USE_BLOOM_FILTER,
+      boost::none /* user_key_for_filter */,
+      rocksdb::kDefaultQueryId,
+      CreateIntentHybridTimeFileFilter(min_running_ht),
+      iterate_upper_bound,
+      statistics);
 }
 
 namespace {
@@ -592,12 +619,14 @@ int32_t GetGlobalRocksDBPriorityThreadPoolSize() {
 
 void InitRocksDBOptions(
     rocksdb::Options* options, const string& log_prefix,
+    const TabletId& tablet_id,
     const shared_ptr<rocksdb::Statistics>& statistics,
     const tablet::TabletOptions& tablet_options,
     rocksdb::BlockBasedTableOptions table_options,
     const uint64_t group_no) {
   AutoInitFromRocksDBFlags(options);
   SetLogPrefix(options, log_prefix);
+  options->tablet_id = tablet_id;
   options->create_if_missing = true;
   // We should always sync data to ensure we can recover rocksdb from crash.
   options->disableDataSync = false;

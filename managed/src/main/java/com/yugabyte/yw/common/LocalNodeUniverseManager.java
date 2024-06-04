@@ -13,6 +13,7 @@ package com.yugabyte.yw.common;
 import static com.yugabyte.yw.common.ShellResponse.ERROR_CODE_SUCCESS;
 
 import com.google.inject.Inject;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
@@ -54,7 +55,8 @@ public class LocalNodeUniverseManager {
     bashCommand.add(cloudInfo.getYugabyteBinDir() + "/ysqlsh");
     bashCommand.add("-h");
     if (authEnabled) {
-      String customTmpDirectory = GFlagsUtil.getCustomTmpDirectory(node, universe);
+      String customTmpDirectory = getTmpDir(node, universe);
+      log.debug("customTmpDirectory {}", customTmpDirectory);
       bashCommand.add(
           String.format(
               "%s/.yb.%s:%s",
@@ -138,19 +140,24 @@ public class LocalNodeUniverseManager {
                       localNodeManager.getNodeRoot(userIntent, node.nodeName)));
         }
       }
-      runProcess(commandArguments);
+      runProcess(commandArguments, null);
     } catch (IOException | InterruptedException e) {
       throw new RuntimeException(e);
     }
     return ShellResponse.create(ERROR_CODE_SUCCESS, "Success!");
   }
 
-  private void runProcess(List<String> commandArguments) throws IOException, InterruptedException {
+  private int runProcess(List<String> commandArguments, Map<String, String> envVars)
+      throws IOException, InterruptedException {
     ProcessBuilder processBuilder =
         new ProcessBuilder(commandArguments.toArray(new String[0])).redirectErrorStream(true);
+    if (envVars != null) {
+      processBuilder.environment().putAll(envVars);
+    }
     log.debug("Running command {}", String.join(" ", commandArguments));
     Process process = processBuilder.start();
-    Thread.sleep(100);
+    int exitCode = process.waitFor();
+    return exitCode;
   }
 
   private ShellResponse uploadFile(Universe universe, NodeDetails node, List<String> commandArgs) {
@@ -177,5 +184,20 @@ public class LocalNodeUniverseManager {
   private UniverseDefinitionTaskParams.UserIntent getUserIntent(
       Universe universe, NodeDetails node) {
     return universe.getUniverseDetails().getClusterByUuid(node.placementUuid).userIntent;
+  }
+
+  private String getTmpDir(NodeDetails node, Universe universe) {
+    UniverseDefinitionTaskParams.Cluster cluster =
+        universe.getUniverseDetails().getClusterByUuid(node.placementUuid);
+    Map<String, String> gflags =
+        GFlagsUtil.getGFlagsForNode(
+            node,
+            UniverseTaskBase.ServerType.TSERVER,
+            cluster,
+            universe.getUniverseDetails().clusters);
+    if (gflags.containsKey(GFlagsUtil.TMP_DIRECTORY)) {
+      return localNodeManager.getTmpDir(gflags, node.getNodeName(), cluster.userIntent);
+    }
+    return GFlagsUtil.getCustomTmpDirectory(node, universe);
   }
 }

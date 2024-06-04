@@ -166,6 +166,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
       const scoped_refptr<MetricEntity>& table_metric_entity,
       const scoped_refptr<MetricEntity>& tablet_metric_entity,
       ThreadPool* raft_pool,
+      rpc::ThreadPool* raft_notifications_pool,
       ThreadPool* tablet_prepare_pool,
       consensus::RetryableRequestsManager* retryable_requests_manager,
       std::unique_ptr<consensus::ConsensusMetadata> consensus_meta,
@@ -479,6 +480,10 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   RetryableRequestsFlushState TEST_RetryableRequestsFlusherState() const;
 
   Preparer* DEBUG_GetPreparer();
+
+  std::string Tserver_uuid() {
+    return local_peer_pb_.permanent_uuid();
+  }
 
  protected:
   friend class RefCountedThreadSafe<TabletPeer>;

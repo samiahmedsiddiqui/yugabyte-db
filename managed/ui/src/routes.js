@@ -34,10 +34,13 @@ import Releases from './pages/Releases';
 import { isDefinedNotNull, isNullOrEmpty, objToQueryParams } from './utils/ObjectUtils';
 import { Administration } from './pages/Administration';
 import ToggleFeaturesInTest from './pages/ToggleFeaturesInTest';
+import { testFeatureFlagsLocalStorageKey } from './reducers/feature';
 import { Replication } from './pages/Replication';
-import { ReleaseList } from './pages/ReleaseList';
 import UniverseNewView from './pages/UniverseNewView';
 import { DataCenterConfiguration } from './pages/DataCenterConfiguration';
+import { SlotDetail } from './redesign/features/universe/universe-tabs/replication-slots/components/SlotDetail';
+import { SecondaryDashboard } from './pages/SecondaryDashboard';
+import { Troubleshoot } from './pages/Troubleshoot';
 import {
   clearRbacCreds,
   getRbacEnabledVal,
@@ -65,6 +68,7 @@ export const clearCredentials = () => {
   localStorage.removeItem('apiToken');
   localStorage.removeItem('customerId');
   localStorage.removeItem('userId');
+  localStorage.removeItem(testFeatureFlagsLocalStorageKey);
   clearRbacCreds();
 
   /*
@@ -131,7 +135,7 @@ axios.interceptors.response.use(
     //rbac is not loaded yet or it is enabled
     if (getRbacEnabledVal() === null || isRbacEnabled()) return Promise.reject(error);
 
-    const isAllowedUrl = /.+\/(login|register)$/i.test(error.request.responseURL);
+    const isAllowedUrl = /.+\/(login|register|reset_password)$/i.test(error.request.responseURL);
     const isUnauthorised = error.response?.status === 401;
     if (isUnauthorised && !isAllowedUrl) {
       //redirect to users current page
@@ -249,6 +253,11 @@ export default (store) => {
         <IndexRoute component={Dashboard} />
         <Route path="/universes" component={Universes}>
           <IndexRoute component={UniverseConsole} />
+          <Route
+            path="/universes/:uuid/troubleshoot/:troubleshootUUID"
+            component={SecondaryDashboard}
+          />
+          <Route path="/universes/:uuid/replication-slots/:streamID" component={SlotDetail} />
           <Route path="/universes/create" component={UniverseNewView} />
           <Route path="/universes/:uuid" component={UniverseDetail} />
           {/* <Route path="/universes/:uuid/edit" component={UniverseDetail}> */}
@@ -277,6 +286,9 @@ export default (store) => {
           <Route path=":tab/:section" component={DataCenterConfiguration} />
           <Route path=":tab/:section/:uuid" component={DataCenterConfiguration} />
         </Route>
+        <Route path="/troubleshoot" component={Troubleshoot}>
+          <Route path=":tab" component={Troubleshoot} />
+        </Route>
         <Route path="/nodeagent" component={NodeAgent} />
         <Route path="/alerts" component={Alerts} />
         <Route path="/backups" component={Backups} />
@@ -285,7 +297,6 @@ export default (store) => {
         <Route path="/profile/:tab" component={Profile} />
         <Route path="/logs" component={YugawareLogs} />
         <Route path="/releases" component={Releases} />
-        <Route path="/releases_list" component={ReleaseList} />
         <Route path="/admin" component={Administration}>
           <Route path="/admin/:tab" component={Administration} />
           <Route path="/admin/:tab/:section" component={Administration} />

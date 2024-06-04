@@ -92,10 +92,8 @@ public class TestPgTransactions extends BasePgSQLTest {
   void runWithFailOnConflict() throws Exception {
     // Some of these tests depend on fail-on-conflict concurrency control to perform its validation.
     // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
-    Map<String, String> disableWaitOnConflict = new TreeMap<String, String>();
-    disableWaitOnConflict.put("enable_wait_queues", "false");
     markClusterNeedsRecreation();
-    restartClusterWithFlags(disableWaitOnConflict, disableWaitOnConflict);
+    restartClusterWithFlags(FailOnConflictTestGflags, FailOnConflictTestGflags);
   }
 
   @Test
@@ -822,11 +820,11 @@ public class TestPgTransactions extends BasePgSQLTest {
 
       // Expect begin transaction to always succeed.
       if (i % 2 == 0) {
-        statement1.execute("BEGIN");
-        statement2.execute("BEGIN");
+        statement1.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        statement2.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       } else {
-        statement2.execute("BEGIN");
-        statement1.execute("BEGIN");
+        statement2.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        statement1.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       }
 
       boolean txn1_success;

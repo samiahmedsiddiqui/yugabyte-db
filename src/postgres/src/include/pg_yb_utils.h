@@ -231,6 +231,12 @@ extern bool YBRelHasSecondaryIndices(Relation relation);
 extern bool YBTransactionsEnabled();
 
 /*
+ * Whether read committed isolation is supported for the cluster or not (via the TServer gflag
+ * yb_enable_read_committed_isolation).
+ */
+extern bool YBIsReadCommittedSupported();
+
+/*
  * Whether the current txn is of READ COMMITTED (or READ UNCOMMITTED) isolation level, and it uses
  * the new READ COMMITTED implementation instead of mapping to REPEATABLE READ level. The latter
  * condition is dictated by the value of gflag yb_enable_read_committed_isolation.
@@ -242,11 +248,6 @@ extern bool IsYBReadCommitted();
  * enable_wait_queues).
  */
 extern bool YBIsWaitQueueEnabled();
-
-/*
- * Whether to allow users to use SAVEPOINT commands at the query layer.
- */
-extern bool YBSavepointsEnabled();
 
 /*
  * Whether the per database catalog version mode is enabled.
@@ -269,6 +270,13 @@ extern bool YbNeedAdditionalCatalogTables();
 extern void HandleYBStatusIgnoreNotFound(YBCStatus status, bool *not_found);
 
 /*
+ * Handle YBStatus while logging a custom error for DocDB 'NotFound' error.
+ */
+extern void
+HandleYBStatusWithCustomErrorForNotFound(YBCStatus status,
+										 const char *message_for_not_found);
+
+/*
  * Same as HandleYBStatus but delete the table description first if the
  * status is not ok.
  */
@@ -281,8 +289,6 @@ extern void YBInitPostgresBackend(const char *program_name,
 								  const char *db_name,
 								  const char *user_name,
 								  uint64_t *session_id);
-
-extern bool YbGetCurrentSessionId(uint64_t *session_id);
 
 /*
  * This should be called on all exit paths from the PostgreSQL backend process.
@@ -528,6 +534,22 @@ extern bool yb_prefer_bnl;
  */
 extern bool yb_explain_hide_non_deterministic_fields;
 
+/*
+ * Enables scalar array operation pushdown.
+ * If true, planner sends supported expressions to DocDB for evaluation
+ */
+extern bool yb_enable_saop_pushdown;
+
+/*
+ * Enables the use of TOAST compression for the Postgres catcache.
+ */
+extern int yb_toast_catcache_threshold;
+
+/*
+ * Configure size of the parallel range in requests for parallel keys.
+ */
+extern int yb_parallel_range_size;
+
 //------------------------------------------------------------------------------
 // GUC variables needed by YB via their YB pointers.
 extern int StatementTimeout;
@@ -572,6 +594,12 @@ extern bool yb_test_fail_next_ddl;
 extern bool yb_test_fail_next_inc_catalog_version;
 
 /*
+ * This number times disable_cost is added to the cost for some unsupported
+ * ybgin index scans.
+ */
+extern double yb_test_ybgin_disable_cost_factor;
+
+/*
  * Block the given index creation phase.
  * - "indisready": index state change to indisready
  *   (not supported for non-concurrent)
@@ -587,16 +615,38 @@ extern char *yb_test_block_index_phase;
 extern char *yb_test_fail_index_state_change;
 
 /*
+ * GUC variable that specifies default replica identity for tables at the time of creation.
+ */
+extern char* yb_default_replica_identity ;
+
+/*
  * If set to true, any DDLs that rewrite tables/indexes will fail after
  * the new table is created.
  */
 extern bool yb_test_fail_table_rewrite_after_creation;
 
+/* GUC variable yb_test_stay_in_global_catalog_version_mode. */
+extern bool yb_test_stay_in_global_catalog_version_mode;
+
+/*
+ * If set to true, any DDLs that rewrite tables/indexes will not drop the
+ * old relfilenode/DocDB table.
+ */
+extern bool yb_test_table_rewrite_keep_old_table;
+
 /*
  * Denotes whether DDL operations touching DocDB system catalog will be rolled
- * back upon failure.
+ * back upon failure. These two GUC variables are used together. See comments
+ * for the gflag --ysql_enable_ddl_atomicity_infra in common_flags.cc.
 */
-extern bool ddl_rollback_enabled;
+extern bool yb_enable_ddl_atomicity_infra;
+extern bool yb_ddl_rollback_enabled;
+static inline bool
+YbDdlRollbackEnabled () {
+	return yb_enable_ddl_atomicity_infra && yb_ddl_rollback_enabled;
+}
+
+extern bool yb_use_hash_splitting_by_default;
 
 /*
  * GUC to allow user to silence the error saying that advisory locks are not
@@ -705,6 +755,15 @@ YbTableProperties YbGetTableProperties(Relation rel);
 YbTableProperties YbGetTablePropertiesById(Oid relid);
 YbTableProperties YbTryGetTableProperties(Relation rel);
 
+typedef enum YbTableDistribution
+{
+	YB_SYSTEM,
+	YB_COLOCATED,
+	YB_HASH_SHARDED,
+	YB_RANGE_SHARDED
+} YbTableDistribution;
+YbTableDistribution YbGetTableDistribution(Oid relid);
+
 /*
  * Check whether the given libc locale is supported in YugaByte mode.
  */
@@ -715,6 +774,8 @@ extern void YbTestGucBlockWhileStrEqual(char **actual, const char *expected,
 										const char *msg);
 
 extern void YbTestGucFailIfStrEqual(char *actual, const char *expected);
+
+extern int YbGetNumberOfFunctionOutputColumns(Oid func_oid);
 
 char *YBDetailSorted(char *input);
 
@@ -890,6 +951,7 @@ void YbSetCatalogCacheVersion(YBCPgStatement handle, uint64_t version);
 
 uint64_t YbGetSharedCatalogVersion();
 uint32_t YbGetNumberOfDatabases();
+bool YbCatalogVersionTableInPerdbMode();
 
 /*
  * This function maps the user intended row-level lock policy i.e., "pg_wait_policy" of
@@ -980,8 +1042,10 @@ OptSplit *YbGetSplitOptions(Relation rel);
 						 PG_FUNCNAME_MACRO, \
 						 TEXTDOMAIN)) \
 			{ \
-				yb_errmsg_from_status_data(msg_buf, msg_nargs, msg_args); \
-				yb_detail_from_status_data(detail_buf, detail_nargs, detail_args); \
+				Assert(msg_buf); \
+				yb_errmsg_from_status(msg_buf, msg_nargs, msg_args); \
+				if (detail_buf) \
+					yb_errdetail_from_status(detail_buf, detail_nargs, detail_args); \
 				yb_set_pallocd_error_file_and_func(filename, funcname); \
 				errcode(pg_err_code); \
 				yb_txn_errcode(txn_err_code); \
@@ -1032,13 +1096,6 @@ extern void** YbPtrListToArray(const List* str_list, size_t* length);
  */
 extern char* YbReadWholeFile(const char *filename, int* length, int elevel);
 
-/*
- * If the tserver gflag --ysql_enable_db_catalog_version_mode is true
- * but the number of rows in pg_yb_catalog_version is 1, disallow a DDL
- * statement if it increments the catalog version.
- */
-extern void YBCheckDdlForDBCatalogVersionMode(YbDdlMode mode);
-
 extern bool yb_use_tserver_key_auth;
 
 extern bool yb_use_tserver_key_auth_check_hook(bool *newval,
@@ -1050,5 +1107,30 @@ extern void YbATCopyPrimaryKeyToCreateStmt(Relation rel,
 
 extern void YbIndexSetNewRelfileNode(Relation indexRel, Oid relfileNodeId,
 									 bool yb_copy_split_options);
+
+/*
+ * Returns the ordering type for a primary key. By default, the first element of
+ * YB relations are sorted by HASH, unless Postgres sorting is set, or the table
+ * is colocated.
+ */
+extern SortByDir YbSortOrdering(SortByDir ordering, bool is_colocated, bool is_tablegroup, bool is_first_key);
+
+extern void YbGetRedactedQueryString(const char* query, int query_len,
+									 const char** redacted_query, int* redacted_query_len);
+
+extern void YbRelationSetNewRelfileNode(Relation rel, Oid relfileNodeId,
+										bool yb_copy_split_options,
+										bool is_truncate);
+
+extern Relation YbGetRelationWithOverwrittenReplicaIdentity(Oid relid,
+															char replident);
+
+extern void YBCUpdateYbReadTimeAndInvalidateRelcache(uint64_t read_time);
+
+extern uint64_t YbCalculateTimeDifferenceInMicros(TimestampTz yb_start_time);
+
+static inline bool YbIsNormalDbOidReserved(Oid db_oid) {
+	return db_oid == kYBCPgSequencesDataDatabaseOid;
+}
 
 #endif /* PG_YB_UTILS_H */

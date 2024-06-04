@@ -50,16 +50,20 @@ public class ThirdpartySoftwareUpgrade extends UpgradeTaskBase {
 
   @Override
   protected void createPrecheckTasks(Universe universe) {
-    if (isFirstTry()) {
-      verifyClustersConsistency();
-    }
+    super.createPrecheckTasks(universe);
+    addBasicPrecheckTasks();
+  }
+
+  @Override
+  protected MastersAndTservers calculateNodesToBeRestarted() {
+    return fetchNodes(taskParams().upgradeOption);
   }
 
   @Override
   public void run() {
     runUpgrade(
         () -> {
-          LinkedHashSet<NodeDetails> nodesToUpdate = fetchAllNodes(taskParams().upgradeOption);
+          LinkedHashSet<NodeDetails> nodesToUpdate = toOrderedSet(getNodesToBeRestarted().asPair());
 
           createRollingNodesUpgradeTaskFlow(
               (nodes, processTypes) -> {

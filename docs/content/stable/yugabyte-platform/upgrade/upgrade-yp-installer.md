@@ -34,6 +34,12 @@ If your YugabyteDB Anywhere installation was installed using [YBA Installer](../
 
 If you are upgrading a YugabyteDB Anywhere installation with high availability enabled, follow the instructions provided in [Upgrade instances](../../administer-yugabyte-platform/high-availability/#upgrade-instances).
 
+{{< note title="Upgrading YBA on deprecated operating systems" >}}
+
+If you are running YBA v2.20 on a [deprecated OS](../../../reference/configuration/operating-systems/), you need to update your OS before you can upgrade YBA to the next major release.
+
+{{< /note >}}
+
 ## Upgrade using YBA Installer
 
 To upgrade using YBA Installer, first download the version of YBA Installer corresponding to the version of YBA you want to upgrade to.
@@ -41,9 +47,9 @@ To upgrade using YBA Installer, first download the version of YBA Installer corr
 Download and extract the YBA Installer by entering the following commands:
 
 ```sh
-$ wget https://downloads.yugabyte.com/releases/{{<yb-version version="preview" format="long">}}/yba_installer_full-{{<yb-version version="preview" format="build">}}-linux-x86_64.tar.gz
-$ tar -xf yba_installer_full-{{<yb-version version="preview" format="build">}}-linux-x86_64.tar.gz
-$ cd yba_installer_full-{{<yb-version version="preview" format="build">}}/
+$ wget https://downloads.yugabyte.com/releases/{{<yb-version version="stable" format="long">}}/yba_installer_full-{{<yb-version version="stable" format="build">}}-linux-x86_64.tar.gz
+$ tar -xf yba_installer_full-{{<yb-version version="stable" format="build">}}-linux-x86_64.tar.gz
+$ cd yba_installer_full-{{<yb-version version="stable" format="build">}}/
 ```
 
 When ready to upgrade, run the `upgrade` command from the untarred directory of the target version of the YBA upgrade:

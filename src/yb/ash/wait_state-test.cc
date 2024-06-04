@@ -36,11 +36,12 @@ AshMetadata GenerateRandomMetadata() {
       .yql_endpoint_tserver_uuid{Uuid::Generate()},
       .query_id = RandomUniformInt<uint64_t>(),
       .session_id = RandomUniformInt<uint64_t>(),
+      .database_id = RandomUniformInt<uint32_t>(),
       .rpc_request_id = RandomUniformInt<int64_t>(),
       .client_host_port = RandomHostPort()};
 }
 
-TEST(WaitStateTest, TestToAndFromPB) {
+void testToAndFromPB() {
   AshMetadata meta1 = GenerateRandomMetadata();
   AshMetadataPB pb;
   meta1.ToPB(&pb);
@@ -51,8 +52,13 @@ TEST(WaitStateTest, TestToAndFromPB) {
   ASSERT_EQ(meta1.yql_endpoint_tserver_uuid, meta2.yql_endpoint_tserver_uuid);
   ASSERT_EQ(meta1.query_id, meta2.query_id);
   ASSERT_EQ(meta1.session_id, meta2.session_id);
+  ASSERT_EQ(meta1.database_id, meta2.database_id);
   ASSERT_EQ(meta1.rpc_request_id, meta2.rpc_request_id);
   ASSERT_EQ(meta1.client_host_port, meta2.client_host_port);
+}
+
+TEST(WaitStateTest, TestToAndFromPB) {
+  testToAndFromPB();
 }
 
 TEST(WaitStateTest, TestUpdate) {
@@ -70,6 +76,7 @@ TEST(WaitStateTest, TestUpdate) {
   ASSERT_EQ(meta1.yql_endpoint_tserver_uuid, meta1_copy.yql_endpoint_tserver_uuid);
   ASSERT_EQ(meta1.query_id, pb1.query_id());
   ASSERT_EQ(meta1.session_id, pb1.session_id());
+  ASSERT_EQ(meta1.database_id, meta1_copy.database_id);
   ASSERT_EQ(meta1.rpc_request_id, meta1_copy.rpc_request_id);
   ASSERT_EQ(meta1.client_host_port, HostPortFromPB(pb1.client_host_port()));
 

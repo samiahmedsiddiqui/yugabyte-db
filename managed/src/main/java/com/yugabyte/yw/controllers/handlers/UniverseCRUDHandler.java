@@ -34,6 +34,7 @@ import com.yugabyte.yw.common.ImageBundleUtil;
 import com.yugabyte.yw.common.KubernetesManagerFactory;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.ReleaseContainer;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
@@ -70,6 +71,7 @@ import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.CertificateInfo;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerTask;
+import com.yugabyte.yw.models.CustomerTask.TargetType;
 import com.yugabyte.yw.models.ImageBundle;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.ProviderDetails;
@@ -92,6 +94,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -99,6 +102,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import javax.inject.Singleton;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -134,7 +138,7 @@ public class UniverseCRUDHandler {
 
   @Inject CertificateHelper certificateHelper;
 
-  private enum OpType {
+  public enum OpType {
     CONFIGURE,
     CREATE,
     UPDATE
@@ -202,6 +206,9 @@ public class UniverseCRUDHandler {
     } else {
       if (hasChangedNodes
           || !cluster.areTagsSame(currentCluster)
+          || !Objects.equals(
+              PlacementInfoUtil.getDefaultRegion(universe.getUniverseDetails()),
+              PlacementInfoUtil.getDefaultRegion(taskParams))
           || PlacementInfoUtil.didAffinitizedLeadersChange(
               currentCluster.placementInfo, cluster.placementInfo)
           || isRegionListUpdate(cluster, currentCluster)
@@ -273,6 +280,16 @@ public class UniverseCRUDHandler {
     return true;
   }
 
+  private boolean proxyConfigChanged(
+      UserIntent newIntent, UserIntent currentIntent, NodeDetails node) {
+    if (!Objects.equals(
+        newIntent.getProxyConfig(node.getAzUuid()),
+        currentIntent.getProxyConfig(node.getAzUuid()))) {
+      return true;
+    }
+    return false;
+  }
+
   private Cluster getClusterFromTaskParams(UniverseConfigureTaskParams taskParams) {
     Cluster cluster;
     if (taskParams.currentClusterType.equals(UniverseDefinitionTaskParams.ClusterType.PRIMARY)) {
@@ -305,6 +322,9 @@ public class UniverseCRUDHandler {
     if (userIntent.deviceInfo != null) {
       userIntent.deviceInfo.validate();
     }
+    if (userIntent.masterDeviceInfo != null && userIntent.dedicatedNodes) {
+      userIntent.masterDeviceInfo.validate();
+    }
 
     checkGeoPartitioningParameters(customer, taskParams, OpType.CONFIGURE);
 
@@ -330,7 +350,7 @@ public class UniverseCRUDHandler {
     }
   }
 
-  private void checkGeoPartitioningParameters(
+  public void checkGeoPartitioningParameters(
       Customer customer, UniverseDefinitionTaskParams taskParams, OpType op) {
 
     UUID defaultRegionUUID = PlacementInfoUtil.getDefaultRegion(taskParams);
@@ -523,6 +543,15 @@ public class UniverseCRUDHandler {
     }
     for (Cluster c : taskParams.clusters) {
       Provider provider = Provider.getOrBadRequest(UUID.fromString(c.userIntent.provider));
+      // Multiple layers of check as cloud info can be null in unit tests
+      if (provider.getDetails().getCloudInfo() != null
+          && provider.getDetails().getCloudInfo().kubernetes != null
+          && provider.getDetails().getCloudInfo().kubernetes.isKubernetesOperatorControlled
+          && !taskParams.isKubernetesOperatorControlled) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            "cannot use operator controlled provider to create a universe without the operator");
+      }
       // Set the provider code.
       c.userIntent.providerType = Common.CloudType.valueOf(provider.getCode());
       c.validate(!cloudEnabled, isAuthEnforced, taskParams.nodeDetailsSet);
@@ -536,7 +565,9 @@ public class UniverseCRUDHandler {
       }
       validateRegionsAndZones(provider, c);
       // Configure the defaultimageBundle in case not specified.
-      if (c.userIntent.imageBundleUUID == null && provider.getCloudCode().imageBundleSupported()) {
+      if (c.userIntent.imageBundleUUID == null
+          && provider.getCloudCode().imageBundleSupported()
+          && !cloudEnabled) {
         if (provider.getImageBundles().size() > 0) {
           List<ImageBundle> bundles = ImageBundle.getDefaultForProvider(provider.getUuid());
           if (bundles.size() > 0) {
@@ -587,9 +618,6 @@ public class UniverseCRUDHandler {
       PlacementInfoUtil.updatePlacementInfo(taskParams.getNodesInCluster(c.uuid), c.placementInfo);
       PlacementInfoUtil.finalSanityCheckConfigure(c, taskParams.getNodesInCluster(c.uuid));
 
-      taskParams.otelCollectorEnabled =
-          confGetter.getConfForScope(provider, ProviderConfKeys.otelCollectorEnabled);
-
       if (c.userIntent.specificGFlags != null) {
         c.userIntent.masterGFlags =
             GFlagsUtil.getBaseGFlags(UniverseTaskBase.ServerType.MASTER, c, taskParams.clusters);
@@ -609,13 +637,13 @@ public class UniverseCRUDHandler {
       UniverseDefinitionTaskParams.UserIntent userIntent =
           taskParams.getPrimaryCluster().userIntent;
 
-      if (taskParams.isEnableYbc()) {
-        Provider p = Provider.getOrBadRequest(UUID.fromString(userIntent.provider));
+      Provider p = Provider.getOrBadRequest(UUID.fromString(userIntent.provider));
+      if (confGetter.getConfForScope(p, ProviderConfKeys.ybcEnabledForProvider)) {
         if (userIntent.providerType.equals(Common.CloudType.kubernetes)) {
-          if (confGetter.getConfForScope(p, ProviderConfKeys.enableYbcOnK8s)
-              && Util.compareYbVersions(
-                      userIntent.ybSoftwareVersion, Util.K8S_YBC_COMPATIBLE_DB_VERSION, true)
-                  >= 0) {
+          if (Util.compareYbVersions(
+                  userIntent.ybSoftwareVersion, Util.K8S_YBC_COMPATIBLE_DB_VERSION, true)
+              >= 0) {
+            taskParams.setEnableYbc(true);
             taskParams.setYbcSoftwareVersion(
                 StringUtils.isNotBlank(taskParams.getYbcSoftwareVersion())
                     ? taskParams.getYbcSoftwareVersion()
@@ -636,11 +664,15 @@ public class UniverseCRUDHandler {
               "Ybc installation is skipped on VM universe with DB version lower than "
                   + confGetter.getGlobalConf(GlobalConfKeys.ybcCompatibleDbVersion));
         } else {
+          taskParams.setEnableYbc(true);
           taskParams.setYbcSoftwareVersion(
               StringUtils.isNotBlank(taskParams.getYbcSoftwareVersion())
                   ? taskParams.getYbcSoftwareVersion()
                   : ybcManager.getStableYbcVersion());
         }
+      } else {
+        taskParams.setEnableYbc(false);
+        taskParams.setYbcSoftwareVersion(null);
       }
 
       if (taskParams.isEnableYbc()) {
@@ -668,14 +700,14 @@ public class UniverseCRUDHandler {
           }
         } else {
           for (NodeDetails nodeDetails : taskParams.nodeDetailsSet) {
-            ReleaseManager.ReleaseMetadata ybReleaseMetadata =
+            ReleaseContainer release =
                 releaseManager.getReleaseByVersion(userIntent.ybSoftwareVersion);
             AvailabilityZone az = AvailabilityZone.getOrBadRequest(nodeDetails.azUuid);
             String ybServerPackage;
             if (taskParams.arch != null) {
-              ybServerPackage = ybReleaseMetadata.getFilePath(taskParams.arch);
+              ybServerPackage = release.getFilePath(taskParams.arch);
             } else {
-              ybServerPackage = ybReleaseMetadata.getFilePath(az.getRegion());
+              ybServerPackage = release.getFilePath(az.getRegion());
             }
             Pair<String, String> ybcPackageDetails =
                 Util.getYbcPackageDetailsFromYbServerPackage(ybServerPackage);
@@ -745,6 +777,18 @@ public class UniverseCRUDHandler {
       for (Cluster readOnlyCluster : taskParams.getReadOnlyClusters()) {
         validateConsistency(taskParams.getPrimaryCluster(), readOnlyCluster);
       }
+
+      taskParams.otelCollectorEnabled =
+          confGetter.getConfForScope(p, ProviderConfKeys.otelCollectorEnabled);
+
+      // update otel port
+      int otelPort = confGetter.getConfForScope(p, ProviderConfKeys.otelCollectorMetricsPort);
+      taskParams.communicationPorts.otelCollectorMetricsPort = otelPort;
+      if (taskParams.nodeDetailsSet != null) {
+        for (NodeDetails nodeDetails : taskParams.nodeDetailsSet) {
+          nodeDetails.otelCollectorMetricsPort = otelPort;
+        }
+      }
     }
 
     checkGeoPartitioningParameters(customer, taskParams, OpType.CREATE);
@@ -755,6 +799,8 @@ public class UniverseCRUDHandler {
     TaskType taskType = TaskType.CreateUniverse;
     DB.beginTransaction();
     try {
+      // If the subsequent universe task fails on validation step, we will show error in UI.
+      taskParams.updateSucceeded = false;
       universe = Universe.create(taskParams, customer.getId());
       LOG.info("Created universe {} : {}.", universe.getUniverseUUID(), universe.getName());
       if (taskParams.runtimeFlags != null) {
@@ -1028,7 +1074,7 @@ public class UniverseCRUDHandler {
   }
 
   /** Merge node exporter related information from current universe details to the task params */
-  private void mergeNodeExporterInfo(Universe u, UniverseDefinitionTaskParams taskParams) {
+  public void mergeNodeExporterInfo(Universe u, UniverseDefinitionTaskParams taskParams) {
     // Set the node exporter config based on the provider
     UniverseDefinitionTaskParams universeDetails = u.getUniverseDetails();
     boolean installNodeExporter = universeDetails.extraDependencies.installNodeExporter;
@@ -1081,7 +1127,7 @@ public class UniverseCRUDHandler {
     return taskUUID;
   }
 
-  private void notHelm2LegacyOrBadRequest(Universe u) {
+  public void notHelm2LegacyOrBadRequest(Universe u) {
     Map<String, String> universeConfig = u.getConfig();
     if (!universeConfig.containsKey(Universe.HELM2_LEGACY)) {
       throw new PlatformServiceException(
@@ -1094,7 +1140,7 @@ public class UniverseCRUDHandler {
     }
   }
 
-  private UUID checkValidRootCA(UUID rootCA) {
+  public UUID checkValidRootCA(UUID rootCA) {
     if (!CertificateInfo.isCertificateValid(rootCA)) {
       String errMsg =
           String.format(
@@ -1186,6 +1232,21 @@ public class UniverseCRUDHandler {
       if (resourceDetails != null) {
         taskParams.setKubernetesResourceDetails(resourceDetails);
       }
+    }
+
+    Optional<UUID> oIdenticalIncompleteTask =
+        CustomerTask.maybeGetIdenticalIncompleteTaskUUID(
+            customer.getUuid(),
+            universe.getUniverseUUID(),
+            CustomerTask.TaskType.Delete,
+            TargetType.Universe);
+    if (oIdenticalIncompleteTask.isPresent()) {
+      UUID inProgressUuid = oIdenticalIncompleteTask.get();
+      LOG.info(
+          "Destroy universe task already exists for {} with task uuid = {}",
+          universe.getUniverseUUID(),
+          inProgressUuid);
+      return inProgressUuid;
     }
 
     UUID taskUUID = commissioner.submit(taskType, taskParams);
@@ -1445,7 +1506,7 @@ public class UniverseCRUDHandler {
     return taskUUID;
   }
 
-  static void validateConsistency(Cluster primaryCluster, Cluster cluster) {
+  public static void validateConsistency(Cluster primaryCluster, Cluster cluster) {
     checkEquals(c -> c.userIntent.enableYSQL, primaryCluster, cluster, "Ysql setting");
     checkEquals(c -> c.userIntent.enableYSQLAuth, primaryCluster, cluster, "Ysql auth setting");
     checkEquals(c -> c.userIntent.enableYCQL, primaryCluster, cluster, "Ycql setting");
@@ -2008,7 +2069,7 @@ public class UniverseCRUDHandler {
     return upgradeUniverseHandler.rotateCerts(certsRotateParams, customer, universe);
   }
 
-  private void checkHelmChartExists(String ybSoftwareVersion) {
+  public void checkHelmChartExists(String ybSoftwareVersion) {
     try {
       kubernetesManagerFactory.getManager().getHelmPackagePath(ybSoftwareVersion);
     } catch (RuntimeException e) {
@@ -2145,6 +2206,14 @@ public class UniverseCRUDHandler {
       throw new PlatformServiceException(BAD_REQUEST, errMsg);
     }
 
+    if (!Objects.equals(taskParams.nodePrefix, universe.getUniverseDetails().nodePrefix)) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format(
+              "Cannot change node prefix (from %s to %s)",
+              universe.getUniverseDetails().nodePrefix, taskParams.nodePrefix));
+    }
+
     Set<UniverseDefinitionTaskParams.UpdateOptions> updateOptions =
         getUpdateOptions(taskParams, UniverseConfigureTaskParams.ClusterOperationType.EDIT);
     if (!updateOptions.contains(UniverseDefinitionTaskParams.UpdateOptions.UPDATE)
@@ -2156,7 +2225,8 @@ public class UniverseCRUDHandler {
       Cluster curCluster = universe.getCluster(newCluster.uuid);
       UserIntent newIntent = newCluster.userIntent;
       UserIntent curIntent = curCluster.userIntent;
-      for (NodeDetails nodeDetails : taskParams.getNodesInCluster(newCluster.uuid)) {
+      Set<NodeDetails> nodeDetailsSet = taskParams.getNodesInCluster(newCluster.uuid);
+      for (NodeDetails nodeDetails : nodeDetailsSet) {
         if (nodeDetails.state != NodeState.ToBeAdded
             && nodeDetails.state != NodeState.ToBeRemoved) {
           String newInstanceType = newIntent.getInstanceTypeForNode(nodeDetails);
@@ -2233,7 +2303,21 @@ public class UniverseCRUDHandler {
                         + " through EditUniverse: from %s to %s",
                     nodeDetails.nodeName, curIntent.useSystemd, newIntent.useSystemd));
           }
+          if (proxyConfigChanged(newIntent, curIntent, nodeDetails)) {
+            throw new PlatformServiceException(
+                BAD_REQUEST,
+                String.format(
+                    "Cannot change proxy config for existing node %s" + " through EditUniverse",
+                    nodeDetails.nodeName));
+          }
         }
+      }
+      Set<NodeDetails> toBeAdded =
+          nodeDetailsSet.stream()
+              .filter(nD -> nD.state.equals(NodeState.ToBeAdded))
+              .collect(Collectors.toSet());
+      if (CollectionUtils.isNotEmpty(toBeAdded)) {
+        newCluster.validateProxyConfig(newIntent, toBeAdded);
       }
     }
   }

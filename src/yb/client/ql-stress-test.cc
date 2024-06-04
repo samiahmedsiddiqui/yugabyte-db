@@ -54,7 +54,7 @@
 #include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/util/backoff_waiter.h"
-#include "yb/util/debug-util.h"
+#include "yb/util/debug.h"
 #include "yb/util/format.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
@@ -145,11 +145,7 @@ class QLStressTest : public QLDmlTestBase<MiniCluster> {
   }
 
   Status WaitForTabletLeaders() {
-    const MonoTime deadline = MonoTime::Now() + 10s * kTimeMultiplier;
-    for (const auto& tablet_id : ListTabletIdsForTable(cluster_.get(), table_->id())) {
-      RETURN_NOT_OK(WaitUntilTabletHasLeader(cluster_.get(), tablet_id, deadline));
-    }
-    return Status::OK();
+    return WaitForTableLeaders(cluster_.get(), table_->id(), 10s * kTimeMultiplier);
   }
 
   YBqlWriteOpPtr InsertRow(const YBSessionPtr& session,
@@ -648,7 +644,7 @@ void QLStressTest::VerifyFlushedFrontiers() {
       rocksdb::Options options;
       auto tablet_options = TabletOptions();
       tablet_options.rocksdb_env = db->GetEnv();
-      InitRocksDBOptions(&options, "", nullptr, tablet_options);
+      InitRocksDBOptions(&options, "", "", nullptr, tablet_options);
       std::unique_ptr<rocksdb::DB> checkpoint_db;
       rocksdb::DB* checkpoint_db_raw_ptr = nullptr;
 
@@ -834,7 +830,7 @@ void QLStressTest::AddWriter(
 }
 
 void QLStressTest::TestWriteRejection() {
-  constexpr int kWriters = IsDebug() ? 10 : 20;
+  constexpr int kWriters = kIsDebug ? 10 : 20;
   constexpr int kKeyBase = 10000;
 
   std::array<std::atomic<int>, kWriters> keys;

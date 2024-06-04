@@ -178,11 +178,6 @@ class CatalogManagerUtil {
       const Schema& schema, uint32_t schema_version, const dockv::PartitionSchema& partition_schema,
       tablet::TableInfoPB* pb);
 
-  static bool RetainTablet(
-      const google::protobuf::RepeatedPtrField<std::string>& retaining_snapshot_schedules,
-      const ScheduleMinRestoreTime& schedule_to_min_restore_time,
-      HybridTime hide_hybrid_time, const TabletId& tablet_id);
-
  private:
   CatalogManagerUtil();
 
@@ -250,6 +245,8 @@ inline bool IsTable(const SysTablesEntryPB& pb) {
 // PlacementInfoPB does not set the number of tablet replicas to create for the placement, default
 // to the replication_factor flag.
 int32_t GetNumReplicasOrGlobalReplicationFactor(const PlacementInfoPB& placement_info);
+
+const BlacklistPB& GetBlacklist(const SysClusterConfigEntryPB& pb, bool blacklist_leader);
 
 } // namespace master
 } // namespace yb

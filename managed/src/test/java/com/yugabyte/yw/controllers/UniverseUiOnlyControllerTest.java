@@ -37,6 +37,7 @@ import com.fasterxml.jackson.databind.type.TypeFactory;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.cloud.PublicCloudConstants;
+import com.yugabyte.yw.cloud.PublicCloudConstants.StorageType;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase;
@@ -49,6 +50,7 @@ import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.forms.UniverseConfigureTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UpdateOptions;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.forms.UpgradeParams;
@@ -287,7 +289,7 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
     for (NodeInstance ni : NodeInstance.listByProvider(p.getUuid())) {
       if (k < 5) {
         k++;
-        ni.setInUse(true);
+        ni.setState(NodeInstance.State.USED);
         ni.save();
       } else {
         break;
@@ -307,6 +309,62 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
     Result result = assertPlatformException(() -> sendPrimaryEditConfigureRequest(topJson));
     assertBadRequest(result, "Couldn't find 12 nodes of type type.small in PlacementAZ 1");
     assertAuditEntry(0, customer.getUuid());
+  }
+
+  @Test
+  @Parameters({
+    "-20, 0, Persistent, FULL_MOVE",
+    "0, -1, Persistent, FULL_MOVE",
+    "0, 0, Scratch, FULL_MOVE",
+    "100, 0, Persistent, SMART_RESIZE_NON_RESTART",
+    "0, 1, Persistent, FULL_MOVE",
+  })
+  public void testConfigureEditVolumeChanges(
+      int deltaVolumeSize,
+      int deltaNumVolumes,
+      StorageType storageType,
+      UpdateOptions expectedUpdateOption) {
+    Provider p = ModelFactory.gcpProvider(customer);
+    Universe u = createUniverse(customer.getId());
+    Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
+    AvailabilityZone.createOrThrow(r, "az-1", "PlacementAZ 1", "subnet-1");
+    AvailabilityZone.createOrThrow(r, "az-2", "PlacementAZ 2", "subnet-2");
+    AvailabilityZone.createOrThrow(r, "az-3", "PlacementAZ 3", "subnet-3");
+    InstanceType i =
+        InstanceType.upsert(
+            p.getUuid(), "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+    UniverseDefinitionTaskParams utd = new UniverseDefinitionTaskParams();
+    utd.setUniverseUUID(u.getUniverseUUID());
+    UniverseDefinitionTaskParams.UserIntent ui = getTestUserIntent(r, p, i, 5);
+    ui.universeName = u.getName();
+    ui.deviceInfo = new DeviceInfo();
+    ui.deviceInfo.numVolumes = 2;
+    ui.deviceInfo.volumeSize = 100;
+    ui.deviceInfo.storageType = StorageType.Persistent;
+    Cluster pc = utd.upsertPrimaryCluster(ui, null);
+    PlacementInfoUtil.updateUniverseDefinition(
+        utd,
+        customer.getId(),
+        utd.getPrimaryCluster().uuid,
+        UniverseConfigureTaskParams.ClusterOperationType.CREATE);
+    Universe.UniverseUpdater updater = universe -> universe.setUniverseDetails(utd);
+    Universe.saveDetails(u.getUniverseUUID(), updater);
+    u = Universe.getOrBadRequest(u.getUniverseUUID());
+    UniverseDefinitionTaskParams editTestUTD = u.getUniverseDetails();
+    UniverseDefinitionTaskParams.Cluster primaryCluster = editTestUTD.getPrimaryCluster();
+    primaryCluster.userIntent.deviceInfo.volumeSize += deltaVolumeSize;
+    primaryCluster.userIntent.deviceInfo.numVolumes += deltaNumVolumes;
+    primaryCluster.userIntent.deviceInfo.storageType = storageType;
+    editTestUTD.nodeDetailsSet.forEach(Node -> Node.state = NodeState.Live);
+
+    ObjectNode editJson = (ObjectNode) Json.toJson(editTestUTD);
+    Result result = sendPrimaryEditConfigureRequest(editJson);
+    assertOk(result);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertTrue(json.get("updateOptions").isArray());
+    ArrayNode updateOptionsJson = (ArrayNode) json.get("updateOptions");
+    assertEquals(1, updateOptionsJson.size());
+    assertTrue(updateOptionsJson.get(0).asText().equals(expectedUpdateOption.name()));
   }
 
   @Test
@@ -446,6 +504,7 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
     clusterJson.set("uuid", Json.toJson(cluster.uuid));
     ArrayNode clustersJsonArray = Json.newArray().add(clusterJson);
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.put("nodePrefix", u.getUniverseDetails().nodePrefix);
     bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.getUuid() + "/universes/" + u.getUniverseUUID();
@@ -500,6 +559,7 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
     clusterJson.set("uuid", Json.toJson(cluster.uuid));
     ArrayNode clustersJsonArray = Json.newArray().add(clusterJson);
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.put("nodePrefix", u.getUniverseDetails().nodePrefix);
     bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.getUuid() + "/universes/" + u.getUniverseUUID();
@@ -573,6 +633,7 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
     clusterJson.set("uuid", Json.toJson(cluster.uuid));
     ArrayNode clustersJsonArray = Json.newArray().add(clusterJson);
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.put("nodePrefix", u.getUniverseDetails().nodePrefix);
     bodyJson.set("nodeDetailsSet", Json.newArray());
     bodyJson.put("enableYbc", true);
     bodyJson.put("ybcSoftwareVersion", "");
@@ -1075,6 +1136,7 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
 
     ObjectNode bodyJson = Json.newObject();
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.put("nodePrefix", u.getUniverseDetails().nodePrefix);
     bodyJson.set("nodeDetailsSet", nodeDetailsJsonArray);
 
     String url = "/api/customers/" + customer.getUuid() + "/universes/" + u.getUniverseUUID();
@@ -1927,6 +1989,14 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
   }
 
   @Test
+  public void testGetUpdateOptionsEditDefaultRegion() throws IOException {
+    testGetAvailableOptions(
+        x -> x.getPrimaryCluster().placementInfo.cloudList.get(0).defaultRegion = UUID.randomUUID(),
+        EDIT,
+        UniverseDefinitionTaskParams.UpdateOptions.UPDATE);
+  }
+
+  @Test
   public void testGetUpdateOptionsEditRF() throws IOException {
     testGetAvailableOptions(
         x -> x.getPrimaryCluster().userIntent.replicationFactor++,
@@ -2177,6 +2247,20 @@ public class UniverseUiOnlyControllerTest extends UniverseCreateControllerTestBa
         assertPlatformException(
             () -> doRequestWithAuthTokenAndBody("PUT", url, authToken, bodyJson));
     assertErrorResponse(result, "Cannot change systemd setting for existing node");
+  }
+
+  @Test
+  public void testUniverseUpdateNodePrefixFail() {
+    Universe u = setUpUniverse();
+    u.getUniverseDetails().nodePrefix = "new_prefix";
+    String url = "/api/customers/" + customer.getUuid() + "/universes/" + u.getUniverseUUID();
+    Result result =
+        assertPlatformException(
+            () ->
+                doRequestWithAuthTokenAndBody(
+                    "PUT", url, authToken, Json.toJson(u.getUniverseDetails())));
+    assertErrorResponse(
+        result, "Cannot change node prefix (from yb-tc-Test universe to new_prefix)");
   }
 
   private Universe addNode(Universe u) {
