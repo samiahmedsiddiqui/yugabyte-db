@@ -15,6 +15,7 @@ public class TsStorageGraphConfig {
   private String timestampColumn;
   private Map<String, FilterColumn> filterColumns;
   private Map<String, DataColumn> dataColumns;
+  private String additionalFilter;
 
   @Data
   public static class DataColumn {
@@ -32,7 +33,9 @@ public class TsStorageGraphConfig {
   @Data
   public static class FilterColumn {
     private String name;
+    private String defaultValue;
     private FilterColumnType type = FilterColumnType.type_text;
+    private boolean neverRead = false;
     private boolean alwaysGroupBy = false;
     private boolean defaultGroupBy = false;
     private List<String> assumesGroupBy = Collections.emptyList();

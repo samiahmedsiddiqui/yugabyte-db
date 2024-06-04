@@ -9,8 +9,8 @@
 
 import { FC } from 'react';
 import clsx from 'clsx';
+import { useQuery } from 'react-query';
 import { useTranslation } from 'react-i18next';
-import { values } from 'lodash';
 import { Control, useFieldArray, useForm } from 'react-hook-form';
 import { FormHelperText, Grid, Typography, makeStyles } from '@material-ui/core';
 import { yupResolver } from '@hookform/resolvers/yup';
@@ -27,9 +27,12 @@ import { CloudVendorRegionField } from '../../forms/configureRegion/ConfigureReg
 import { isNonEmptyObject } from '../../../../../utils/ObjectUtils';
 import {
   ImageBundle,
-  ImageBundleType
+  ImageBundleType,
+  RunTimeConfigEntry
 } from '../../../../../redesign/features/universe/universe-form/utils/dto';
 import { ArchitectureType, ProviderCode } from '../../constants';
+import { runtimeConfigQueryKey } from '../../../../../redesign/helpers/api';
+import { fetchGlobalRunTimeConfigs } from '../../../../../api/admin';
 import { AWSProviderEditFormFieldValues } from '../../forms/aws/AWSProviderEditForm';
 import { AWSProviderCreateFormFieldValues } from '../../forms/aws/AWSProviderCreateForm';
 import { getAddLinuxVersionSchema } from './ValidationSchemas';
@@ -87,6 +90,8 @@ const useStyles = makeStyles((theme) => ({
   }
 }));
 
+const IMDSV2_RUNTIME_CONFIG = 'yb.aws.enable_imdsv2_support';
+
 export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
   providerType,
   control,
@@ -100,6 +105,17 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
     keyPrefix: 'linuxVersion'
   });
   const classes = useStyles();
+
+  const { data: globalRuntimeConfigs } = useQuery(runtimeConfigQueryKey.globalScope(), () =>
+    fetchGlobalRunTimeConfigs(true).then((res: any) => res.data)
+  );
+
+  const isIMDSv2Enabled =
+    globalRuntimeConfigs?.configEntries?.find(
+      (c: RunTimeConfigEntry) => c.key === IMDSV2_RUNTIME_CONFIG
+    )?.value === 'true';
+
+  const showIMDSv2 = providerType === ProviderCode.AWS && isIMDSv2Enabled;
 
   const regions = useFieldArray({
     name: 'regions',
@@ -119,7 +135,7 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
       details: {
         arch: ArchitectureType.X86_64,
         sshPort: 22,
-        ...(providerType === ProviderCode.AWS && { useIMDSv2: false })
+        ...(showIMDSv2 && { useIMDSv2: false })
       },
       ...editDetails
     },
@@ -164,6 +180,8 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
       cancelLabel={t('cancel', { keyPrefix: 'common' })}
       overrideWidth={'800px'}
       overrideHeight={'810px'}
+      submitTestId="AddLinuxVersionModal-Submit"
+      cancelTestId="AddLinuxVersionModal-Cancel"
       onSubmit={() => {
         handleSubmit((values) => {
           onSubmit(values);
@@ -186,6 +204,9 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
             className={classes.nameInput}
             placeholder={t('form.linuxVersionNamePlaceholder')}
             disabled={isEditMode || isYBAManagedBundle}
+            inputProps={{
+              'data-testid': 'AddLinuxVersionModal-LinuxVersionNameInput'
+            }}
           />
         </div>
         {providerType !== ProviderCode.AWS && (
@@ -197,6 +218,9 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
               className={classes.nameInput}
               placeholder={t('form.machineImageIdPlaceholder')}
               disabled={isYBAManagedBundle}
+              inputProps={{
+                'data-testid': 'AddLinuxVersionModal-MachineImageID'
+              }}
             />
           </div>
         )}
@@ -255,6 +279,9 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
                 placeholder={t('form.sshUserPlaceholder')}
                 fullWidth
                 disabled={isYBAManagedBundle}
+                inputProps={{
+                  'data-testid': 'AddLinuxVersionModal-SSHUser'
+                }}
               />
             </Grid>
           </Grid>
@@ -270,12 +297,15 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
                 placeholder={t('form.sshPortPlaceholder')}
                 disabled={isYBAManagedBundle}
                 fullWidth
+                inputProps={{
+                  'data-testid': 'AddLinuxVersionModal-SSHPort'
+                }}
               />
             </Grid>
           </Grid>
         </div>
 
-        {providerType === ProviderCode.AWS && (
+        {showIMDSv2 && (
           <div>
             <Typography variant="body1">{t('form.otherConfiguration')}</Typography>
             <Grid container spacing={3} alignItems="center">
@@ -288,7 +318,9 @@ export const AddLinuxVersionModal: FC<AddLinuxVersionModalProps> = ({
                 <YBToggleField
                   name={'details.useIMDSv2'}
                   control={formControl}
-                  disabled={isEditMode || isYBAManagedBundle}
+                  inputProps={{
+                    'data-testid': 'AddLinuxVersionModal-useIMDSv2'
+                  }}
                 />
               </Grid>
             </Grid>

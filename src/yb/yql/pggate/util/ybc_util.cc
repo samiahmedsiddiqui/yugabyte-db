@@ -325,6 +325,10 @@ bool YBCIsTxnAbortedError(uint16_t txn_errcode) {
   return txn_errcode == to_underlying(TransactionErrorCode::kAborted);
 }
 
+const char* YBCTxnErrCodeToString(uint16_t txn_errcode) {
+  return YBCPAllocStdString(ToString(TransactionErrorCode(txn_errcode)));
+}
+
 uint16_t YBCGetTxnConflictErrorCode() {
   return to_underlying(TransactionErrorCode::kConflict);
 }
@@ -476,6 +480,10 @@ const char* YBCGetWaitEventType(uint32_t wait_event_info) {
   constexpr uint32_t kWaitEventMask = (1 << YB_ASH_COMPONENT_POSITION) - 1;
   uint32_t wait_event = wait_event_info & kWaitEventMask;
   return NoPrefixName(GetWaitStateType(static_cast<ash::WaitStateCode>(wait_event)));
+}
+
+uint8_t YBCGetQueryIdForCatalogRequests() {
+  return static_cast<uint8_t>(ash::FixedQueryId::kQueryIdForCatalogRequests);
 }
 
 } // extern "C"

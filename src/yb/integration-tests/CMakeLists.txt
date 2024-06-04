@@ -57,6 +57,7 @@ set(INTEGRATION_TESTS_SRCS
   cluster_verifier.cc
   create-table-itest-base.cc
   external_mini_cluster.cc
+  external_daemon.cc
   external_yb_controller.cc
   external_mini_cluster_fs_inspector.cc
   external_mini_cluster_validator.cc
@@ -166,6 +167,7 @@ ADD_YB_TEST(tserver_path_handlers-itest)
 ADD_YB_TEST(master_failover-itest)
 ADD_YB_TEST(master_config-itest)
 ADD_YB_TEST(master_tasks-test)
+ADD_YB_TEST(metacache_refresh-itest)
 ADD_YB_TEST(network_failure-test)
 ADD_YB_TEST(system_table_fault_tolerance)
 ADD_YB_TEST(raft_consensus-itest)
@@ -219,6 +221,7 @@ ADD_YB_TEST(cdcsdk_tablet_split-test)
 ADD_YB_TEST(cdcsdk_consistent_snapshot-test)
 ADD_YB_TEST(transaction-test)
 ADD_YB_TEST(encryption-test)
+ADD_YB_TEST(pg_cron-test)
 ADD_YB_TEST(secure_connection_test)
 ADD_YB_TEST(xcluster/xcluster_consistency-test)
 ADD_YB_TEST(xcluster/xcluster_db_scoped-test)

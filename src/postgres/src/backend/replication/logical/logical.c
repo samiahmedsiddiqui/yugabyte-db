@@ -229,8 +229,6 @@ StartupDecodingContext(List *output_plugin_options,
 	{
 		HASHCTL		ctl;
 
-		ctx->yb_handle_relcache_invalidation_startup = true;
-
 		/*
 		 * Allocate the hash table to handle relcache invaldations. Uses the
 		 * memory context of the LogicalDecodingContext.
@@ -620,6 +618,16 @@ LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin)
 		elog(ERROR, "output plugins have to register a change callback");
 	if (callbacks->commit_cb == NULL)
 		elog(ERROR, "output plugins have to register a commit callback");
+}
+
+void
+YBValidateOutputPlugin(char *plugin)
+{
+	OutputPluginCallbacks *callbacks;
+
+	callbacks = palloc(sizeof(OutputPluginCallbacks));
+	LoadOutputPlugin(callbacks, plugin);
+	pfree(callbacks);
 }
 
 static void

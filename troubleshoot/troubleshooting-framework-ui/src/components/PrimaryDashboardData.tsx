@@ -2,12 +2,16 @@ import { useState, useEffect, ChangeEvent } from 'react';
 import { useUpdateEffect } from 'react-use';
 import { Box, MenuItem, makeStyles } from '@material-ui/core';
 import clsx from 'clsx';
+import {
+  YBSelect,
+  YBDateTimePicker,
+  YBTimeFormats,
+  formatDatetime,
+  getDiffHours
+} from '@yugabytedb/ui-components';
 import { PrimaryDashboard } from './PrimaryDashboard';
-import { YBDateTimePicker } from '../common/YBDateTimePicker';
 import { Anomaly, AnomalyCategory, AppName } from '../helpers/dtos';
-import { YBSelect } from '../common/YBSelect';
 import { TIME_FILTER, anomalyFilterDurations } from '../helpers/constants';
-import { YBTimeFormats, formatDatetime, getDiffHours } from '../helpers/dateUtils';
 
 interface PrimaryDashboardDataProps {
   anomalyData: Anomaly[] | null;
@@ -134,7 +138,7 @@ export const PrimaryDashboardData = ({
   }, [filterDuration]);
 
   const handleResolve = (id: string, isResolved: boolean) => {
-    const anomalyListCopy = JSON.parse(JSON.stringify(anomalyData));
+    const anomalyListCopy = JSON.parse(JSON.stringify(filteredAnomalyList));
     const selectedAnomaly = anomalyListCopy?.find((anomaly: Anomaly) => anomaly.uuid === id);
     if (selectedAnomaly) {
       selectedAnomaly.isResolved = isResolved;

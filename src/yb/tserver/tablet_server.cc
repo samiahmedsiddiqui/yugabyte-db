@@ -39,6 +39,7 @@
 #include <utility>
 
 #include "yb/client/client_fwd.h"
+#include "yb/client/meta_cache.h"
 #include "yb/client/transaction_manager.h"
 #include "yb/client/universe_key_client.h"
 
@@ -73,6 +74,7 @@
 #include "yb/server/ycql_stat_provider.h"
 
 #include "yb/tablet/maintenance_manager.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/heartbeater.h"
@@ -80,6 +82,7 @@
 #include "yb/tserver/metrics_snapshotter.h"
 #include "yb/tserver/pg_client_service.h"
 #include "yb/tserver/remote_bootstrap_service.h"
+#include "yb/tserver/stateful_services/pg_cron_leader_service.h"
 #include "yb/tserver/tablet_service.h"
 #include "yb/tserver/pg_table_mutation_count_sender.h"
 #include "yb/tserver/ts_tablet_manager.h"
@@ -114,6 +117,8 @@ using std::make_shared;
 using std::shared_ptr;
 using std::vector;
 using std::string;
+using yb::client::internal::RemoteTabletServer;
+using yb::client::internal::RemoteTabletServerPtr;
 using yb::rpc::ServiceIf;
 
 using namespace std::literals;
@@ -221,6 +226,12 @@ DEFINE_NON_RUNTIME_uint32(ysql_conn_mgr_port, yb::pgwrapper::PgProcessConf::kDef
 
 DEFINE_NON_RUNTIME_bool(start_pgsql_proxy, false,
             "Whether to run a PostgreSQL server as a child process of the tablet server");
+
+DEFINE_RUNTIME_uint32(ysql_min_new_version_ignored_count, 10,
+    "Minimum consecutive number of times that a tserver is allowed to ignore an older catalog "
+    "version that is retrieved from a tserver-master heartbeat response.");
+
+DECLARE_bool(enable_pg_cron);
 
 namespace yb::tserver {
 
@@ -508,10 +519,10 @@ Status TabletServer::Init() {
   return Status::OK();
 }
 
-Status TabletServer::InitAutoFlags() {
-  RETURN_NOT_OK(auto_flags_manager_->Init(options_.HostsString(), *opts_.GetMasterAddresses()));
+Status TabletServer::InitAutoFlags(rpc::Messenger* messenger) {
+  RETURN_NOT_OK(auto_flags_manager_->Init(messenger, *opts_.GetMasterAddresses()));
 
-  return RpcAndWebServerBase::InitAutoFlags();
+  return RpcAndWebServerBase::InitAutoFlags(messenger);
 }
 
 Result<std::unordered_set<std::string>> TabletServer::GetAvailableAutoFlagsForServer() const {
@@ -627,6 +638,14 @@ Status TabletServer::RegisterServices() {
   RETURN_NOT_OK(RegisterService(
       FLAGS_TEST_echo_svc_queue_length, std::move(pg_auto_analyze_service)));
 
+  if (FLAGS_enable_pg_cron) {
+    pg_cron_leader_service_ = std::make_unique<stateful_service::PgCronLeaderService>(
+        std::bind(&TabletServer::SetCronLeaderLease, this, _1), client_future());
+    LOG(INFO) << "yb::tserver::stateful_service::PgCronLeaderService created at "
+              << pg_cron_leader_service_.get();
+    RETURN_NOT_OK(pg_cron_leader_service_->Init(tablet_manager_.get()));
+  }
+
   return Status::OK();
 }
 
@@ -662,6 +681,10 @@ void TabletServer::Shutdown() {
 
   bool expected = true;
   if (initted_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
+    if (pg_cron_leader_service_) {
+      pg_cron_leader_service_->Shutdown();
+    }
+
     auto xcluster_consumer = GetXClusterConsumer();
     if (xcluster_consumer) {
       xcluster_consumer->Shutdown();
@@ -694,15 +717,51 @@ Status TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& h
   // TODO: In the future, we should enhance the logic here to keep track information retrieved
   // from the master and compare it with information stored here. Based on this information, we
   // can only send diff updates CQL clients about whether a node came up or went down.
-  live_tservers_.assign(heartbeat_resp.tservers().begin(), heartbeat_resp.tservers().end());
+  live_tservers_.clear();
+  for (const auto& ts_info_pb : heartbeat_resp.tservers()) {
+    const auto& ts_uuid = ts_info_pb.tserver_instance().permanent_uuid();
+    live_tservers_[ts_uuid] = ts_info_pb;
+    if (!remote_tservers_.contains(ts_uuid)) {
+      remote_tservers_[ts_uuid] = std::make_shared<RemoteTabletServer>(ts_info_pb);
+    }
+  }
+  // Prune handles to the TServers that are no longer alive.
+  std::erase_if(remote_tservers_, [&](const auto& remote_ts_pair) REQUIRES(lock_) {
+    return !live_tservers_.contains(remote_ts_pair.first);
+  });
   return Status::OK();
 }
 
-Status TabletServer::GetLiveTServers(
-    std::vector<master::TSInformationPB> *live_tservers) const {
-  std::lock_guard l(lock_);
-  *live_tservers = live_tservers_;
+Status TabletServer::GetLiveTServers(std::vector<master::TSInformationPB> *live_tservers) const {
+  SharedLock l(lock_);
+  live_tservers->reserve(live_tservers_.size());
+  for (const auto& [_, ts_info_pb] : live_tservers_) {
+    live_tservers->push_back(ts_info_pb);
+  }
   return Status::OK();
+}
+
+Result<std::vector<RemoteTabletServerPtr>> TabletServer::GetRemoteTabletServers() const {
+  SharedLock l(lock_);
+  std::vector<RemoteTabletServerPtr> remote_tservers;
+  remote_tservers.reserve(remote_tservers_.size());
+  for (auto& [_, remote_ts_ptr] : remote_tservers_) {
+    remote_tservers.push_back(DCHECK_NOTNULL(remote_ts_ptr));
+  }
+  return remote_tservers;
+}
+
+Result<std::vector<RemoteTabletServerPtr>> TabletServer::GetRemoteTabletServers(
+    const std::unordered_set<std::string>& ts_uuids) const {
+  SharedLock l(lock_);
+  std::vector<RemoteTabletServerPtr> remote_tservers;
+  remote_tservers.reserve(ts_uuids.size());
+  for (auto& ts_uuid : ts_uuids) {
+    auto remote_ts = FindPtrOrNull(remote_tservers_, ts_uuid);
+    SCHECK(remote_ts, NotFound, Format("Unable to find TServer connection info with id ", ts_uuid));
+    remote_tservers.push_back(remote_ts);
+  }
+  return remote_tservers;
 }
 
 Status TabletServer::GetTabletStatus(const GetTabletStatusRequestPB* req,
@@ -727,7 +786,7 @@ void TabletServer::set_cluster_uuid(const std::string& cluster_uuid) {
 }
 
 std::string TabletServer::cluster_uuid() const {
-  std::lock_guard l(lock_);
+  SharedLock l(lock_);
   return cluster_uuid_;
 }
 
@@ -809,7 +868,7 @@ uint64_t TabletServer::GetSharedMemoryPostgresAuthKey() {
 Status TabletServer::get_ysql_db_oid_to_cat_version_info_map(
     const GetTserverCatalogVersionInfoRequestPB& req,
     GetTserverCatalogVersionInfoResponsePB *resp) const {
-  std::lock_guard l(lock_);
+  SharedLock l(lock_);
   if (req.size_only()) {
     resp->set_num_entries(narrow_cast<uint32_t>(ysql_db_catalog_version_map_.size()));
   } else {
@@ -857,6 +916,8 @@ void TabletServer::SetYsqlDBCatalogVersions(
 
   bool catalog_changed = false;
   std::unordered_set<uint32_t> db_oid_set;
+  std::unordered_set<uint32_t> db_oids_updated;
+  std::unordered_set<uint32_t> db_oids_deleted;
   for (int i = 0; i < db_catalog_version_data.db_catalog_versions_size(); i++) {
     const auto& db_catalog_version = db_catalog_version_data.db_catalog_versions(i);
     const uint32_t db_oid = db_catalog_version.db_oid();
@@ -880,7 +941,8 @@ void TabletServer::SetYsqlDBCatalogVersions(
     const auto it = ysql_db_catalog_version_map_.insert(
       std::make_pair(db_oid, CatalogVersionInfo({.current_version = new_version,
                                                  .last_breaking_version = new_breaking_version,
-                                                 .shm_index = -1})));
+                                                 .shm_index = -1,
+                                                 .new_version_ignored_count = 0})));
     if (ysql_db_catalog_version_map_.size() > 1) {
       if (!catalog_version_table_in_perdb_mode_.has_value() ||
           !catalog_version_table_in_perdb_mode_.value()) {
@@ -899,20 +961,34 @@ void TabletServer::SetYsqlDBCatalogVersions(
       if (new_version > existing_entry.current_version) {
         existing_entry.current_version = new_version;
         existing_entry.last_breaking_version = new_breaking_version;
+        existing_entry.new_version_ignored_count = 0;
         row_updated = true;
+        db_oids_updated.insert(db_oid);
         shm_index = existing_entry.shm_index;
         CHECK(
             shm_index >= 0 &&
             shm_index < static_cast<int>(TServerSharedData::kMaxNumDbCatalogVersions))
             << "Invalid shm_index: " << shm_index;
       } else if (new_version < existing_entry.current_version) {
-        LOG(DFATAL) << "Ignoring ysql db " << db_oid
-                    << " catalog version update: new version too old. "
-                    << "New: " << new_version << ", Old: " << existing_entry.current_version;
+        ++existing_entry.new_version_ignored_count;
+        // If the new version is continuously older than what we have seen, it implies that master's
+        // current version has somehow gone backwards which isn't expected. Crash this tserver to
+        // sync up with master again. Do so with RandomUniformInt to reduce the chance that all
+        // tservers are crashed at the same time.
+        auto new_version_ignored_count =
+          RandomUniformInt<uint32_t>(FLAGS_ysql_min_new_version_ignored_count,
+                                     FLAGS_ysql_min_new_version_ignored_count + 180);
+        (existing_entry.new_version_ignored_count >= new_version_ignored_count ?
+         LOG(FATAL) : LOG(DFATAL))
+            << "Ignoring ysql db " << db_oid
+            << " catalog version update: new version too old. "
+            << "New: " << new_version << ", Old: " << existing_entry.current_version
+            << ", ignored count: " << existing_entry.new_version_ignored_count;
       } else {
         // It is not possible to have same current_version but different last_breaking_version.
         CHECK_EQ(new_breaking_version, existing_entry.last_breaking_version)
             << "db_oid: " << db_oid << ", new_version: " << new_version;
+        existing_entry.new_version_ignored_count = 0;
       }
     } else {
       auto& inserted_entry = it.first->second;
@@ -993,6 +1069,7 @@ void TabletServer::SetYsqlDBCatalogVersions(
     const uint32_t db_oid = it->first;
     if (db_oid_set.count(db_oid) == 0) {
       // This means the entry for db_oid no longer exists.
+      db_oids_deleted.insert(db_oid);
       catalog_changed = true;
       auto shm_index = it->second.shm_index;
       CHECK(shm_index >= 0 &&
@@ -1020,9 +1097,19 @@ void TabletServer::SetYsqlDBCatalogVersions(
                     << ", new fingerprint: " << new_fingerprint;
 
   if (catalog_changed) {
-    // TODO(myang): see how to only invalidate per-database tables.
-    // https://github.com/yugabyte/yugabyte-db/issues/16114.
-    InvalidatePgTableCache();
+    // If we only inserted new rows, then the existing databases do not have
+    // any catalog version changes and the current catalog caches are valid.
+    if (db_oids_updated.empty() && db_oids_deleted.empty()) {
+      return;
+    }
+    // If many databases have their catalog versions changed, there is
+    // a high chance that a global impact DDL statement has incremented the
+    // catalog versions of all databases.
+    if (db_oids_updated.size() > ysql_db_catalog_version_map_.size() / 2) {
+      InvalidatePgTableCache();
+    } else {
+      InvalidatePgTableCache(db_oids_updated, db_oids_deleted);
+    }
   }
 }
 
@@ -1132,11 +1219,27 @@ Status TabletServer::ListMasterServers(const ListMasterServersRequestPB* req,
 void TabletServer::InvalidatePgTableCache() {
   auto pg_client_service = pg_client_service_.lock();
   if (pg_client_service) {
-    LOG(INFO) << "Invalidating the entire PgTableCache cache since catalog version incremented";
+    LOG(INFO) << "Invalidating all PgTableCache caches since catalog version incremented";
     pg_client_service->InvalidateTableCache();
   }
 }
 
+void TabletServer::InvalidatePgTableCache(
+    const std::unordered_set<uint32_t>& db_oids_updated,
+    const std::unordered_set<uint32_t>& db_oids_deleted) {
+  auto pg_client_service = pg_client_service_.lock();
+  if (pg_client_service) {
+    string msg = "Invalidating db PgTableCache caches since ";
+    if (!db_oids_updated.empty()) {
+      msg += Format("catalog version incremented for $0 ", yb::ToString(db_oids_updated));
+    }
+    if (!db_oids_deleted.empty()) {
+      msg += Format("databases $0 are removed", yb::ToString(db_oids_deleted));
+    }
+    LOG(INFO) << msg;
+    pg_client_service->InvalidateTableCache(db_oids_updated, db_oids_deleted);
+  }
+}
 Status TabletServer::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
   RETURN_NOT_OK(DbServerBase::SetupMessengerBuilder(builder));
 
@@ -1379,4 +1482,21 @@ void TabletServer::ClearAllMetaCachesOnServer() {
   }
   client()->ClearAllMetaCachesOnServer();
 }
+
+Result<std::vector<tablet::TabletStatusPB>> TabletServer::GetLocalTabletsMetadata() const {
+  std::vector<tablet::TabletStatusPB> result;
+  auto peers = tablet_manager_.get()->GetTabletPeers();
+  for (const std::shared_ptr<tablet::TabletPeer>& peer : peers) {
+    tablet::TabletStatusPB status;
+    peer->GetTabletStatusPB(&status);
+    status.set_pgschema_name(peer->status_listener()->schema()->SchemaName());
+    result.emplace_back(std::move(status));
+  }
+  return result;
+}
+
+void TabletServer::SetCronLeaderLease(MonoTime cron_leader_lease_end) {
+  SharedObject().SetCronLeaderLease(cron_leader_lease_end);
+}
+
 }  // namespace yb::tserver

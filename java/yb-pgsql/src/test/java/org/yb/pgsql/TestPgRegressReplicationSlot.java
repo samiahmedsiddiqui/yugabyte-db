@@ -22,7 +22,7 @@ import org.yb.YBTestRunner;
  * Runs the pg_regress replication_slot-related tests on YB code.
  */
 @RunWith(value = YBTestRunner.class)
-public class TestPgRegressReplicationSlot extends BasePgSQLTest {
+public class TestPgRegressReplicationSlot extends BasePgRegressTest {
   @Override
   public int getTestMethodTimeoutSec() {
     return 1800;
@@ -31,10 +31,20 @@ public class TestPgRegressReplicationSlot extends BasePgSQLTest {
   @Override
   protected Map<String, String> getTServerFlags() {
     Map<String, String> flagMap = super.getTServerFlags();
-    flagMap.put("allowed_preview_flags_csv",
-        "ysql_yb_enable_replication_commands," +
-        "yb_enable_cdc_consistent_snapshot_streams," +
-        "ysql_yb_enable_replica_identity");
+
+    if (isTestRunningWithConnectionManager()) {
+      flagMap.put("allowed_preview_flags_csv",
+          "ysql_yb_enable_replication_commands," +
+          "yb_enable_cdc_consistent_snapshot_streams," +
+          "ysql_yb_enable_replica_identity," +
+          "enable_ysql_conn_mgr");
+      flagMap.put("enable_ysql_conn_mgr", "true");
+    } else {
+      flagMap.put("allowed_preview_flags_csv",
+          "ysql_yb_enable_replication_commands," +
+          "yb_enable_cdc_consistent_snapshot_streams," +
+          "ysql_yb_enable_replica_identity");
+    }
     flagMap.put("ysql_yb_enable_replication_commands", "true");
     flagMap.put("yb_enable_cdc_consistent_snapshot_streams", "true");
     flagMap.put("ysql_TEST_enable_replication_slot_consumption", "true");

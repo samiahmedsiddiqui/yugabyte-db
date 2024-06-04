@@ -394,6 +394,7 @@ typedef struct PgGFlagsAccessor {
   const bool*     ysql_use_relcache_file;
   const bool*     ysql_enable_pg_per_database_oid_allocator;
   const bool*     ysql_enable_db_catalog_version_mode;
+  const bool*     TEST_ysql_hide_catalog_version_increment_log;
 } YBCPgGFlagsAccessor;
 
 typedef struct YbTablePropertiesData {
@@ -441,6 +442,29 @@ typedef enum PgBoundType {
   YB_YQL_BOUND_VALID,
   YB_YQL_BOUND_VALID_INCLUSIVE
 } YBCPgBoundType;
+
+// Must be kept in sync with PgVectorDistanceType in common.proto
+typedef enum YbPgVectorDistType {
+  YB_VEC_DIST_INVALID,
+  YB_VEC_DIST_L2,
+  YB_VEC_DIST_IP,
+  YB_VEC_DIST_COSINE
+} YbPgVectorDistType;
+
+// Must be kept in sync with PgVectorIndexType in common.proto
+typedef enum YbPgVectorIdxType {
+  YB_VEC_INVALID,
+  YB_VEC_DUMMY,
+  YB_VEC_IVFFLAT,
+  YB_VEC_HNSW
+} YbPgVectorIdxType;
+
+typedef struct YbPgVectorIdxOptions {
+  YbPgVectorDistType dist_type;
+  YbPgVectorIdxType idx_type;
+  uint32_t dimensions;
+  // TODO(tanuj): Add vector index type-specific options
+} YbPgVectorIdxOptions;
 
 typedef struct PgExecReadWriteStats {
   uint64_t reads;
@@ -571,6 +595,7 @@ typedef struct PgReplicaIdentityDescriptor {
 
 typedef struct PgReplicationSlotDescriptor {
   const char *slot_name;
+  const char *output_plugin;
   const char *stream_id;
   YBCPgOid database_oid;
   bool active;
@@ -644,6 +669,9 @@ typedef struct AshMetadata {
   // PgClient session id.
   uint64_t session_id;
 
+  // OID of database.
+  uint32_t database_id;
+
   // If addr_family is AF_INET (ipv4) or AF_INET6 (ipv6), client_addr stores
   // the ipv4/ipv6 address and client_port stores the port of the PG process
   // where the YSQL query originated. In case of AF_INET, the first 4 bytes
@@ -704,9 +732,10 @@ typedef struct AshSample {
 // A struct to pass ASH postgres config to PgClient
 typedef struct PgAshConfig {
   YBCAshMetadata* metadata;
-  bool* is_metadata_set;
   bool* yb_enable_ash;
   unsigned char yql_endpoint_tserver_uuid[16];
+  // length of host should be equal to INET6_ADDRSTRLEN
+  char host[46];
 } YBCPgAshConfig;
 
 typedef struct YBCBindColumn {
@@ -723,6 +752,36 @@ typedef enum PgReplicationSlotSnapshotAction {
   YB_REPLICATION_SLOT_NOEXPORT_SNAPSHOT,
   YB_REPLICATION_SLOT_USE_SNAPSHOT
 } YBCPgReplicationSlotSnapshotAction;
+
+typedef struct PgTabletsDescriptor {
+  const char* tablet_id;
+  const char* table_name;
+  const char* table_id;
+  const char* namespace_name;
+  const char* table_type;
+  const char* pgschema_name;
+  const char* partition_key_start;
+  size_t partition_key_start_len;
+  const char* partition_key_end;
+  size_t partition_key_end_len;
+} YBCPgTabletsDescriptor;
+
+typedef struct PgExplicitRowLockParams {
+  int rowmark;
+  int pg_wait_policy;
+  int docdb_wait_policy;
+} YBCPgExplicitRowLockParams;
+
+// For creating a new table...
+typedef enum PgYbrowidMode {
+  PG_YBROWID_MODE_NONE,   // ...do not add ybrowid
+  PG_YBROWID_MODE_HASH,   // ...add ybrowid HASH
+  PG_YBROWID_MODE_RANGE,  // ...add ybrowid ASC
+} YBCPgYbrowidMode;
+
+// The reserved database oid for system_postgres. Must be the same as
+// kPgSequencesDataTableOid (defined in entity_ids.h).
+static const YBCPgOid kYBCPgSequencesDataDatabaseOid = 65535;
 
 #ifdef __cplusplus
 }  // extern "C"

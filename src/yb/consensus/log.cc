@@ -215,8 +215,8 @@ DEFINE_RUNTIME_int64(reuse_unclosed_segment_threshold_bytes, INT64_MAX,
             "Log will reuse this last segment as writable active_segment at tablet bootstrap. "
             "Otherwise, Log will create a new segment.");
 
-DEFINE_RUNTIME_int32(min_segment_size_to_rollover_at_flush, 0,
-                    "Only rotate wals at least of this size at tablet flush."
+DEFINE_RUNTIME_int32(min_segment_size_bytes_to_rollover_at_flush, 0,
+                    "Only rotate wals at least of this size (in bytes) at tablet flush."
                     "-1 to disable WAL rollover at flush. 0 to always rollover WAL at flush.");
 
 // Validate that log_min_segments_to_retain >= 1
@@ -416,10 +416,6 @@ class Log::Appender {
     return task_stream_->ToString();
   }
 
-  const yb::ash::WaitStateInfoPtr& wait_state() const {
-    return wait_state_;
-  }
-
  private:
   // Process the given log entry batch or does a sync if a null is passed.
   void ProcessBatch(LogEntryBatch* entry_batch);
@@ -449,6 +445,7 @@ Log::Appender::Appender(Log* log, ThreadPool* append_thread_pool)
           MonoDelta::FromMilliseconds(FLAGS_taskstream_queue_max_wait_ms))),
       wait_state_(ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>()) {
   if (wait_state_) {
+    wait_state_->set_root_request_id(yb::Uuid::Generate());
     wait_state_->set_query_id(yb::to_underlying(yb::ash::FixedQueryId::kQueryIdForLogAppender));
     wait_state_->UpdateAuxInfo({.tablet_id = log_->tablet_id(), .method = "RaftWAL"});
     SET_WAIT_STATUS_TO(wait_state_, Idle);
@@ -470,6 +467,7 @@ Status Log::Appender::Init() {
 // fsync will eventually be called. [if there is a background thread executing DoSync in parallel,
 // it might OR might not flush the new dirty data in the current iteration due to race condition]
 void Log::Appender::ProcessBatch(LogEntryBatch* entry_batch) {
+  ADOPT_WAIT_STATE(wait_state_);
   // A callback function to TaskStream is expected to process the accumulated batch of entries.
   if (entry_batch == nullptr) {
     // Here, we do sync and call callbacks.
@@ -663,10 +661,21 @@ Log::Log(
       log_prefix_(consensus::MakeTabletLogPrefix(tablet_id_, peer_uuid_)),
       create_new_segment_at_start_(create_new_segment),
       new_segment_allocation_callback_(callback),
-      pre_log_rollover_callback_(pre_log_rollover_callback) {
+      pre_log_rollover_callback_(pre_log_rollover_callback),
+      background_synchronizer_wait_state_(
+          ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>()) {
   set_wal_retention_secs(options_.retention_secs);
   if (table_metric_entity_ && tablet_metric_entity_) {
     metrics_.reset(new LogMetrics(table_metric_entity_, tablet_metric_entity_));
+  }
+  if (background_synchronizer_wait_state_) {
+    background_synchronizer_wait_state_->set_root_request_id(yb::Uuid::Generate());
+    background_synchronizer_wait_state_->set_query_id(
+        yb::to_underlying(yb::ash::FixedQueryId::kQueryIdForLogBackgroundSync));
+    background_synchronizer_wait_state_->UpdateAuxInfo(
+        {.tablet_id = tablet_id_, .method = "RaftWAL"});
+    SET_WAIT_STATUS_TO(background_synchronizer_wait_state_, Idle);
+    yb::ash::RaftLogAppenderWaitStatesTracker().Track(background_synchronizer_wait_state_);
   }
 }
 
@@ -885,7 +894,6 @@ Status Log::AsyncAppendReplicates(const ReplicateMsgs& msgs, const yb::OpId& com
 }
 
 Status Log::DoAppend(LogEntryBatch* entry_batch, SkipWalWrite skip_wal_write) {
-  ADOPT_WAIT_STATE(appender_->wait_state());
   SCOPED_WAIT_STATUS(WAL_Append);
   if (!skip_wal_write) {
     RETURN_NOT_OK(entry_batch->Serialize());
@@ -907,7 +915,7 @@ Status Log::DoAppend(LogEntryBatch* entry_batch, SkipWalWrite skip_wal_write) {
       } else if (entry_batch->IsSingleEntryOfType(ASYNC_ROLLOVER_AT_FLUSH_MARKER)) {
         if (allocation_state() == SegmentAllocationState::kAllocationNotStarted) {
           const auto min_size_to_rollover =
-              GetAtomicFlag(&FLAGS_min_segment_size_to_rollover_at_flush);
+              GetAtomicFlag(&FLAGS_min_segment_size_bytes_to_rollover_at_flush);
           if (min_size_to_rollover < 0 || active_segment_->Size() < min_size_to_rollover) {
             VLOG_WITH_PREFIX(1) << Format("Skipping async wal rotation at flush. "
                                           "segment_size: $0 min_size_to_rollover: $1",
@@ -1160,7 +1168,6 @@ Status Log::EnsureSegmentInitializedUnlocked() {
 // might not be necessary. We only call ::DoSync directly before we call ::CloseCurrentSegment
 Status Log::DoSync() {
   // Acquire the lock over active_segment_ to prevent segment rollover in the interim.
-  ADOPT_WAIT_STATE(appender_->wait_state());
   SCOPED_WAIT_STATUS(WAL_Sync);
   std::lock_guard lock(active_segment_mutex_);
   if (active_segment_->IsClosed()) {
@@ -1189,6 +1196,7 @@ Status Log::DoSync() {
 // have to use active_segment_sequence_number_ instead of fsync_task_in_queue_, in ::Sync(), to
 // determine if there is a pending fsync task corresponding to the current active segment.
 void Log::DoSyncAndResetTaskInQueue() {
+  ADOPT_WAIT_STATE(background_synchronizer_wait_state_);
   auto status = DoSync();
   if (!status.ok()) {
     // ensure that fsync gets called on the subsequent call to Log::Sync() function
@@ -1633,6 +1641,9 @@ Status Log::Close() {
       RETURN_NOT_OK(CloseCurrentSegment());
       RETURN_NOT_OK(ReplaceSegmentInReaderUnlocked());
       log_state_ = kLogClosed;
+      if (background_synchronizer_wait_state_) {
+        yb::ash::RaftLogAppenderWaitStatesTracker().Untrack(background_synchronizer_wait_state_);
+      }
       VLOG_WITH_PREFIX(1) << "Log closed";
 
       // Release FDs held by these objects.
@@ -1928,7 +1939,6 @@ Status Log::SwitchToAllocatedSegment() {
   // Calling Sync() here is important because it ensures the file has a complete WAL header
   // on disk before renaming the file.
   {
-    ADOPT_WAIT_STATE(appender_->wait_state());
     SCOPED_WAIT_STATUS(WAL_Sync);
     RETURN_NOT_OK(new_segment->Sync());
   }

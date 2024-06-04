@@ -35,7 +35,7 @@ TAG_FLAG(ysql_disable_index_backfill, advanced);
 
 DEPRECATE_FLAG(bool, enable_pg_savepoints, "04_2024");
 
-DEFINE_RUNTIME_AUTO_bool(enable_automatic_tablet_splitting, kLocalPersisted, false, true,
+DEFINE_RUNTIME_AUTO_bool(enable_automatic_tablet_splitting, kExternal, false, true,
     "If false, disables automatic tablet splitting driven from the yb-master side.");
 
 DEFINE_UNKNOWN_bool(log_ysql_catalog_versions, false,
@@ -59,7 +59,7 @@ DEFINE_NON_RUNTIME_bool(disable_deadlock_detection, false,
 TAG_FLAG(disable_deadlock_detection, advanced);
 TAG_FLAG(disable_deadlock_detection, hidden);
 
-DEFINE_RUNTIME_PG_PREVIEW_FLAG(bool, yb_ddl_rollback_enabled, false,
+DEFINE_RUNTIME_PG_FLAG(bool, yb_ddl_rollback_enabled, true,
     "If true, upon failure of a YSQL DDL transaction that affects the DocDB syscatalog, the "
     "YB-Master will rollback the changes made to the DocDB syscatalog.");
 
@@ -108,6 +108,12 @@ DEFINE_NON_RUNTIME_bool(ysql_enable_pg_per_database_oid_allocator, true,
 TAG_FLAG(ysql_enable_pg_per_database_oid_allocator, advanced);
 TAG_FLAG(ysql_enable_pg_per_database_oid_allocator, hidden);
 
+DEFINE_RUNTIME_int32(
+    ysql_clone_pg_schema_rpc_timeout_ms, 10 * 60 * 1000,  // 10 min.
+    "Timeout used by the master when attempting to clone PG Schema objects using an async task to "
+    "tserver");
+TAG_FLAG(ysql_clone_pg_schema_rpc_timeout_ms, advanced);
+
 DEFINE_RUNTIME_PREVIEW_bool(yb_enable_cdc_consistent_snapshot_streams, false,
                             "Enable support for CDC Consistent Snapshot Streams");
 
@@ -116,6 +122,10 @@ DEFINE_RUNTIME_PG_FLAG(bool, TEST_enable_replication_slot_consumption, false,
                        "Requires yb_enable_replication_commands to be true.");
 TAG_FLAG(ysql_TEST_enable_replication_slot_consumption, unsafe);
 TAG_FLAG(ysql_TEST_enable_replication_slot_consumption, hidden);
+
+DEFINE_NON_RUNTIME_bool(TEST_ysql_hide_catalog_version_increment_log, false,
+                        "Hide catalog version increment log messages.");
+TAG_FLAG(TEST_ysql_hide_catalog_version_increment_log, hidden);
 
 // The following flags related to the cloud, region and availability zone that an instance is
 // started in. These are passed in from whatever provisioning mechanics start the servers. They
@@ -178,6 +188,13 @@ DEFINE_RUNTIME_AUTO_bool(enable_xcluster_auto_flag_validation, kLocalPersisted, 
 // --ysql_enable_ddl_atomicity_infra=true and --ysql_yb_ddl_rollback_enabled=true.
 DEFINE_RUNTIME_AUTO_PG_FLAG(bool, yb_enable_ddl_atomicity_infra, kLocalPersisted, false, true,
     "Enables YSQL DDL atomicity");
+
+// NOTE: This flag guards proto changes and it is not safe to enable during an upgrade, or rollback
+// once enabled. If you want to change the default to true then you will have to make it a
+// kLocalPersisted AutoFlag.
+DEFINE_NON_RUNTIME_PREVIEW_bool(enable_pg_cron, false,
+    "Enables the pg_cron extension. Jobs will be run on a single tserver node. The node should be "
+    "assumed to be selected randomly.");
 
 namespace yb {
 

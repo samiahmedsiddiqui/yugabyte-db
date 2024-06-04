@@ -2,6 +2,7 @@
 -- test distinct bitmap scans (distinct pushdown is not supported by bitmap scans)
 --
 SET yb_explain_hide_non_deterministic_fields = true;
+SET yb_enable_bitmapscan = true;
 CREATE TABLE test_distinct (r1 INT, r2 INT, r3 INT, v INT, PRIMARY KEY(r1 ASC, r2 ASC, r3 ASC)) SPLIT AT VALUES ((1, 1, 500));
 INSERT INTO test_distinct (SELECT 1, i%3, i, i/3 FROM GENERATE_SERIES(1, 1000) AS i);
 -- Add one more distinct value to catch bugs that arise only with more than one distinct value.
@@ -85,7 +86,7 @@ SELECT DISTINCT r1 FROM test_distinct WHERE r1 < 2 ORDER BY r1;
                Storage Table Rows Scanned: 1000
                ->  Bitmap Index Scan on test_distinct_pkey (actual rows=1000 loops=1)
                      Index Cond: (r1 < 2)
-                     Storage Table Read Requests: 2
+                     Storage Table Read Requests: 1
                      Storage Table Rows Scanned: 1000
 (11 rows)
 
@@ -211,7 +212,7 @@ SELECT DISTINCT r1 FROM test_distinct WHERE r1 < 2 ORDER BY r1;
                Storage Table Rows Scanned: 1000
                ->  Bitmap Index Scan on test_distinct_pkey (actual rows=1000 loops=1)
                      Index Cond: (r1 < 2)
-                     Storage Table Read Requests: 2
+                     Storage Table Read Requests: 1
                      Storage Table Rows Scanned: 1000
 (11 rows)
 

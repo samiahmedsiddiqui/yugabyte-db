@@ -25,6 +25,7 @@ import "yb/common/wire_protocol.proto";
 import "yb/master/master_ddl.proto";
 import "yb/master/master_types.proto";
 import "yb/rpc/lightweight_message.proto";
+import "yb/tablet/tablet.proto";
 
 service PgClientService {
   rpc Heartbeat(PgHeartbeatRequestPB) returns (PgHeartbeatResponsePB);
@@ -96,6 +97,8 @@ service PgClientService {
 
   rpc GetNewObjectId(PgGetNewObjectIdRequestPB)
       returns (PgGetNewObjectIdResponsePB);
+
+  rpc TabletsMetadata(PgTabletsMetadataRequestPB) returns (PgTabletsMetadataResponsePB);
 
   // DEPRECATED: GetReplicationSlot RPC is a superset of this GetReplicationSlotStatus.
   // So GetReplicationSlot should be used everywhere.
@@ -219,6 +222,8 @@ message PgCreateDatabaseRequestPB {
   uint32 source_database_oid = 5;
   uint32 next_oid = 6;
   bool colocated = 7;
+  fixed64 clone_time = 8;
+  string source_database_name = 9;
 }
 
 message PgCreateDatabaseResponsePB {
@@ -244,6 +249,7 @@ message PgCreateReplicationSlotRequestPB {
   uint32 database_oid = 2;
   string replication_slot_name = 3;
   PgReplicationSlotSnapshotActionPB snapshot_action = 4;
+  string output_plugin_name = 5;
 }
 
 message PgCreateReplicationSlotResponsePB {
@@ -310,6 +316,8 @@ message PgCreateTableRequestPB {
   PgObjectIdPB old_relfilenode_oid = 22;
   // Set to true when the table is being re-written as part of a TRUNCATE operation.
   bool is_truncate = 23;
+
+  PgVectorIdxOptionsPB vector_idx_options = 24;
 }
 
 message PgCreateTableResponsePB {
@@ -520,6 +528,7 @@ message PgReplicationSlotInfoPB {
   map<uint32, PgReplicaIdentityPB> replica_identity_map = 8;
   uint64 record_id_commit_time_ht = 9;
   uint64 last_pub_refresh_time = 10;
+  string output_plugin_name = 11;
 }
 
 message PgListReplicationSlotsResponsePB {
@@ -602,6 +611,12 @@ message PgPerformOptionsPB {
   int64 pg_txn_start_us = 22;
 
   AshMetadataPB ash_metadata = 23;
+
+  // When set,
+  // - Sets the read time locally.
+  // - Clamps the read uncertainty window.
+  // See the commit desc for more info.
+  bool clamp_uncertainty_window = 24;
 }
 
 message PgPerformRequestPB {
@@ -852,6 +867,7 @@ message PgActiveSessionHistoryRequestPB {
   bool fetch_cql_states = 3;
   bool ignore_ash_and_perform_calls = 4;
   bool fetch_raft_log_appender_states = 5;
+  bool export_wait_state_code_as_string = 6;
 }
 
 message WaitStatesPB {
@@ -932,4 +948,12 @@ message YCQLStatementStatsPB {
   double max_time = 7;
   double mean_time = 8;
   double stddev_time = 9;
+}
+
+message PgTabletsMetadataRequestPB {
+}
+
+message PgTabletsMetadataResponsePB {
+  AppStatusPB status = 1;
+  repeated tablet.TabletStatusPB tablets = 2;
 }

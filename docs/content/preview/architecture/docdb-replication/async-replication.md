@@ -10,7 +10,7 @@ menu:
   preview:
     identifier: architecture-docdb-async-replication
     parent: architecture-docdb-replication
-    weight: 1150
+    weight: 300
 type: docs
 ---
 
@@ -35,7 +35,7 @@ Asynchronous replication has its own drawbacks, however, including:
 
 ## YugabyteDB's xCluster replication
 
-xCluster replication is YugabyteDB's implementation of asynchronous replication for disaster recovery.  It allows you to set up one or more unidirectional replication _flows_ between universes.  Note that xCluster can only be used to replicate between primary clusters in two different universes; it cannot be used to replicate between clusters in the same universe.  (See [universe versus cluster](../../concepts/#universe) for more on the distinction between universes and clusters.)
+xCluster replication is YugabyteDB's implementation of asynchronous replication for disaster recovery.  It allows you to set up one or more unidirectional replication _flows_ between universes.  Note that xCluster can only be used to replicate between primary clusters in two different universes; it cannot be used to replicate between clusters in the same universe.  (See [universe versus cluster](../../key-concepts/#universe) for more on the distinction between universes and clusters.)
 
 For each flow, data is replicated from a _source_ (also called a producer) universe to a _target_ (also called a consumer) universe.  Replication is done at the DocDB level, with newly committed writes in the source universe asynchronously replicated to the target universe.  Both YSQL and YCQL are supported.
 
@@ -283,8 +283,6 @@ A number of interactions across features are supported.
 - Source and target universes can have different numbers of tablets.
 - Tablet splitting is supported on both source and target universes.
 
-{{< note title="Note" >}}
-
+{{< tip title="Explore" >}}
 To better understand how xCluster replication works in practice, see [xCluster deployment](../../../deploy/multi-dc/async-replication/) and [Transactional xCluster deployment](../../../deploy/multi-dc/async-replication-transactional/) in Launch and Manage.
-
-{{< /note >}}
+{{< /tip >}}

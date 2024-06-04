@@ -4,12 +4,13 @@ package com.yugabyte.yw.commissioner.tasks.upgrade;
 
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
-import com.google.common.collect.ImmutableList;
+import com.yugabyte.yw.commissioner.MockUpgrade;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -44,31 +45,6 @@ public class RebootUniverseTest extends UpgradeTaskTest {
 
   @InjectMocks private RebootUniverse rebootUniverse;
 
-  private static final List<TaskType> ROLLING_REBOOT_TASK_SEQUENCE =
-      ImmutableList.of(
-          TaskType.SetNodeState,
-          TaskType.CheckUnderReplicatedTablets,
-          TaskType.CheckNodesAreSafeToTakeDown,
-          TaskType.RunHooks,
-          TaskType.ModifyBlackList,
-          TaskType.WaitForLeaderBlacklistCompletion,
-          TaskType.AnsibleClusterServerCtl, // master
-          TaskType.AnsibleClusterServerCtl, // tserver
-          TaskType.RebootServer,
-          TaskType.AnsibleClusterServerCtl, // master
-          TaskType.WaitForServer,
-          TaskType.WaitForServerReady,
-          TaskType.AnsibleClusterServerCtl, // tserver
-          TaskType.WaitForServer,
-          TaskType.WaitForServerReady,
-          TaskType.WaitForEncryptionKeyInMemory,
-          TaskType.ModifyBlackList,
-          TaskType.CheckFollowerLag, // master
-          TaskType.CheckFollowerLag, // tserver
-          TaskType.RunHooks,
-          TaskType.SetNodeState,
-          TaskType.WaitStartingFromTime);
-
   @Override
   @Before
   public void setUp() {
@@ -82,19 +58,6 @@ public class RebootUniverseTest extends UpgradeTaskTest {
 
   private TaskInfo submitTask(UpgradeTaskParams requestParams) {
     return submitTask(requestParams, TaskType.RebootUniverse, commissioner);
-  }
-
-  private int assertSequence(Map<Integer, List<TaskInfo>> subTasksByPosition, int startPosition) {
-    int position = startPosition;
-    for (int i = 0; i < 3; i++) {
-      for (TaskType type : ROLLING_REBOOT_TASK_SEQUENCE) {
-        List<TaskInfo> tasks = subTasksByPosition.get(position++);
-        TaskType taskType = tasks.get(0).getTaskType();
-        assertEquals(1, tasks.size());
-        assertEquals(type, taskType);
-      }
-    }
-    return position;
   }
 
   @Test
@@ -118,20 +81,46 @@ public class RebootUniverseTest extends UpgradeTaskTest {
     UpgradeTaskParams taskParams = new UpgradeTaskParams();
     TaskInfo taskInfo = submitTask(taskParams);
     verify(mockNodeManager, times(27)).nodeCommand(any(), any());
+    assertEquals(100.0, taskInfo.getPercentCompleted(), 0);
+    assertEquals(Success, taskInfo.getTaskState());
+
+    initMockUpgrade()
+        .precheckTasks(getPrecheckTasks(true))
+        .upgradeRound(UpgradeOption.ROLLING_UPGRADE, true)
+        .tserverTask(TaskType.RebootServer, null)
+        .applyRound()
+        .verifyTasks(taskInfo.getSubTasks());
+  }
+
+  private MockUpgrade initMockUpgrade() {
+    return initMockUpgrade(RebootUniverse.class);
+  }
+
+  @Test
+  public void testRollingRebootNotLiveNode() {
+    Universe.saveDetails(
+        defaultUniverse.getUniverseUUID(),
+        u -> {
+          UniverseDefinitionTaskParams details = u.getUniverseDetails();
+          details.nodeDetailsSet.iterator().next().state = NodeDetails.NodeState.UpdateGFlags;
+          u.setUniverseDetails(details);
+        },
+        false);
+    UpgradeTaskParams taskParams = new UpgradeTaskParams();
+    TaskInfo taskInfo = submitTask(taskParams);
+    verify(mockNodeManager, times(27)).nodeCommand(any(), any());
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
-    int position = 0;
-    assertTaskType(subTasksByPosition.get(position++), TaskType.CheckNodesAreSafeToTakeDown);
-    assertTaskType(subTasksByPosition.get(position++), TaskType.FreezeUniverse);
-    assertTaskType(subTasksByPosition.get(position++), TaskType.RunHooks);
-    assertTaskType(subTasksByPosition.get(position++), TaskType.ModifyBlackList);
-    position = assertSequence(subTasksByPosition, position);
-    assertTaskType(subTasksByPosition.get(position++), TaskType.RunHooks);
-    assertTaskType(subTasksByPosition.get(position++), TaskType.UniverseUpdateSucceeded);
-    assertTaskType(subTasksByPosition.get(position++), TaskType.ModifyBlackList);
-    assertEquals(73, position);
+    for (int i = 0; i < subTasks.size(); i++) {
+      if (subTasksByPosition.get(i).get(0).getTaskType() == TaskType.FreezeUniverse) {
+        break;
+      }
+      // Verify no CheckNodesAreSafeToTakeDown before freeze
+      assertNotEquals(
+          TaskType.CheckNodesAreSafeToTakeDown, subTasksByPosition.get(i).get(0).getTaskType());
+    }
     assertEquals(100.0, taskInfo.getPercentCompleted(), 0);
     assertEquals(Success, taskInfo.getTaskState());
   }

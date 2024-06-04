@@ -46,6 +46,7 @@
 #include "yb/tablet/transaction_participant.h"
 
 #include "yb/util/logging.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
 
@@ -91,8 +92,6 @@ DEFINE_NON_RUNTIME_int64(
 
 DECLARE_bool(ysql_enable_packed_row);
 DECLARE_bool(ysql_yb_enable_replica_identity);
-
-DECLARE_bool(ysql_yb_ddl_rollback_enabled);
 
 namespace yb {
 namespace cdc {
@@ -704,6 +703,9 @@ Result<SchemaDetails> GetOrPopulateRequiredSchemaDetails(
       VLOG(1) << "Found schema version:" << result->second << " for table : " << table_name
               << " from system catalog table with read hybrid time: " << read_hybrid_time;
     }
+
+    VLOG(1) << "Populating schema details for table " << req_table_id
+            << " tablet " << tablet->tablet_id();
 
     const auto& schema_details = (*cached_schema_details)[cur_table_id];
     FillDDLInfo(tablet_peer, schema_details, table_name, cur_table_id, resp);
@@ -1505,8 +1507,14 @@ Status PopulateCDCSDKWriteRecord(
     // and we should return from here.
     if (records_added == 0 && !resp->mutable_cdc_sdk_proto_records()->empty()) {
       VLOG(2) << "Removing the added BEGIN record because there are no other records to add";
-      resp->mutable_cdc_sdk_proto_records()->RemoveLast();
-      return Status::OK();
+      // Only remove the BEGIN record if it happens to be the last added record in the response. If
+      // its not the last record, skip removing it and instead add a commit record to the response.
+      auto size = resp->cdc_sdk_proto_records_size();
+      auto last_record = resp->cdc_sdk_proto_records().Get(size - 1);
+      if (last_record.has_row_message() && last_record.row_message().op() == RowMessage::BEGIN) {
+        resp->mutable_cdc_sdk_proto_records()->RemoveLast();
+        return Status::OK();
+      }
     }
 
     FillCommitRecordForSingleShardTransaction(
@@ -1533,8 +1541,8 @@ Status PopulateCDCSDKWriteRecordWithInvalidSchemaRetry(
       cached_schema_details, resp, client);
 
   if (!status.ok()) {
-    VLOG_WITH_FUNC(1) << "Recevied error status: " << status.ToString()
-                      << ", while prcoessing WRITE_OP, with op_id: " << msg->id().ShortDebugString()
+    VLOG_WITH_FUNC(1) << "Received error status: " << status.ToString()
+                      << ", while processing WRITE_OP, with op_id: " << msg->id().ShortDebugString()
                       << ", on tablet: " << tablet_peer->tablet_id();
     // Remove partial remnants created while processing the write record
     while (resp->cdc_sdk_proto_records_size() > records_size_before) {
@@ -1787,8 +1795,8 @@ Status PrcoessIntentsWithInvalidSchemaRetry(
       cached_schema_details, commit_time);
 
   if (!status.ok()) {
-    VLOG_WITH_FUNC(1) << "Recevied error status: " << status.ToString()
-                      << ", while prcoessing intents for transaction: " << transaction_id
+    VLOG_WITH_FUNC(1) << "Received error status: " << status.ToString()
+                      << ", while processing intents for transaction: " << transaction_id
                       << ", with APPLY op_id: " << op_id
                       << ", on tablet: " << tablet_peer->tablet_id();
     // Remove partial remnants created while processing intents
@@ -2419,7 +2427,11 @@ Status GetChangesForCDCSDK(
     const int& wal_segment_index_req,
     int64_t* last_readable_opid_index,
     const TableId& colocated_table_id,
-    const CoarseTimePoint deadline) {
+    const CoarseTimePoint deadline,
+    const std::optional<uint64> getchanges_resp_max_size_bytes) {
+  // Delete the memory context if it was created for decoding the QLValuePB.
+  auto scope_exit = ScopeExit([&] { docdb::DeleteMemoryContextForCDCWrapper(); });
+
   OpId op_id{from_op_id.term(), from_op_id.index()};
   VLOG(1) << "GetChanges request has from_op_id: " << from_op_id.DebugString()
           << ", safe_hybrid_time: " << safe_hybrid_time_req
@@ -2611,11 +2623,15 @@ Status GetChangesForCDCSDK(
           resp_records_size += resp->cdc_sdk_proto_records(resp_num_records).ByteSizeLong();
         }
 
-        if (resp_records_size >= FLAGS_cdc_stream_records_threshold_size_bytes) {
+        auto resp_max_size = getchanges_resp_max_size_bytes.has_value()
+                                 ? *getchanges_resp_max_size_bytes
+                                 : FLAGS_cdc_stream_records_threshold_size_bytes;
+
+        if (resp_records_size >= resp_max_size) {
           VLOG(1) << "Response records size crossed the thresold size. Will stream rest of the "
                      "records in next GetChanges Call. resp_records_size: "
                   << resp_records_size
-                  << ", threshold: " << FLAGS_cdc_stream_records_threshold_size_bytes
+                  << ", threshold: " << resp_max_size
                   << ", resp_num_records: " << resp_num_records << ", tablet_id: " << tablet_id;
           break;
         }

@@ -54,11 +54,39 @@ public class PgStatStatementsQueryService
         .toList();
   }
 
+  public List<PgStatStatementsQuery> listByDatabaseId(UUID universeUuid, String dbId) {
+    return new QPgStatStatementsQuery().id.universeId.eq(universeUuid).id.dbId.eq(dbId).findList();
+  }
+
+  public List<PgStatStatementsQuery> listByQueryId(UUID universeUuid, Long queryId) {
+    return new QPgStatStatementsQuery()
+        .id
+        .universeId
+        .eq(universeUuid)
+        .id
+        .queryId
+        .eq(queryId)
+        .findList();
+  }
+
   public List<PgStatStatementsQuery> listByUniverseId(UUID universeUuid) {
     return new QPgStatStatementsQuery().id.universeId.eq(universeUuid).findList();
   }
 
   public List<PgStatStatementsQuery> listAll() {
     return new QPgStatStatementsQuery().findList();
+  }
+
+  @Override
+  protected PgStatStatementsQuery prepareForSave(
+      PgStatStatementsQuery entity, PgStatStatementsQuery before) {
+    if (before == null || before.getLastActive() == null) {
+      return entity;
+    }
+    if (entity.getLastActive() == null || entity.getLastActive().isBefore(before.getLastActive())) {
+      // Always prefer max out of 2
+      entity.setLastActive(before.getLastActive());
+    }
+    return super.prepareForSave(entity, before);
   }
 }

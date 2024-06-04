@@ -505,13 +505,17 @@ CatCacheRemoveCTup(CatCache *cache, CatCTup *ct)
 	/* delink from linked list */
 	dlist_delete(&ct->cache_elem);
 
+	bool need_to_free_ybctid = false;
 	/*
 	 * Free keys when we're dealing with a negative entry, normal entries just
 	 * point into tuple, allocated together with the CatCTup.
+	 * YB Note: for normal entries we may need to free ybctid.
 	 */
 	if (ct->negative)
 		CatCacheFreeKeys(cache->cc_tupdesc, cache->cc_nkeys,
 						 cache->cc_keyno, ct->keys);
+	else if (IsYugaByteEnabled() && ct->tuple.t_ybctid)
+		need_to_free_ybctid = true;
 
 #ifdef CATCACHE_STATS
 	/*
@@ -521,10 +525,16 @@ CatCacheRemoveCTup(CatCache *cache, CatCTup *ct)
 	if (ct->negative)
 		cache->yb_cc_size_bytes -= sizeof(CatCTup);
 	else
+	{
 		cache->yb_cc_size_bytes -=
 			sizeof(CatCTup) + MAXIMUM_ALIGNOF + ct->tuple.t_len;
+		if (need_to_free_ybctid)
+			cache->yb_cc_size_bytes -= VARSIZE(ct->tuple.t_ybctid);
+	}
 #endif
 
+	if (need_to_free_ybctid)
+		pfree(DatumGetPointer(ct->tuple.t_ybctid));
 	pfree(ct);
 
 	--cache->cc_ntup;
@@ -1822,6 +1832,8 @@ SearchCatCacheMiss(CatCache *cache,
 			* For safety, disable catcache logging within the scope of this
 			* function as YBDatumToString below may trigger additional cache
 			* lookups (to get the attribute type info).
+			* Also only call YBDatumToString when MyDatabaseId is valid to
+			* avoid PG FATAL.
 			*/
 			yb_debug_log_catcache_events = false;
 			for (int i = 0; i < nkeys; i++)
@@ -1833,8 +1845,10 @@ SearchCatCacheMiss(CatCache *cache,
 				Oid typid = OIDOID; // default.
 				if (attnum > 0)
 					typid = TupleDescAttr(cache->cc_tupdesc, attnum - 1)->atttypid;
-
-				appendStringInfoString(&buf, YBDatumToString(cur_skey[i].sk_argument, typid));
+				if (OidIsValid(MyDatabaseId))
+					appendStringInfoString(&buf, YBDatumToString(cur_skey[i].sk_argument, typid));
+				else
+					appendStringInfo(&buf, "typid=%u value=<not logged>", typid);
 			}
 			ereport(LOG,
 					(errmsg("Catalog cache miss on cache with id %d:\n"
@@ -2362,6 +2376,12 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, Datum *arguments,
 			   (const char *) dtp->t_data,
 			   dtp->t_len);
 		HEAPTUPLE_COPY_YBCTID(dtp->t_ybctid, ct->tuple.t_ybctid);
+#ifdef CATCACHE_STATS
+		/* HEAPTUPLE_COPY_YBCTID makes allocation for t_ybctid. */
+		bool allocated_ybctid = IsYugaByteEnabled() && ct->tuple.t_ybctid;
+		if (allocated_ybctid)
+			cache->yb_cc_size_bytes += VARSIZE(ct->tuple.t_ybctid);
+#endif
 		MemoryContextSwitchTo(oldcxt);
 
 		if (dtp != ntp)

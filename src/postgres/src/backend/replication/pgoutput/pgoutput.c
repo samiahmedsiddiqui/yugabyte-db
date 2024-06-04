@@ -90,7 +90,8 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->filter_by_origin_cb = pgoutput_origin_filter;
 	cb->shutdown_cb = pgoutput_shutdown;
 
-	cb->yb_schema_change_cb = yb_pgoutput_schema_change;
+	if (IsYugaByteEnabled())
+		cb->yb_schema_change_cb = yb_pgoutput_schema_change;
 }
 
 static void
@@ -303,6 +304,10 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 		logicalrep_write_rel(ctx->out, relation);
 		OutputPluginWrite(ctx, false);
 		relentry->schema_sent = true;
+
+		if (IsYugaByteEnabled())
+			elog(DEBUG1, "Sent the RELATION message for table_id: %d",
+				RelationGetRelid(relation));
 	}
 }
 
@@ -476,6 +481,8 @@ pgoutput_shutdown(LogicalDecodingContext *ctx)
 static void
 yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid)
 {
+	elog(DEBUG1, "yb_pgoutput_schema_change for relid: %d", relid);
+
 	rel_sync_cache_relation_cb(0 /* unused */, relid);
 }
 

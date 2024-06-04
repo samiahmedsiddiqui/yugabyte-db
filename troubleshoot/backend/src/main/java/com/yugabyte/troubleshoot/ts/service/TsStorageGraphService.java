@@ -4,6 +4,7 @@ import static com.yugabyte.troubleshoot.ts.MetricsUtil.*;
 import static com.yugabyte.troubleshoot.ts.service.GraphService.*;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Streams;
 import com.yugabyte.troubleshoot.ts.models.*;
 import java.sql.ResultSet;
@@ -15,14 +16,12 @@ import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
-import java.util.stream.DoubleStream;
 import java.util.stream.Stream;
 import lombok.Data;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.commons.lang3.tuple.ImmutablePair;
-import org.apache.commons.lang3.tuple.Pair;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -79,7 +78,7 @@ public class TsStorageGraphService implements GraphSourceIF {
     GraphResponse response = new GraphResponse();
     response.setSuccessful(true);
     response.setName(query.getName());
-    response.setLayout(config.getLayout());
+    response.setLayout(config.getLayout().toBuilder().build());
     response.setStepSeconds(query.getStepSeconds());
 
     Set<String> groupByLabels = new LinkedHashSet<>();
@@ -87,10 +86,13 @@ public class TsStorageGraphService implements GraphSourceIF {
       // Will group data for all the nodes into single line.
       groupByLabels.add(GraphLabel.instanceName.name());
     }
-    if (query.getGroupBy() != null) {
+    List<String> groupByColumns;
+    if (CollectionUtils.isNotEmpty(query.getGroupBy())) {
+      groupByColumns =
+          query.getGroupBy().stream().map(GraphLabel::name).collect(Collectors.toList());
       groupByLabels.addAll(
           config.getFilterColumns().entrySet().stream()
-              .filter(e -> e.getKey().equals(query.getGroupBy().name()))
+              .filter(e -> groupByColumns.contains(e.getKey()))
               .flatMap(
                   e ->
                       Streams.concat(
@@ -105,24 +107,74 @@ public class TsStorageGraphService implements GraphSourceIF {
                       Streams.concat(
                           Stream.of(e.getKey()), e.getValue().getAssumesGroupBy().stream()))
               .collect(Collectors.toSet()));
+      groupByColumns =
+          config.getFilterColumns().entrySet().stream()
+              .filter(e -> e.getValue().isDefaultGroupBy())
+              .map(Map.Entry::getKey)
+              .collect(Collectors.toList());
+    }
+    if (response.getLayout().getMetadata() != null && CollectionUtils.isNotEmpty(groupByColumns)) {
+      response
+          .getLayout()
+          .setMetadata(
+              response.getLayout().getMetadata().toBuilder()
+                  .currentGroupBy(
+                      groupByColumns.stream().map(GraphLabel::valueOf).collect(Collectors.toList()))
+                  .build());
     }
     Map<String, TsStorageGraphConfig.FilterColumn> columnsToRead =
-      config.getFilterColumns().entrySet().stream()
-        .filter(entry -> groupByLabels.contains(entry.getKey()))
-        .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        config.getFilterColumns().entrySet().stream()
+            .filter(
+                entry ->
+                    groupByLabels.contains(entry.getKey())
+                        || (query.getSettings().getSplitType() == GraphSettings.SplitType.NODE
+                            && entry.getKey().equals(GraphLabel.instanceName.name())))
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+    config.getFilterColumns().entrySet().stream()
+        .filter(entry -> StringUtils.isNotEmpty(entry.getValue().getDefaultValue()))
+        .filter(entry -> !query.getFilters().containsKey(GraphLabel.valueOf(entry.getKey())))
+        .forEach(
+            entry ->
+                query
+                    .getFilters()
+                    .put(
+                        GraphLabel.valueOf(entry.getKey()),
+                        ImmutableList.of(entry.getValue().getDefaultValue())));
 
     // Generate SQL statement
     String sql = "SELECT ";
-    sql += config.getTimestampColumn() + ", ";
-    List<String> filterColumnNames = columnsToRead.values().stream()
-            .map(TsStorageGraphConfig.FilterColumn::getName)
-            .toList();
-    sql += StringUtils.join(filterColumnNames, ", ") + ", ";
-    sql += StringUtils.join(config.getDataColumns().keySet(), ", ") + " ";
+    sql +=
+        "date_bin('"
+            + query.getStepSeconds()
+            + " seconds', "
+            + config.getTimestampColumn()
+            + ", to_timestamp("
+            + query.getStart().getEpochSecond()
+            + ")) as bucket, ";
+    List<String> toReadColumnNames =
+        columnsToRead.values().stream().map(TsStorageGraphConfig.FilterColumn::getName).toList();
+    if (CollectionUtils.isNotEmpty(toReadColumnNames)) {
+      sql += StringUtils.join(toReadColumnNames, ", ") + ", ";
+    }
+    sql +=
+        StringUtils.join(
+                config.getDataColumns().entrySet().stream()
+                    .map(
+                        e ->
+                            e.getValue().getAggregation().name()
+                                + "("
+                                + e.getKey()
+                                + ") as "
+                                + e.getKey())
+                    .toList(),
+                ", ")
+            + " ";
     sql += "FROM " + config.getTable() + " ";
     sql += "WHERE ";
     sql +=
         query.getFilters().entrySet().stream()
+                .filter(e -> config.getFilterColumns().containsKey(e.getKey().name()))
                 .map(
                     entry -> {
                       TsStorageGraphConfig.FilterColumn filterColumn =
@@ -136,11 +188,21 @@ public class TsStorageGraphService implements GraphSourceIF {
                     })
                 .collect(Collectors.joining(" AND "))
             + " ";
+    if (StringUtils.isNotEmpty(config.getAdditionalFilter())) {
+      sql += "AND " + config.getAdditionalFilter() + " ";
+    }
     sql += "AND " + config.getTimestampColumn() + " > :startTimestamp ";
     sql += "AND " + config.getTimestampColumn() + " <= :endTimestamp ";
+    sql += "GROUP BY ";
+    if (CollectionUtils.isNotEmpty(toReadColumnNames)) {
+      sql += StringUtils.join(toReadColumnNames, ", ") + ", ";
+    }
+    sql += "bucket ";
     sql += "ORDER BY ";
-    sql += StringUtils.join(filterColumnNames, ", ") + ", ";
-    sql += config.getTimestampColumn();
+    if (CollectionUtils.isNotEmpty(toReadColumnNames)) {
+      sql += StringUtils.join(toReadColumnNames, ", ") + ", ";
+    }
+    sql += "bucket";
 
     Map<String, Object> params = new HashMap<>();
     params.put(
@@ -149,34 +211,69 @@ public class TsStorageGraphService implements GraphSourceIF {
     params.put("endTimestamp", Timestamp.from(query.getEnd()));
     params.putAll(
         query.getFilters().entrySet().stream()
+            .filter(e -> config.getFilterColumns().containsKey(e.getKey().name()))
             .collect(
                 Collectors.toMap(
                     e -> e.getKey().name(),
                     e -> convertParamValues(config, e.getKey().name(), e.getValue()))));
 
     long queryStartTime = System.currentTimeMillis();
+    String nameColumn = groupByColumns.stream().findFirst().orElse(null);
     // Get raw lines
-    Map<LineKey, RawLine> rawLines =
+    Map<LineKey, GraphData> graphDatas =
         jdbcTemplate.query(
             sql,
             params,
             rs -> {
-              Map<LineKey, RawLine> result = new HashMap<>();
+              Map<LineKey, GraphData> result = new HashMap<>();
               while (rs.next()) {
-                LineKey key = new LineKey();
-                for (var filterColumn : columnsToRead.entrySet()) {
-                  key.labels.put(
-                      filterColumn.getKey(), readFilterValue(filterColumn.getValue(), rs));
-                }
-                RawLine rawLine = result.computeIfAbsent(key, k -> new RawLine());
-                OffsetDateTime timestampDataTime =
-                    rs.getObject(config.getTimestampColumn(), OffsetDateTime.class);
-                Instant timestamp = timestampDataTime.toInstant();
                 for (var dataColumn : config.getDataColumns().entrySet()) {
-                  RawLineValue value = new RawLineValue();
-                  value.setAlias(dataColumn.getValue().getAlias());
-                  value.setValue(rs.getDouble(dataColumn.getKey()));
-                  rawLine.values.add(new ImmutablePair<>(timestamp, value));
+                  GraphData newData = new GraphData();
+                  String lineName = dataColumn.getValue().getAlias();
+                  Map<String, String> labels = new HashMap<>();
+                  LineKey lineKey = new LineKey();
+                  lineKey.getLabels().put(ALIAS, dataColumn.getValue().getAlias());
+                  for (var filterColumn : columnsToRead.entrySet()) {
+                    String filterColumnName = filterColumn.getKey();
+                    String filterColumnValue = readFilterValue(filterColumn.getValue(), rs);
+                    lineKey.getLabels().put(filterColumnName, filterColumnValue);
+                    if (nameColumn != null
+                        && nameColumn.equals(filterColumnName)
+                        && config.getDataColumns().size() == 1) {
+                      lineName = filterColumnValue;
+                    }
+                    if (filterColumnName.equals(GraphLabel.instanceName.name())) {
+                      newData.setInstanceName(filterColumnValue);
+                      continue;
+                    }
+                    if (filterColumnName.equals(GraphLabel.waitEventComponent.name())) {
+                      newData.setWaitEventComponent(filterColumnValue);
+                      continue;
+                    }
+                    if (filterColumnName.equals(GraphLabel.waitEventClass.name())) {
+                      newData.setWaitEventClass(filterColumnValue);
+                      continue;
+                    }
+                    if (filterColumnName.equals(GraphLabel.waitEventType.name())) {
+                      newData.setWaitEventType(filterColumnValue);
+                      continue;
+                    }
+                    if (filterColumnName.equals(GraphLabel.waitEvent.name())) {
+                      newData.setWaitEvent(filterColumnValue);
+                      continue;
+                    }
+                    labels.put(filterColumnName, filterColumnValue);
+                  }
+                  newData.setName(lineName);
+                  newData.setLabels(labels);
+                  GraphData graphData = result.computeIfAbsent(lineKey, k -> newData);
+                  OffsetDateTime timestampDataTime = rs.getObject("bucket", OffsetDateTime.class);
+                  Instant timestamp = timestampDataTime.toInstant();
+                  Double dataColumnValue = rs.getDouble(dataColumn.getKey());
+                  graphData
+                      .getPoints()
+                      .add(new GraphPoint().setX(timestamp.toEpochMilli()).setY(dataColumnValue));
+                  graphData.appendToTotal(dataColumnValue);
                 }
               }
               return result;
@@ -185,64 +282,62 @@ public class TsStorageGraphService implements GraphSourceIF {
         .labels(query.getName())
         .observe(System.currentTimeMillis() - queryStartTime);
 
-    if (rawLines == null) {
+    if (graphDatas == null) {
       return response;
     }
 
-    // Group values, related to the same alias/timestamp together
-    Map<LineKey, GroupedLine> groupedLines = new HashMap<>();
-    Map<LineKey, GroupedLine> averageLines = new HashMap<>();
-    for (var entry : rawLines.entrySet()) {
-      RawLine rawLine = entry.getValue();
-      for (Pair<Instant, RawLineValue> rawLineValuePair : rawLine.getValues()) {
-        RawLineValue value = rawLineValuePair.getValue();
-        LineKey key = new LineKey();
-        key.getLabels()
-            .putAll(
-                entry.getKey().getLabels().entrySet().stream()
-                    .filter(e -> groupByLabels.contains(e.getKey()))
-                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
-        key.getLabels().put(ALIAS, value.getAlias());
-
-        // Adjust timestamp
-        long pointSeconds = rawLineValuePair.getKey().getEpochSecond();
-        long adjustment = pointSeconds % query.getStepSeconds();
-        if (adjustment > 0) {
-          pointSeconds -= adjustment;
-          pointSeconds += query.getStepSeconds();
-        }
-        Instant aggregateTimestamp = Instant.ofEpochSecond(pointSeconds);
-
-        GroupedLine groupedLine = groupedLines.computeIfAbsent(key, k -> new GroupedLine());
-        groupedLine
-            .getValues()
-            .computeIfAbsent(aggregateTimestamp, k -> new ArrayList<>())
-            .add(rawLineValuePair.getValue().getValue());
-        groupedLine.total += rawLineValuePair.getValue().getValue();
-        groupedLine.totalPoints++;
-
-        if (query.getSettings().getSplitType() == GraphSettings.SplitType.NODE
-            && query.getSettings().isReturnAggregatedValue()) {
-          // Will add one more line with average value
-          LineKey averageKey = new LineKey(key);
-          averageKey.getLabels().remove(GraphLabel.instanceName.name());
-
-          GroupedLine groupedAverageLine =
-              averageLines.computeIfAbsent(averageKey, k -> new GroupedLine());
-          groupedAverageLine
-              .getValues()
-              .computeIfAbsent(aggregateTimestamp, k -> new ArrayList<>())
-              .add(rawLineValuePair.getValue().getValue());
-          groupedAverageLine.total += rawLineValuePair.getValue().getValue();
-          groupedAverageLine.totalPoints++;
-        }
+    // Calculate average lines, if needed
+    Map<LineKey, GraphData> averageDatas = new HashMap<>();
+    if (query.getSettings().getSplitType() == GraphSettings.SplitType.NODE
+        && query.getSettings().isReturnAggregatedValue()) {
+      Set<String> nodes = new HashSet<>();
+      Map<LineKey, List<GraphData>> nodeLines =
+          graphDatas.entrySet().stream()
+              .collect(
+                  Collectors.groupingBy(
+                      e -> {
+                        LineKey key = new LineKey(e.getKey());
+                        nodes.add(key.getLabels().remove(GraphLabel.instanceName.name()));
+                        return key;
+                      },
+                      Collectors.mapping(Map.Entry::getValue, Collectors.toList())));
+      // Will add one more line with average value
+      for (var lines : nodeLines.entrySet()) {
+        List<GraphData> nodeGraphs = lines.getValue();
+        GraphData averageLine =
+            nodeGraphs.get(0).toBuilder()
+                .instanceName(null)
+                .points(new ArrayList<>())
+                .total(0D)
+                .build();
+        Map<Long, List<Double>> timestampToValues =
+            nodeGraphs.stream()
+                .flatMap(d -> d.getPoints().stream())
+                .collect(
+                    Collectors.groupingBy(
+                        GraphPoint::getX,
+                        TreeMap::new,
+                        Collectors.mapping(GraphPoint::getY, Collectors.toList())));
+        timestampToValues.forEach(
+            (x, yList) -> {
+              Double value =
+                  yList.stream()
+                      .filter(v -> !v.isNaN())
+                      .reduce(Double.NaN, (a, b) -> a.isNaN() ? b : a + b);
+              if (!value.isNaN()) {
+                averageLine.appendToTotal(value);
+                value = value / nodes.size();
+              }
+              averageLine.getPoints().add(new GraphPoint(x, value));
+              averageDatas.put(lines.getKey(), averageLine);
+            });
       }
     }
 
     // Filter unneeded lines based on graph query settings
     if (query.getSettings().getSplitType() == GraphSettings.SplitType.NODE) {
       var partitionedLines =
-          groupedLines.entrySet().stream()
+          graphDatas.entrySet().stream()
               .collect(
                   Collectors.groupingBy(
                       e -> {
@@ -251,11 +346,11 @@ public class TsStorageGraphService implements GraphSourceIF {
                         return groupingKey;
                       },
                       Collectors.toList()));
-      groupedLines =
+      graphDatas =
           partitionedLines.values().stream()
               .flatMap(
                   s -> {
-                    Comparator<? super Map.Entry<LineKey, GroupedLine>> comparator =
+                    Comparator<? super Map.Entry<LineKey, GraphData>> comparator =
                         Comparator.comparing(e -> e.getValue().getAverage());
                     if (query.getSettings().getSplitMode() == GraphSettings.SplitMode.BOTTOM) {
                       comparator = comparator.reversed();
@@ -269,50 +364,8 @@ public class TsStorageGraphService implements GraphSourceIF {
                   })
               .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
-    Map<String, TsStorageGraphConfig.DataColumn> dataColumnByAlias =
-        config.getDataColumns().entrySet().stream()
-            .collect(Collectors.toMap(e -> e.getValue().getAlias(), Map.Entry::getValue));
-    Stream.concat(groupedLines.entrySet().stream(), averageLines.entrySet().stream())
-        .forEach(
-            groupedLineEntry -> {
-              LineKey key = groupedLineEntry.getKey();
-              GroupedLine groupedLine = groupedLineEntry.getValue();
-              GraphData graphData = new GraphData();
-              graphData.setName(key.getLabels().remove(ALIAS));
-              if (key.getLabels().containsKey(GraphLabel.instanceName.name())) {
-                graphData.setInstanceName(key.getLabels().remove(GraphLabel.instanceName.name()));
-              }
-              if (key.getLabels().containsKey(GraphLabel.waitEventComponent.name())) {
-                graphData.setWaitEventComponent(
-                    key.getLabels().remove(GraphLabel.waitEventComponent.name()));
-              }
-              if (key.getLabels().containsKey(GraphLabel.waitEventClass.name())) {
-                graphData.setWaitEventClass(
-                    key.getLabels().remove(GraphLabel.waitEventClass.name()));
-              }
-              if (key.getLabels().containsKey(GraphLabel.waitEvent.name())) {
-                graphData.setWaitEvent(key.getLabels().remove(GraphLabel.waitEvent.name()));
-              }
-
-              graphData.setLabels(key.getLabels());
-              for (var valueGroup : groupedLine.values.entrySet()) {
-                double aggregated = Double.NaN;
-                DoubleStream valuesStream = valueGroup.getValue().stream().mapToDouble(a -> a);
-                TsStorageGraphConfig.DataColumn dataColumn =
-                    dataColumnByAlias.get(graphData.getName());
-                switch (dataColumn.getAggregation()) {
-                  case avg -> aggregated = valuesStream.average().getAsDouble();
-                  case sum -> aggregated = valuesStream.sum();
-                  case max -> aggregated = valuesStream.max().getAsDouble();
-                  case min -> aggregated = valuesStream.min().getAsDouble();
-                }
-                graphData
-                    .getPoints()
-                    .add(
-                        new GraphPoint().setX(valueGroup.getKey().toEpochMilli()).setY(aggregated));
-              }
-              response.getData().add(graphData);
-            });
+    response.getData().addAll(graphDatas.values());
+    response.getData().addAll(averageDatas.values());
     Comparator<GraphData> graphDataComparator =
         Comparator.comparing(GraphData::getInstanceNameOrEmpty)
             .thenComparing(GraphData::getNameOrEmpty)
@@ -357,28 +410,6 @@ public class TsStorageGraphService implements GraphSourceIF {
     private LineKey(LineKey other) {
       this();
       labels.putAll(other.getLabels());
-    }
-  }
-
-  @Data
-  private static class RawLine {
-    private List<Pair<Instant, RawLineValue>> values = new ArrayList<>();
-  }
-
-  @Data
-  private static class RawLineValue {
-    private String alias;
-    private Double value;
-  }
-
-  @Data
-  private static class GroupedLine {
-    private double total;
-    private double totalPoints;
-    private Map<Instant, List<Double>> values = new TreeMap<>();
-
-    public double getAverage() {
-      return total / totalPoints;
     }
   }
 }

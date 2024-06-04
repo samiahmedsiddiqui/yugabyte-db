@@ -587,6 +587,8 @@ public class NodeManagerTest extends FakeDBApplication {
         .thenReturn(true);
     when(mockConfGetter.getConfForScope(any(Customer.class), eq(CustomerConfKeys.enableIMDSv2)))
         .thenReturn(false);
+    when(mockConfGetter.getConfForScope(any(Customer.class), eq(CustomerConfKeys.cloudEnabled)))
+        .thenReturn(false);
   }
 
   private String getMountPoints(AnsibleConfigureServers.Params taskParam) {
@@ -1423,8 +1425,10 @@ public class NodeManagerTest extends FakeDBApplication {
   @Test
   public void testCreateNodeCommandSecondarySubnet() {
     int idx = 0;
+    when(mockConfig.getBoolean("yb.cloud.enabled")).thenReturn(true);
+    when(mockConfGetter.getConfForScope(any(Customer.class), eq(CustomerConfKeys.cloudEnabled)))
+        .thenReturn(false);
     for (TestData t : testData) {
-      when(mockConfig.getBoolean("yb.cloud.enabled")).thenReturn(true);
       AnsibleCreateServer.Params params = new AnsibleCreateServer.Params();
       buildValidParams(
           t,
@@ -2055,7 +2059,12 @@ public class NodeManagerTest extends FakeDBApplication {
               "--private_key_file",
               "/path/to/private.key",
               "--custom_ssh_port",
-              "3333");
+              "3333",
+              "--install_node_exporter",
+              "--node_exporter_port",
+              "9300",
+              "--node_exporter_user",
+              "yugabyte");
       expectedCommand.addAll(expectedCommand.size() - 7, accessKeyCommand);
       reset(shellProcessHandler);
       nodeManager.nodeCommand(NodeManager.NodeCommandType.Configure, params);
@@ -2331,10 +2340,14 @@ public class NodeManagerTest extends FakeDBApplication {
         params.deviceInfo.mountPoints = fakeMountPaths;
 
         when(mockConfig.getBoolean("yb.cloud.enabled")).thenReturn(true);
+        when(mockConfGetter.getConfForScope(any(Customer.class), eq(CustomerConfKeys.cloudEnabled)))
+            .thenReturn(true);
         reset(shellProcessHandler);
         nodeManager.nodeCommand(NodeManager.NodeCommandType.Configure, params);
 
         when(mockConfig.getBoolean("yb.cloud.enabled")).thenReturn(false);
+        when(mockConfGetter.getConfForScope(any(Customer.class), eq(CustomerConfKeys.cloudEnabled)))
+            .thenReturn(false);
         when(mockConfig.getBoolean("yb.gflags.allow_user_override")).thenReturn(false);
         when(mockConfGetter.getConfForScope(
                 any(Universe.class), eq(UniverseConfKeys.gflagsAllowUserOverride)))

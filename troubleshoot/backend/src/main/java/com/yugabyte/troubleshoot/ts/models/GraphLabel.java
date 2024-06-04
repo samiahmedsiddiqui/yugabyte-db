@@ -22,7 +22,9 @@ public enum GraphLabel {
   mountPoint("mountpoint"),
   waitEventComponent(""),
   waitEventClass(""),
-  waitEvent("");
+  waitEventType(""),
+  waitEvent(""),
+  clientNodeIp("");
 
   private final String metricLabel;
 

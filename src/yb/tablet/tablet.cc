@@ -289,6 +289,14 @@ DEFINE_test_flag(uint64, inject_sleep_before_applying_write_batch_ms, 0,
 DEFINE_test_flag(uint64, inject_sleep_before_applying_intents_ms, 0,
                  "Sleep before applying intents to docdb after transaction commit");
 
+DEFINE_test_flag(bool, skip_remove_intent, false,
+                 "If true, remove intent will be skipped");
+
+DEFINE_test_flag(bool, cdc_immediate_transaction_cleanup_cleanup_intent_files, false,
+                 "Do intent SST file cleanup even when cdc_immediate_transaction_cleanup is on. "
+                 "This can cause data loss (#22227) but we don't run into that issue during some "
+                 "unit tests.");
+
 DECLARE_bool(TEST_invalidate_last_change_metadata_op);
 
 using namespace std::placeholders;
@@ -311,6 +319,7 @@ using client::YBSession;
 using client::YBTablePtr;
 
 using dockv::DocKey;
+using dockv::KeyEntryTypeAsChar;
 using docdb::DocRowwiseIterator;
 using docdb::TableInfoProvider;
 using dockv::SubDocKey;
@@ -333,18 +342,96 @@ bool IsSortedAscendingEncoded(
 
 namespace {
 
-thread_local docdb::DocDBStatistics scoped_docdb_statistics;
-thread_local ScopedTabletMetrics scoped_tablet_metrics;
+class MetricsScope {
+ public:
+  MetricsScope(TabletMetrics& global_metrics, rocksdb::Statistics& regulardb_statistics,
+               rocksdb::Statistics& intentsdb_statistics) :
+      MetricsScope(
+          global_metrics, regulardb_statistics, intentsdb_statistics,
+          GetAtomicFlag(&FLAGS_batch_tablet_metrics_update)) { }
 
-void TraceScopedMetrics() {
-  std::stringstream ss;
-  ss << "Metric changes:\n";
-  size_t changes = scoped_docdb_statistics.Dump(&ss);
-  changes += scoped_tablet_metrics.Dump(&ss);
-  if (changes > 0) {
-    TRACE(ss.str());
+  ~MetricsScope() {
+    if (!IsBatchedMetricsUpdate()) {
+      return;
+    }
+
+    if (GetAtomicFlag(&FLAGS_dump_metrics_to_trace)) {
+      TraceScopedMetrics();
+    }
+
+    scoped_tablet_metrics_.MergeAndClear(&global_metrics_);
+    scoped_docdb_statistics_.MergeAndClear(&regulardb_statistics_, &intentsdb_statistics_);
   }
-}
+
+  docdb::DocDBStatistics* statistics() {
+    return statistics_;
+  }
+
+  TabletMetrics* metrics() {
+    return &metrics_;
+  }
+
+ protected:
+  static thread_local docdb::DocDBStatistics scoped_docdb_statistics_;
+  static thread_local ScopedTabletMetrics scoped_tablet_metrics_;
+
+  bool IsBatchedMetricsUpdate() {
+    return statistics_ != nullptr;
+  }
+
+ private:
+  MetricsScope(TabletMetrics& global_metrics, rocksdb::Statistics& regulardb_statistics,
+               rocksdb::Statistics& intentsdb_statistics, bool batch_metrics_update) :
+      global_metrics_(global_metrics), regulardb_statistics_(regulardb_statistics),
+      intentsdb_statistics_(intentsdb_statistics),
+      statistics_(batch_metrics_update ? &scoped_docdb_statistics_ : nullptr),
+      metrics_(batch_metrics_update ? scoped_tablet_metrics_ : global_metrics_) { }
+
+  void TraceScopedMetrics() {
+    std::stringstream ss;
+    ss << "Metric changes:\n";
+    size_t changes = scoped_docdb_statistics_.Dump(&ss);
+    changes += scoped_tablet_metrics_.Dump(&ss);
+    if (changes > 0) {
+      TRACE(ss.str());
+    }
+  }
+
+  TabletMetrics& global_metrics_;
+  rocksdb::Statistics& regulardb_statistics_;
+  rocksdb::Statistics& intentsdb_statistics_;
+
+  docdb::DocDBStatistics* statistics_;
+  TabletMetrics& metrics_;
+};
+
+class YSQLMetricsScope : public MetricsScope {
+ public:
+  YSQLMetricsScope(TabletMetrics& global_metrics, rocksdb::Statistics& regulardb_statistics,
+                   rocksdb::Statistics& intentsdb_statistics,
+                   PgsqlMetricsCaptureType metrics_capture, PgsqlResponsePB& pgsql_response):
+      MetricsScope(global_metrics, regulardb_statistics, intentsdb_statistics),
+      metrics_capture_(metrics_capture), pgsql_response_(pgsql_response) { }
+
+  ~YSQLMetricsScope() {
+    if (!IsBatchedMetricsUpdate()) {
+      return;
+    }
+
+    if (GetAtomicFlag(&FLAGS_ysql_analyze_dump_metrics) &&
+        metrics_capture_ == PgsqlMetricsCaptureType::PGSQL_METRICS_CAPTURE_ALL) {
+      scoped_tablet_metrics_.CopyToPgsqlResponse(&pgsql_response_);
+      scoped_docdb_statistics_.CopyToPgsqlResponse(&pgsql_response_);
+    }
+  }
+
+ private:
+  PgsqlMetricsCaptureType metrics_capture_;
+  PgsqlResponsePB& pgsql_response_;
+};
+
+thread_local docdb::DocDBStatistics MetricsScope::scoped_docdb_statistics_;
+thread_local ScopedTabletMetrics MetricsScope::scoped_tablet_metrics_;
 
 std::string MakeTabletLogPrefix(
     const TabletId& tablet_id, const std::string& log_prefix_suffix) {
@@ -816,6 +903,15 @@ Status Tablet::OpenKeyValueTablet() {
           block_based_table_mem_tracker_, AddToParent::kTrue, CreateMetrics::kFalse);
   rocksdb_options.block_based_table_mem_tracker = regulardb_mem_tracker_;
 
+
+  if (metadata()->primary_table_info()->index_info) {
+    const auto &ind_info = metadata()->primary_table_info()->index_info;
+    if (ind_info->is_vector_idx()) {
+      auto vec_options = ind_info->get_vector_idx_options();
+      LOG_WITH_PREFIX(INFO) << "Opening vector index tablet";
+    }
+  }
+
   // We may not have a metrics_entity_ instantiated in tests.
   if (tablet_metrics_entity_) {
     rocksdb_options.block_based_table_mem_tracker->SetMetricEntity(tablet_metrics_entity_);
@@ -912,7 +1008,6 @@ Status Tablet::OpenKeyValueTablet() {
     intents_db_->ListenFilesChanged(std::bind(&Tablet::CleanupIntentFiles, this));
   }
 
-  ql_storage_.reset(new docdb::QLRocksDBStorage(doc_db()));
   if (transaction_participant_) {
     // We need to set the "cdc_sdk_min_checkpoint_op_id" so that intents don't get
     // garbage collected after transactions are loaded.
@@ -975,6 +1070,20 @@ void Tablet::DoCleanupIntentFiles() {
     VLOG_WITH_PREFIX_AND_FUNC(4) << "Exit because of xCluster replication";
     return;
   }
+
+  // This codepath may in some cases delete SST files that we still need for CDC, if
+  // cdc_immediate_transaction_cleanup is enabled (#22227). This is a temporary fix and should
+  // be removed when #22227 is resolved.
+  if (GetAtomicFlag(&FLAGS_cdc_immediate_transaction_cleanup) &&
+      !GetAtomicFlag(&FLAGS_TEST_cdc_immediate_transaction_cleanup_cleanup_intent_files)) {
+    auto cdc_op_id = transaction_participant_->GetLatestCheckPoint();
+    if (cdc_op_id != OpId::Max()) {
+      VLOG_WITH_PREFIX_AND_FUNC(1)
+          << "Skipping because CDC is in use with cdc_immediate_transaction_cleanup enabled";
+      return;
+    }
+  }
+
   HybridTime best_file_max_ht = HybridTime::kMax;
   OpId best_file_op_id = OpId::Max();
   std::vector<rocksdb::LiveFileMetaData> files;
@@ -1587,8 +1696,13 @@ Status Tablet::HandleQLReadRequest(
   auto scoped_read_operation = CreateScopedRWOperationNotBlockingRocksDbShutdownStart(
       read_operation_data.deadline);
   RETURN_NOT_OK(scoped_read_operation);
+
+  MetricsScope metrics_scope(*metrics_, *regulardb_statistics_, *intentsdb_statistics_);
+
   ScopedTabletMetricsLatencyTracker metrics_tracker(
-      metrics_.get(), TabletEventStats::kQlReadLatency);
+      metrics_scope.metrics(), TabletEventStats::kQlReadLatency);
+
+  docdb::QLRocksDBStorage storage{doc_db(metrics_scope.metrics())};
 
   bool schema_version_compatible = IsSchemaVersionCompatible(
       metadata()->schema_version(), ql_read_request.schema_version(),
@@ -1600,8 +1714,8 @@ Status Tablet::HandleQLReadRequest(
         CreateTransactionOperationContext(transaction_metadata, /* is_ysql_catalog_table */ false);
     RETURN_NOT_OK(txn_op_ctx);
     status = AbstractTablet::HandleQLReadRequest(
-        read_operation_data, ql_read_request, *txn_op_ctx, *ql_storage_, scoped_read_operation,
-        result, rows_data);
+        read_operation_data, ql_read_request, *txn_op_ctx, storage, scoped_read_operation,
+        result, rows_data, metrics_scope.statistics());
 
     schema_version_compatible = IsSchemaVersionCompatible(
         metadata()->schema_version(), ql_read_request.schema_version(),
@@ -1684,32 +1798,14 @@ Status Tablet::HandlePgsqlReadRequest(
       read_operation_data.deadline);
   RETURN_NOT_OK(scoped_read_operation);
 
-  docdb::DocDBStatistics* statistics = nullptr;
-  TabletMetrics* metrics = metrics_.get();
-
-  if (GetAtomicFlag(&FLAGS_batch_tablet_metrics_update)) {
-    statistics = &scoped_docdb_statistics;
-    metrics = &scoped_tablet_metrics;
-  }
+  YSQLMetricsScope metrics_scope(
+      *metrics_, *regulardb_statistics_, *intentsdb_statistics_,
+      pgsql_read_request.metrics_capture(), result->response);
 
   auto status = DoHandlePgsqlReadRequest(
-      &scoped_read_operation, statistics, metrics, read_operation_data,
-      is_explicit_request_read_time, pgsql_read_request, transaction_metadata,
+      &scoped_read_operation, metrics_scope.statistics(), metrics_scope.metrics(),
+      read_operation_data, is_explicit_request_read_time, pgsql_read_request, transaction_metadata,
       subtransaction_metadata, result);
-
-  if (statistics) {
-    if (GetAtomicFlag(&FLAGS_dump_metrics_to_trace)) {
-      TraceScopedMetrics();
-    }
-    auto metrics_capture = pgsql_read_request.metrics_capture();
-    if (GetAtomicFlag(&FLAGS_ysql_analyze_dump_metrics) &&
-        metrics_capture == PgsqlMetricsCaptureType::PGSQL_METRICS_CAPTURE_ALL) {
-      statistics->CopyToPgsqlResponse(&result->response);
-      scoped_tablet_metrics.CopyToPgsqlResponse(&result->response);
-    }
-    scoped_tablet_metrics.MergeAndClear(metrics_.get());
-    statistics->MergeAndClear(regulardb_statistics_.get(), intentsdb_statistics_.get());
-  }
 
   return status;
 }
@@ -2028,6 +2124,9 @@ Result<docdb::ApplyTransactionState> Tablet::ApplyIntents(const TransactionApply
 template <class Ids>
 Status Tablet::RemoveIntentsImpl(
     const RemoveIntentsData& data, RemoveReason reason, const Ids& ids) {
+  if (PREDICT_FALSE(GetAtomicFlag(&FLAGS_TEST_skip_remove_intent))) {
+    return Status::OK();
+  }
   auto scoped_read_operation = CreateScopedRWOperationNotBlockingRocksDbShutdownStart();
   RETURN_NOT_OK(scoped_read_operation);
 
@@ -2055,7 +2154,7 @@ Status Tablet::RemoveIntentsImpl(
       AtomicFlagSleepMs(&FLAGS_apply_intents_task_injected_delay_ms);
     }
   }
-
+  DEBUG_ONLY_TEST_SYNC_POINT("Tablet::RemoveIntentsImpl");
   return Status::OK();
 }
 
@@ -4489,7 +4588,9 @@ Status Tablet::GetLockStatus(const std::map<TransactionId, SubtxnSet>& transacti
   if (!metadata_->colocated()) {
     // For colocated table, we don't populate table_id field of TabletLockInfoPB message. Instead,
     // it is populated in LockInfoPB by downstream code.
-    tablet_lock_info->set_table_id(metadata_->table_id());
+    auto pg_table_id = metadata_->primary_table_info()->pg_table_id.empty() ?
+        metadata_->table_id() : metadata_->primary_table_info()->pg_table_id;
+    tablet_lock_info->set_pg_table_id(pg_table_id);
   }
   tablet_lock_info->set_tablet_id(tablet_id());
 
@@ -4501,20 +4602,20 @@ Status Tablet::GetLockStatus(const std::map<TransactionId, SubtxnSet>& transacti
   }
 
   TransactionLockInfoManager lock_info_manager(tablet_lock_info);
-
   rocksdb::ReadOptions read_options;
   auto intent_iter = std::unique_ptr<rocksdb::Iterator>(intents_db_->NewIterator(read_options));
   intent_iter->SeekToFirst();
-
-  if (transactions.empty()) {
+  // It could happen that the tablet gets a lock status request with the transactions field unset,
+  // but max_single_shard_waiter_start_time_us set. If so, the response shouldn't be populated with
+  // all active intents.
+  if (transactions.empty() && max_single_shard_waiter_start_time_us == 0) {
     intent_iter->Seek(key_bounds_.lower);
     while (intent_iter->Valid() &&
            (key_bounds_.upper.empty() || intent_iter->key().compare(key_bounds_.upper) < 0)) {
       auto key = intent_iter->key();
-
-      if (key[0] == dockv::KeyEntryTypeAsChar::kTransactionId) {
+      if (key[0] == KeyEntryTypeAsChar::kTransactionId) {
         static const std::array<char, 1> kAfterTransactionId{
-            dockv::KeyEntryTypeAsChar::kTransactionId + 1};
+            KeyEntryTypeAsChar::kTransactionId + 1};
         static const Slice kAfterTxnRegion(kAfterTransactionId);
         intent_iter->Seek(kAfterTxnRegion);
         continue;
@@ -4529,7 +4630,6 @@ Status Tablet::GetLockStatus(const std::map<TransactionId, SubtxnSet>& transacti
 
     RETURN_NOT_OK(intent_iter->status());
   } else {
-    DCHECK(!transactions.empty());
     // While fetching intents of transactions below, we assume that the 'transactions' map is sorted
     // following the encoded string notation order of TransactionId. This assumption helps us avoid
     // repeated SeekToFirst calls on the rocksdb iterator so we can fetch relevant intents in one
@@ -4540,7 +4640,7 @@ Status Tablet::GetLockStatus(const std::map<TransactionId, SubtxnSet>& transacti
     std::vector<dockv::KeyBytes> txn_intent_keys;
     static constexpr size_t kReverseKeySize = 1 + sizeof(TransactionId);
     char reverse_key_data[kReverseKeySize];
-    reverse_key_data[0] = dockv::KeyEntryTypeAsChar::kTransactionId;
+    reverse_key_data[0] = KeyEntryTypeAsChar::kTransactionId;
     for (auto& txn : transactions) {
       auto& txn_id = txn.first;
       memcpy(&reverse_key_data[1], txn_id.data(), sizeof(TransactionId));
@@ -4554,7 +4654,7 @@ Status Tablet::GetLockStatus(const std::map<TransactionId, SubtxnSet>& transacti
 
       // Scan the transaction's corresponding reverse index section.
       while (intent_iter->Valid() && intent_iter->key().compare_prefix(reverse_key) == 0) {
-        DCHECK_EQ(intent_iter->key()[0], dockv::KeyEntryTypeAsChar::kTransactionId);
+        DCHECK_EQ(intent_iter->key()[0], KeyEntryTypeAsChar::kTransactionId);
         // We should only consider intents whose value is within the tablet's key bounds.
         // Else, we would observe duplicate results in case of tablet split.
         if (key_bounds_.IsWithinBounds(intent_iter->value())) {
@@ -4568,17 +4668,19 @@ Status Tablet::GetLockStatus(const std::map<TransactionId, SubtxnSet>& transacti
     std::sort(txn_intent_keys.begin(), txn_intent_keys.end());
     intent_iter->SeekToFirst();
     RETURN_NOT_OK(intent_iter->status());
-
+    DEBUG_ONLY_TEST_SYNC_POINT("Tablet::GetLockStatus:1");
+    DEBUG_ONLY_TEST_SYNC_POINT("Tablet::GetLockStatus:2");
     for (const auto& intent_key : txn_intent_keys) {
       intent_iter->Seek(intent_key);
       RETURN_NOT_OK(intent_iter->status());
-
-      auto key = intent_iter->key();
-      DCHECK_EQ(intent_iter->key(), key);
-
-      auto val = intent_iter->value();
-      RETURN_NOT_OK(PopulateLockInfoFromIntent(
-          key, val, *this, transactions, &lock_info_manager, max_txn_locks_per_tablet));
+      // Since records could get added/tombstoned after we formed 'txn_intent_keys', ensure that
+      // we are operating on the previously seen provisional record. If the record has been
+      // tombstoned, move on to the next record of interest.
+      if (intent_iter->Valid() && intent_iter->key() == intent_key) {
+        RETURN_NOT_OK(PopulateLockInfoFromIntent(
+            intent_iter->key(), intent_iter->value(), *this, transactions, &lock_info_manager,
+            max_txn_locks_per_tablet));
+      }
     }
   }
 
@@ -4717,17 +4819,31 @@ Status Tablet::GetTabletKeyRanges(
 
 namespace {
 
+YB_DEFINE_ENUM(RetrieveFullDocKeyResult, (kFound)(kSkipDataBlock)(kReachedEnd));
+
+template<Direction direction>
+const rocksdb::KeyValueEntry& MoveIterator(rocksdb::Iterator*);
+template<>
+const rocksdb::KeyValueEntry& MoveIterator<Direction::kForward>(rocksdb::Iterator* iter) {
+  return iter->Next();
+}
+template<>
+const rocksdb::KeyValueEntry& MoveIterator<Direction::kBackward>(rocksdb::Iterator* iter) {
+  return iter->Prev();
+}
+
 // Retrieves from the data block full doc key pointed by index_iter.
-// If its length less or equal to max_key_length, pushes the key to the callback, updates
-// last_key and returns true.
-// Otherwise, skips the data block and returns false.
+// If its length less or equal to max_key_length and key is less than end_bound,
+// pushes the key to the callback, updates last_key and returns kFound.
+// Otherwise, returns kSkipDataBlock or kReachedEnd if we've reached end_bound.
 template<Direction direction, typename Callback>
-Result<bool> RetrieveFullDocKey(
+Result<RetrieveFullDocKeyResult> RetrieveFullDocKey(
     const std::string& log_prefix, rocksdb::Iterator* index_iter, rocksdb::Iterator* data_iter,
-    std::string* last_key, const uint32_t max_key_length, Callback callback) {
-  RSTATUS_DCHECK(
-    index_iter->Valid(), InternalError,
-    "Not expected to reach this line when index iterator is invalid");
+    std::string* last_key, const uint32_t max_key_length, const Slice end_bound,
+    Callback callback) {
+  if (!index_iter->Valid()) {
+    return RetrieveFullDocKeyResult::kReachedEnd;
+  }
   auto data_entry = data_iter->Seek(index_iter->key());
   RSTATUS_DCHECK(
       data_entry.Valid(), InternalError,
@@ -4735,8 +4851,7 @@ Result<bool> RetrieveFullDocKey(
           "Invalid data iterator after seeking to key from SST index: $0",
           index_iter->KeyDebugHexString()));
 
-  for (; data_entry.Valid();
-       data_entry = (direction == Direction::kForward ? data_iter->Next() : data_iter->Prev())) {
+  for (; data_entry.Valid(); data_entry = MoveIterator<direction>(data_iter)) {
     VLOG_WITH_FUNC(2) << log_prefix << "data_entry.key: " << data_entry.key.ToDebugHexString();
     // Use encoded doc key to avoid breaking data related to the same row into halves.
     const auto doc_key_size_result =
@@ -4750,19 +4865,37 @@ Result<bool> RetrieveFullDocKey(
     }
     if (doc_key_size_result.get() > max_key_length) {
       // Skip keys longer than max_key_length. Also skip the whole block for efficiency.
-      return false;
+      return RetrieveFullDocKeyResult::kSkipDataBlock;
     }
     const auto key = data_entry.key.Prefix(doc_key_size_result.get());
-    if (direction == Direction::kBackward && !last_key->empty() && key >= *last_key) {
-      // Skips keys larger than last_key (can only happen during reverse scan).
-      continue;
+
+    switch (direction) {
+      case Direction::kBackward:
+        if (!end_bound.empty() && key <= end_bound) {
+          return RetrieveFullDocKeyResult::kReachedEnd;
+        }
+        if (!last_key->empty() && key >= *last_key) {
+          // Skips keys larger than or equal to last_key.
+          continue;
+        }
+        break;
+      case Direction::kForward:
+        if (!end_bound.empty() && key >= end_bound) {
+          return RetrieveFullDocKeyResult::kReachedEnd;
+        }
+        if (key == *last_key) {
+          // Skips keys equal to last_key. Also skip the whole block for efficiency.
+          return RetrieveFullDocKeyResult::kSkipDataBlock;
+        }
+        break;
     }
+
     VLOG_WITH_FUNC(2) << log_prefix << "key: " << key.ToDebugHexString();
     callback(key);
     *last_key = key.ToBuffer();
-    return true;
+    return RetrieveFullDocKeyResult::kFound;
   }
-  return false;
+  return RetrieveFullDocKeyResult::kReachedEnd;
 }
 
 template <
@@ -4773,7 +4906,8 @@ Status DoGetTabletKeyRanges(
     std::string* last_key, NoMoreKeysFunc no_more_keys_func, SkipKeyFunc skip_key_func,
     HasKeyChangedFunc has_key_changed_func, const uint64_t max_num_ranges,
     uint64_t num_blocks_to_skip, const uint64_t num_blocks_to_skip_after_first,
-    const uint32_t max_key_length, const Slice key_to_add_as_last, Callback callback) {
+    const uint32_t max_key_length, const bool use_empty_as_last_key, const Slice end_bound,
+    Callback callback) {
   uint64_t num_keys = 1;
 
   while (num_keys <= max_num_ranges) {
@@ -4787,14 +4921,36 @@ Status DoGetTabletKeyRanges(
                       << ", num_keys: " << num_keys;
 
     if (no_more_keys) {
-      VLOG_WITH_FUNC(2) << log_prefix << "key: " << key_to_add_as_last.ToDebugHexString();
-      callback(key_to_add_as_last);
+      Slice key = use_empty_as_last_key ? Slice() : end_bound;
+      VLOG_WITH_FUNC(2) << log_prefix << "key: " << key.ToDebugHexString();
+      callback(key);
       break;
     }
 
-    if (VERIFY_RESULT(RetrieveFullDocKey<direction>(
-            log_prefix, index_iter, data_iter, last_key, max_key_length, callback))) {
-      ++num_keys;
+    for (;;) {
+      auto retrieve_full_doc_key_result = VERIFY_RESULT(RetrieveFullDocKey<direction>(
+          log_prefix, index_iter, data_iter, last_key, max_key_length, end_bound,
+          callback));
+      VLOG_WITH_FUNC(2) << log_prefix << "retrieve_full_doc_key_result: "
+                        << AsString(retrieve_full_doc_key_result);
+      bool handled = false;
+      switch (retrieve_full_doc_key_result) {
+        case RetrieveFullDocKeyResult::kFound:
+          ++num_keys;
+          handled = true;
+          break;
+        case RetrieveFullDocKeyResult::kSkipDataBlock:
+          MoveIterator<direction>(index_iter);
+          continue;
+        case RetrieveFullDocKeyResult::kReachedEnd:
+          handled = true;
+          break;
+      }
+      if (!handled) {
+        FATAL_INVALID_ENUM_VALUE(RetrieveFullDocKeyResult, retrieve_full_doc_key_result);
+      }
+
+      break;
     }
   }
   return Status::OK();
@@ -4819,13 +4975,15 @@ Status DoGetTabletKeyRanges<Direction::kForward>(
     index_iter->SeekToFirst();
   } else {
     index_iter->Seek(lower_bound_key);
+    if (index_iter->Valid() && index_iter->key() == lower_bound_key) {
+      index_iter->Next();
+    }
   }
   VLOG_WITH_FUNC(2) << log_prefix << "index_iter: " << index_iter->KeyDebugHexString();
 
   // First index key is the last key in first data block, so we treat it as we've already
   // skipped one data block.
-  const auto treat_first_block_as_skipped =
-      index_iter->Valid() && index_iter->key() != lower_bound_key;
+  const auto treat_first_block_as_skipped = index_iter->Valid();
 
   std::string last_key = lower_bound_key.ToBuffer();
 
@@ -4846,8 +5004,8 @@ Status DoGetTabletKeyRanges<Direction::kForward>(
   return DoGetTabletKeyRanges<Direction::kForward>(
       log_prefix, index_iter, data_iter, &last_key, no_more_keys_func, skip_key_func,
       has_iter_key_changed_func, max_num_ranges, num_blocks_to_skip - treat_first_block_as_skipped,
-      num_blocks_to_skip, max_key_length, use_empty_as_last_key ? Slice{} : upper_bound_key,
-      callback);
+      num_blocks_to_skip, max_key_length, use_empty_as_last_key, upper_bound_key,
+      std::move(callback));
 }
 
 template<>
@@ -4885,7 +5043,7 @@ Status DoGetTabletKeyRanges<Direction::kBackward>(
   return DoGetTabletKeyRanges<Direction::kBackward>(
       log_prefix, index_iter, data_iter, &last_key, no_more_keys_func, skip_key_func,
       has_iter_key_changed_func, max_num_ranges, num_blocks_to_skip, num_blocks_to_skip,
-      max_key_length, use_empty_as_last_key ? Slice{} : upper_bound_key, callback);
+      max_key_length, use_empty_as_last_key, lower_bound_key, std::move(callback));
 }
 
 } // namespace

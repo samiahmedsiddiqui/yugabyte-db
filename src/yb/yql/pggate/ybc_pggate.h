@@ -114,6 +114,9 @@ YBCStatus YBCGetHeapConsumption(YbTcmallocStats *desc);
 // Validate the JWT based on the options including the identity matching based on the identity map.
 YBCStatus YBCValidateJWT(const char *token, const YBCPgJwtAuthOptions *options);
 
+// Is this node acting as the pg_cron leader?
+bool YBCIsCronLeader();
+
 //--------------------------------------------------------------------------------------------------
 // YB Bitmap Scan Operations
 //--------------------------------------------------------------------------------------------------
@@ -221,8 +224,10 @@ YBCStatus YBCPgNewDropDBSequences(const YBCPgOid database_oid,
 YBCStatus YBCPgNewCreateDatabase(const char *database_name,
                                  YBCPgOid database_oid,
                                  YBCPgOid source_database_oid,
+                                 const char *source_database_name,
                                  YBCPgOid next_oid,
                                  const bool colocated,
+                                 const int64_t clone_time,
                                  YBCPgStatement *handle);
 YBCStatus YBCPgExecCreateDatabase(YBCPgStatement handle);
 
@@ -277,8 +282,9 @@ YBCStatus YBCPgNewCreateTable(const char *database_name,
                               YBCPgOid database_oid,
                               YBCPgOid table_relfilenode_oid,
                               bool is_shared_table,
+                              bool is_sys_catalog_table,
                               bool if_not_exist,
-                              bool add_primary_key,
+                              YBCPgYbrowidMode ybrowid_mode,
                               bool is_colocated_via_database,
                               YBCPgOid tablegroup_oid,
                               YBCPgOid colocation_id,
@@ -372,7 +378,7 @@ YBCStatus YBCGetSplitPoints(YBCPgTableDesc table_desc,
                             const YBCPgTypeEntity **type_entities,
                             YBCPgTypeAttrs *type_attrs_arr,
                             YBCPgSplitDatum *split_points,
-                            bool *has_null);
+                            bool *has_null, bool *has_gin_null);
 
 // INDEX -------------------------------------------------------------------------------------------
 // Create and drop index "database_name.schema_name.index_name()".
@@ -385,6 +391,7 @@ YBCStatus YBCPgNewCreateIndex(const char *database_name,
                               YBCPgOid index_relfilenode_oid,
                               YBCPgOid table_relfilenode_oid,
                               bool is_shared_index,
+                              bool is_sys_catalog_index,
                               bool is_unique_index,
                               const bool skip_index_backfill,
                               bool if_not_exist,
@@ -401,6 +408,8 @@ YBCStatus YBCPgCreateIndexAddColumn(YBCPgStatement handle, const char *attr_name
                                     bool is_desc, bool is_nulls_first);
 
 YBCStatus YBCPgCreateIndexSetNumTablets(YBCPgStatement handle, int32_t num_tablets);
+
+YBCStatus YBCPgCreateIndexSetVectorOptions(YBCPgStatement handle, YbPgVectorIdxOptions *options);
 
 YBCStatus YBCPgExecCreateIndex(YBCPgStatement handle);
 
@@ -433,8 +442,6 @@ YBCStatus YBCPgBackfillIndex(
 // - SELECT target_expr1, target_expr2, ...
 // - INSERT / UPDATE / DELETE ... RETURNING target_expr1, target_expr2, ...
 YBCStatus YBCPgDmlAppendTarget(YBCPgStatement handle, YBCPgExpr target);
-
-YBCStatus YBCPgDmlHasRegularTargets(YBCPgStatement handle, bool *has_targets);
 
 // Check if any statement target is a system column reference.
 YBCStatus YBCPgDmlHasSystemTargets(YBCPgStatement handle, bool *has_system_cols);
@@ -501,8 +508,9 @@ YBCStatus YBCPgDmlBindHashCodes(YBCPgStatement handle,
                                 YBCPgBoundType end_type, uint64_t end_value);
 
 // For parallel scan only, limit fetch to specified range of ybctids
-YBCStatus YBCPgDmlBindRange(YBCPgStatement handle, const char *start_value, size_t start_value_len,
-                            const char *end_value, size_t end_value_len);
+YBCStatus YBCPgDmlBindRange(YBCPgStatement handle,
+                            const char *lower_bound, size_t lower_bound_len,
+                            const char *upper_bound, size_t upper_bound_len);
 
 YBCStatus YBCPgDmlAddRowUpperBound(YBCPgStatement handle, int n_col_values,
                                     YBCPgExpr *col_values, bool is_inclusive);
@@ -517,6 +525,10 @@ YBCStatus YBCPgDmlBindTable(YBCPgStatement handle);
 YBCStatus YBCPgDmlAssignColumn(YBCPgStatement handle,
                                int attr_num,
                                YBCPgExpr attr_value);
+
+YBCStatus YBCPgDmlANNBindVector(YBCPgStatement handle, YBCPgExpr vector);
+
+YBCStatus YBCPgDmlANNSetPrefetchSize(YBCPgStatement handle, int prefetch_size);
 
 // This function is to fetch the targets in YBCPgDmlAppendTarget() from the rows that were defined
 // by YBCPgDmlBindColumn().
@@ -658,11 +670,13 @@ YBCStatus YBCPgRestartTransaction();
 YBCStatus YBCPgResetTransactionReadPoint();
 YBCStatus YBCPgRestartReadPoint();
 bool YBCIsRestartReadPointRequested();
-YBCStatus YBCPgCommitTransaction();
-YBCStatus YBCPgAbortTransaction();
+YBCStatus YBCPgCommitPlainTransaction();
+YBCStatus YBCPgAbortPlainTransaction();
 YBCStatus YBCPgSetTransactionIsolationLevel(int isolation);
 YBCStatus YBCPgSetTransactionReadOnly(bool read_only);
 YBCStatus YBCPgSetTransactionDeferrable(bool deferrable);
+YBCStatus YBCPgSetInTxnBlock(bool in_txn_blk);
+YBCStatus YBCPgSetReadOnlyStmt(bool read_only_stmt);
 YBCStatus YBCPgSetEnableTracing(bool tracing);
 YBCStatus YBCPgEnableFollowerReads(bool enable_follower_reads, int32_t staleness_ms);
 YBCStatus YBCPgEnterSeparateDdlTxnMode();
@@ -742,6 +756,12 @@ YBCStatus YBCPgForeignKeyReferenceCacheDelete(const YBCPgYBTupleIdDescriptor* de
 YBCStatus YBCForeignKeyReferenceExists(const YBCPgYBTupleIdDescriptor* descr, bool* res);
 YBCStatus YBCAddForeignKeyReferenceIntent(const YBCPgYBTupleIdDescriptor* descr,
                                           bool relation_is_region_local);
+
+// Explicit Row-level Locking.
+YBCStatus YBCAddExplicitRowLockIntent(
+    YBCPgOid table_relfilenode_oid, uint64_t ybctid,
+    YBCPgOid database_oid, const YBCPgExplicitRowLockParams *params, bool is_region_local);
+YBCStatus YBCFlushExplicitRowLockIntents();
 
 bool YBCIsInitDbModeEnvVarSet();
 
@@ -831,6 +851,7 @@ YBCStatus YBCGetTableKeyRanges(
 // Replication Slots.
 
 YBCStatus YBCPgNewCreateReplicationSlot(const char *slot_name,
+                                        const char *plugin_name,
                                         YBCPgOid database_oid,
                                         YBCPgReplicationSlotSnapshotAction snapshot_action,
                                         YBCPgStatement *handle);
@@ -871,6 +892,8 @@ YBCStatus YBCYcqlStatementStats(YCQLStatementStats** stats, size_t* num_stats);
 void YBCStoreTServerAshSamples(
     YBCAshAcquireBufferLock acquire_cb_lock_fn, YBCAshGetNextCircularBufferSlot get_cb_slot_fn,
     uint64_t sample_time);
+
+YBCStatus YBCLocalTablets(YBCPgTabletsDescriptor** tablets, size_t* count);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -24,9 +24,7 @@ Consider a setup where YugabyteDB is deployed across three zones in a single reg
 {{<nav/panels>}}
 {{<nav/panel name="local" active="true">}}
 <!-- local cluster setup instructions -->
-{{<collapse title="Setup a local cluster">}}
 {{<setup/local numnodes="3" rf="3" locations="aws.us-east.us-east-1a,aws.us-central.us-east-1b,aws.us-west.us-west-1c">}}
-{{</collapse>}}
 {{</nav/panel>}}
 
 {{<nav/panel name="anywhere">}} {{<setup/anywhere>}} {{</nav/panel>}}
@@ -49,9 +47,7 @@ Suppose one of your zones, us-east-1b, fails. In this case, the connections esta
 {{<collapse title="Simulate failure of a zone locally">}}
 To simulate the failure of the 2nd zone locally, you can just stop the second node.
 
-```bash
-./bin/yugabyted stop --base_dir=/tmp/ybd2
-```
+{{%cluster/cmd op="stop" nodes="2"%}}
 
 {{</collapse>}}
 {{</nav/panel>}}
@@ -85,7 +81,7 @@ In the illustration, you can see that one of the followers of the tablet B leade
 
 ## Cluster is fully functional
 
-Once new leaders have been elected, there are no leader-less tablets and the cluster becomes fully functional. There is no data loss as the follower that was elected as the leader has the latest data (guaranteed by RAFT replication). The recovery time is about 3s. But note that the cluster is now under-replicated because some of the followers are currently offline.
+Once new leaders have been elected, there are no leader-less tablets and the cluster becomes fully functional. There is no data loss as the follower that was elected as the leader has the latest data (guaranteed by Raft replication). The recovery time is about 3s. But note that the cluster is now under-replicated because some of the followers are currently offline.
 
 ![Back to normal](/images/explore/fault-tolerance/zone-failure-fully-functional.png)
 

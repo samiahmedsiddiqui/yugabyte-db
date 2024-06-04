@@ -110,6 +110,7 @@
 #include "yb/util/metric_entity.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/physical_time.h"
 #include "yb/util/result.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
@@ -118,6 +119,7 @@
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/strongly_typed_bool.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/cql/ql/ptree/pt_option.h"
 
@@ -208,6 +210,7 @@ using yb::master::ListTablesResponsePB_TableInfo;
 using yb::master::ListTabletServersRequestPB;
 using yb::master::ListTabletServersResponsePB;
 using yb::master::ListTabletServersResponsePB_Entry;
+using yb::master::MasterBackupProxy;
 using yb::master::MasterDdlProxy;
 using yb::master::MasterReplicationProxy;
 using yb::master::PlacementInfoPB;
@@ -218,8 +221,8 @@ using yb::master::RedisConfigSetResponsePB;
 using yb::master::ReplicationInfoPB;
 using yb::master::ReservePgsqlOidsRequestPB;
 using yb::master::ReservePgsqlOidsResponsePB;
-using yb::master::TabletLocationsPB;
 using yb::master::TableIdentifierPB;
+using yb::master::TabletLocationsPB;
 using yb::master::UpdateCDCStreamRequestPB;
 using yb::master::UpdateCDCStreamResponsePB;
 using yb::master::UpdateConsumerOnProducerSplitRequestPB;
@@ -228,6 +231,7 @@ using yb::master::WaitForYsqlBackendsCatalogVersionRequestPB;
 using yb::master::WaitForYsqlBackendsCatalogVersionResponsePB;
 using yb::rpc::Messenger;
 using yb::tserver::AllowSplitTablet;
+using yb::tserver::TabletConsensusInfoPB;
 
 using namespace yb::size_literals;  // NOLINT.
 
@@ -285,6 +289,10 @@ DEFINE_RUNTIME_uint32(ddl_verification_timeout_multiplier, 5,
     " default_admin_operation_timeout which is the timeout used for a single DDL operation ");
 
 TAG_FLAG(wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms, advanced);
+
+DEFINE_test_flag(int32, create_namespace_if_not_exist_inject_delay_ms, 0,
+                 "After checking a namespace does not exist, inject delay "
+                 "before creating the namespace.");
 
 namespace yb {
 namespace client {
@@ -925,39 +933,84 @@ Status YBClient::CreateNamespace(const std::string& namespace_name,
                                  const boost::optional<uint32_t>& next_pg_oid,
                                  const TransactionMetadata* txn,
                                  const bool colocated,
-                                 CoarseTimePoint deadline) {
-  CreateNamespaceRequestPB req;
-  CreateNamespaceResponsePB resp;
-  req.set_name(namespace_name);
-  if (!creator_role_name.empty()) {
-    req.set_creator_role_name(creator_role_name);
-  }
-  if (database_type) {
-    req.set_database_type(*database_type);
-  }
-  if (!namespace_id.empty()) {
-    req.set_namespace_id(namespace_id);
-  }
-  if (!source_namespace_id.empty()) {
-    req.set_source_namespace_id(source_namespace_id);
-  }
-  if (next_pg_oid) {
-    req.set_next_pg_oid(*next_pg_oid);
-  }
-  if (txn) {
-    txn->ToPB(req.mutable_transaction());
-  }
-  req.set_colocated(colocated);
-  deadline = PatchAdminDeadline(deadline);
-  RETURN_NOT_OK(data_->SyncLeaderMasterRpc(
-      deadline, req, &resp, "CreateNamespace", &MasterDdlProxy::CreateNamespaceAsync));
-  std::string cur_id = resp.has_id() ? resp.id() : namespace_id;
+                                 CoarseTimePoint deadline,
+                                 const std::optional<std::string> source_namespace_name,
+                                 std::optional<HybridTime> clone_time) {
+  // If source_namespace_name is template0 or template1 or not set, then initiate the typical create
+  // namespace request. Otherwise, initiate the clone request.
+  if (!source_namespace_name.has_value() || *source_namespace_name == "template0" ||
+      *source_namespace_name == "template1") {
+    CreateNamespaceRequestPB req;
+    CreateNamespaceResponsePB resp;
+    req.set_name(namespace_name);
+    if (!creator_role_name.empty()) {
+      req.set_creator_role_name(creator_role_name);
+    }
+    if (database_type) {
+      req.set_database_type(*database_type);
+    }
+    if (!namespace_id.empty()) {
+      req.set_namespace_id(namespace_id);
+    }
+    if (!source_namespace_id.empty()) {
+      req.set_source_namespace_id(source_namespace_id);
+    }
+    if (next_pg_oid) {
+      req.set_next_pg_oid(*next_pg_oid);
+    }
+    if (txn) {
+      txn->ToPB(req.mutable_transaction());
+    }
+    req.set_colocated(colocated);
+    deadline = PatchAdminDeadline(deadline);
+    RETURN_NOT_OK(data_->SyncLeaderMasterRpc(
+        deadline, req, &resp, "CreateNamespace", &MasterDdlProxy::CreateNamespaceAsync));
+    std::string cur_id = resp.has_id() ? resp.id() : namespace_id;
 
+    // Verify that the namespace we found is running so that, once this request returns,
+    // the client can send operations without receiving a "namespace not found" error.
+    RETURN_NOT_OK(data_->WaitForCreateNamespaceToFinish(
+        this, namespace_name, database_type, cur_id, deadline));
+  } else {
+    RETURN_NOT_OK(CloneNamespace(
+        namespace_name, source_namespace_name.value(),
+        database_type ? database_type.value() : YQL_DATABASE_PGSQL, clone_time));
+  }
+  return Status::OK();
+}
+
+Status YBClient::CloneNamespace(const std::string& target_namespace_name,
+                                const std::string& source_namespace_name,
+                                const YQLDatabase& database_type,
+                                std::optional<HybridTime> clone_time) {
+  LOG(INFO) << Format(
+      "Creating database $0 as clone of database $1", target_namespace_name, source_namespace_name);
+  auto clone_deadline = ToCoarse(MonoTime::Now() + FLAGS_ysql_clone_pg_schema_rpc_timeout_ms * 1ms);
+  master::CloneNamespaceRequestPB req;
+  master::CloneNamespaceResponsePB resp;
+  master::NamespaceIdentifierPB source_namespace;
+  source_namespace.set_name(source_namespace_name);
+  source_namespace.set_database_type(database_type);
+  *req.mutable_source_namespace() = source_namespace;
+  if (!clone_time) {
+    // Clone as of current time
+    clone_time = HybridTime::FromMicros(VERIFY_RESULT(WallClock()->Now()).time_point);
+  }
+  req.set_restore_ht(clone_time->ToUint64());
+  req.set_target_namespace_name(target_namespace_name);
+  // Set clone_deadline to ysql_clone_pg_schema_rpc_timeout_ms to give time to clone pg schema
+  // operation.
+  RETURN_NOT_OK(data_->SyncLeaderMasterRpc(
+      clone_deadline, req, &resp, "CloneNamespace", &MasterBackupProxy::CloneNamespaceAsync));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  uint32 seq_no = resp.seq_no();
+  string source_namespace_id = resp.source_namespace_id();
   // Verify that the namespace we found is running so that, once this request returns,
   // the client can send operations without receiving a "namespace not found" error.
-  RETURN_NOT_OK(data_->WaitForCreateNamespaceToFinish(
-      this, namespace_name, database_type, cur_id, deadline));
-
+  RETURN_NOT_OK(
+      data_->WaitForCloneNamespaceToFinish(this, source_namespace_id, seq_no, clone_deadline));
   return Status::OK();
 }
 
@@ -968,22 +1021,43 @@ Status YBClient::CreateNamespaceIfNotExists(const std::string& namespace_name,
                                             const std::string& source_namespace_id,
                                             const boost::optional<uint32_t>& next_pg_oid,
                                             const bool colocated) {
-  const auto namespace_exists = VERIFY_RESULT(
-      !namespace_id.empty() ? NamespaceIdExists(namespace_id)
-                            : NamespaceExists(namespace_name));
-  if (namespace_exists) {
-    // Verify that the namespace we found is running so that, once this request returns,
-    // the client can send operations without receiving a "namespace not found" error.
-    return data_->WaitForCreateNamespaceToFinish(this, namespace_name, database_type, namespace_id,
-        CoarseMonoClock::Now() + default_admin_operation_timeout());
-  }
+  bool retried = false;
+  while (true) {
+    const auto namespace_exists = VERIFY_RESULT(
+        !namespace_id.empty() ? NamespaceIdExists(namespace_id)
+                              : NamespaceExists(namespace_name));
+    if (namespace_exists) {
+      // Verify that the namespace we found is running so that, once this request returns,
+      // the client can send operations without receiving a "namespace not found" error.
+      return data_->WaitForCreateNamespaceToFinish(
+          this, namespace_name, database_type, namespace_id,
+          CoarseMonoClock::Now() + default_admin_operation_timeout());
+    } else if (FLAGS_TEST_create_namespace_if_not_exist_inject_delay_ms > 0) {
+      std::this_thread::sleep_for(FLAGS_TEST_create_namespace_if_not_exist_inject_delay_ms * 1ms);
+    }
 
-  Status s = CreateNamespace(namespace_name, database_type, creator_role_name, namespace_id,
-                             source_namespace_id, next_pg_oid, nullptr /* txn */, colocated);
-  if (s.IsAlreadyPresent() && database_type && *database_type == YQLDatabase::YQL_DATABASE_CQL) {
-    return Status::OK();
+    Status s = CreateNamespace(namespace_name, database_type, creator_role_name, namespace_id,
+                               source_namespace_id, next_pg_oid, nullptr /* txn */, colocated);
+
+    // Retain old behavior: return Status::OK() on s.IsAlreadyPresent() error for
+    // YQLDatabase::YQL_DATABASE_CQL database_type.
+    if (!s.IsAlreadyPresent() || !database_type) {
+      return s;
+    }
+    if (*database_type == YQLDatabase::YQL_DATABASE_CQL) {
+      return Status::OK();
+    }
+
+    // Do one time retry for YQL_DATABASE_PGSQL.
+    if (*database_type == YQLDatabase::YQL_DATABASE_PGSQL && !retried) {
+      // Sleep a bit before retrying.
+      std::this_thread::sleep_for(1000ms * kTimeMultiplier);
+      retried = true;
+    } else {
+      return s;
+    }
   }
-  return s;
+  return STATUS(RuntimeError, "Unreachable statement");
 }
 
 Status YBClient::IsCreateNamespaceInProgress(const std::string& namespace_name,
@@ -1429,45 +1503,12 @@ Status YBClient::DeleteUDType(const std::string& namespace_name,
   return Status::OK();
 }
 
-Result<xrepl::StreamId> YBClient::CreateCDCStream(
-    const TableId& table_id,
-    const std::unordered_map<std::string, std::string>& options,
-    bool active,
-    const xrepl::StreamId& db_stream_id) {
-  // Setting up request.
-  CreateCDCStreamRequestPB req;
-  req.set_table_id(table_id);
-  if (db_stream_id) {
-    req.set_db_stream_id(db_stream_id.ToString());
-  }
-  req.mutable_options()->Reserve(narrow_cast<int>(options.size()));
-  for (const auto& option : options) {
-    auto new_option = req.add_options();
-    new_option->set_key(option.first);
-    new_option->set_value(option.second);
-  }
-  req.set_initial_state(active ? master::SysCDCStreamEntryPB::ACTIVE
-                               : master::SysCDCStreamEntryPB::INITIATED);
-
-  CreateCDCStreamResponsePB resp;
-  CALL_SYNC_LEADER_MASTER_RPC_EX(Replication, req, resp, CreateCDCStream);
-  return xrepl::StreamId::FromString(resp.stream_id());
-}
-
-void YBClient::CreateCDCStream(
-    const TableId& table_id,
-    const std::unordered_map<std::string, std::string>& options,
-    cdc::StreamModeTransactional transactional,
-    CreateCDCStreamCallback callback) {
-  auto deadline = CoarseMonoClock::Now() + default_admin_operation_timeout();
-  data_->CreateCDCStream(this, table_id, options, transactional, deadline, callback);
-}
-
 Result<xrepl::StreamId> YBClient::CreateCDCSDKStreamForNamespace(
     const NamespaceId& namespace_id,
     const std::unordered_map<std::string, std::string>& options,
     bool populate_namespace_id_as_table_id,
     const ReplicationSlotName& replication_slot_name,
+    const std::optional<std::string>& replication_slot_plugin_name,
     const std::optional<CDCSDKSnapshotOption>& consistent_snapshot_option,
     CoarseTimePoint deadline,
     uint64_t *consistent_snapshot_time) {
@@ -1490,6 +1531,9 @@ Result<xrepl::StreamId> YBClient::CreateCDCSDKStreamForNamespace(
   }
   if (consistent_snapshot_option.has_value()) {
     req.set_cdcsdk_consistent_snapshot_option(*consistent_snapshot_option);
+  }
+  if (replication_slot_plugin_name.has_value()) {
+    req.set_cdcsdk_ysql_replication_slot_plugin_name(*replication_slot_plugin_name);
   }
 
   CreateCDCStreamResponsePB resp;
@@ -1780,40 +1824,6 @@ Status YBClient::BootstrapProducer(
   auto deadline = CoarseMonoClock::Now() + default_admin_operation_timeout();
   return data_->BootstrapProducer(
       this, db_type, namespace_name, pg_schema_names, table_names, deadline, std::move(callback));
-}
-
-Result<NamespaceId> YBClient::XClusterAddNamespaceToOutboundReplicationGroup(
-    const xcluster::ReplicationGroupId& replication_group_id, const NamespaceName& namespace_name) {
-  master::XClusterAddNamespaceToOutboundReplicationGroupRequestPB req;
-  req.set_replication_group_id(replication_group_id.ToString());
-  req.set_namespace_name(namespace_name);
-
-  master::XClusterAddNamespaceToOutboundReplicationGroupResponsePB resp;
-  CALL_SYNC_LEADER_MASTER_RPC_EX(
-      Replication, req, resp, XClusterAddNamespaceToOutboundReplicationGroup);
-
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
-  }
-
-  return resp.namespace_id();
-}
-
-Status YBClient::XClusterRemoveNamespaceFromOutboundReplicationGroup(
-    const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id) {
-  master::XClusterRemoveNamespaceFromOutboundReplicationGroupRequestPB req;
-  req.set_replication_group_id(replication_group_id.ToString());
-  req.set_namespace_id(namespace_id);
-
-  master::XClusterRemoveNamespaceFromOutboundReplicationGroupResponsePB resp;
-  CALL_SYNC_LEADER_MASTER_RPC_EX(
-      Replication, req, resp, XClusterRemoveNamespaceFromOutboundReplicationGroup);
-
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
-  }
-
-  return Status::OK();
 }
 
 Status YBClient::UpdateConsumerOnProducerSplit(
@@ -2329,13 +2339,6 @@ std::pair<RetryableRequestId, RetryableRequestId> YBClient::NextRequestIdAndMinR
   auto id = requests.request_id_seq++;
   requests.running_requests.insert(id);
   return std::make_pair(id, *requests.running_requests.begin());
-}
-
-Result<std::shared_ptr<internal::RemoteTabletServer>> YBClient::GetRemoteTabletServer(
-    const std::string& permanent_uuid) {
-  auto tserver = data_->meta_cache_->GetRemoteTabletServer(permanent_uuid);
-  RETURN_NOT_OK(tserver->InitProxy(this));
-  return tserver;
 }
 
 void YBClient::AddMetaCacheInfo(JsonWriter* writer) {
@@ -2945,6 +2948,20 @@ Result<master::StatefulServiceInfoPB> YBClient::GetStatefulServiceLocation(
 
 void YBClient::ClearAllMetaCachesOnServer() {
   data_->meta_cache_->ClearAll();
+}
+
+bool YBClient::RefreshTabletInfoWithConsensusInfo(
+    const tserver::TabletConsensusInfoPB& newly_received_info) {
+  auto status = data_->meta_cache_->RefreshTabletInfoWithConsensusInfo(newly_received_info);
+  if(!status.ok()) {
+    VLOG(1) << "Partially refreshing meta-cache for tablet failed because " << status;
+    return false;
+  }
+  return true;
+}
+
+int64_t YBClient::GetRaftConfigOpidIndex(const TabletId& tablet_id) {
+  return data_->meta_cache_->GetRaftConfigOpidIndex(tablet_id);
 }
 
 }  // namespace client

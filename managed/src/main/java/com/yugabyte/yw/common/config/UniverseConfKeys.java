@@ -80,15 +80,6 @@ public class UniverseConfKeys extends RuntimeConfigKeysModule {
           "The maximum time (in milliseconds) that we allow a tserver to be behind its peers",
           ConfDataType.IntegerType,
           ImmutableList.of(ConfKeyTags.PUBLIC));
-  // TODO(naorem): Add correct metadata
-  public static final ConfKeyInfo<Boolean> ybUpgradeVmImage =
-      new ConfKeyInfo<>(
-          "yb.upgrade.vmImage",
-          ScopeType.UNIVERSE,
-          "Upgrade VM Image",
-          "TODO - Leave this for feature owners to fill in",
-          ConfDataType.BooleanType,
-          ImmutableList.of(ConfKeyTags.BETA));
   // TODO(): Add correct metadata
   public static final ConfKeyInfo<Boolean> allowDowngrades =
       new ConfKeyInfo<>(
@@ -345,25 +336,23 @@ public class UniverseConfKeys extends RuntimeConfigKeysModule {
           "Time in seconds to wait for master leader before timeout for List tables API",
           ConfDataType.DurationType,
           ImmutableList.of(ConfKeyTags.PUBLIC));
-  // TODO(Shashank): Add correct metadata
   public static final ConfKeyInfo<Integer> slowQueryLimit =
       new ConfKeyInfo<>(
           "yb.query_stats.slow_queries.limit",
           ScopeType.UNIVERSE,
           "Slow Queries Limit",
-          "TODO - Leave this for feature owners to fill in",
+          "The number of queries to fetch.",
           ConfDataType.IntegerType,
-          ImmutableList.of(ConfKeyTags.BETA));
-  // TODO(Shashank): Add correct metadata
+          ImmutableList.of(ConfKeyTags.PUBLIC));
   public static final ConfKeyInfo<String> slowQueryOrderByKey =
       new ConfKeyInfo<>(
           "yb.query_stats.slow_queries.order_by",
           ScopeType.UNIVERSE,
           "Slow Queries Order By Key",
-          "TODO - Leave this for feature owners to fill in",
+          "We sort queries by this metric. Possible values: total_time, max_time, mean_time, rows,"
+              + " calls",
           ConfDataType.StringType,
-          ImmutableList.of(ConfKeyTags.BETA));
-  // TODO(Shashank): Add correct metadata
+          ImmutableList.of(ConfKeyTags.PUBLIC));
   public static final ConfKeyInfo<Boolean> setEnableNestloopOff =
       new ConfKeyInfo<>(
           "yb.query_stats.slow_queries.set_enable_nestloop_off",
@@ -373,16 +362,23 @@ public class UniverseConfKeys extends RuntimeConfigKeysModule {
               + "for slow queries. If true, it will be turned off and we expect better "
               + "performance.",
           ConfDataType.BooleanType,
-          ImmutableList.of(ConfKeyTags.BETA));
-  // TODO(Shashank)
+          ImmutableList.of(ConfKeyTags.PUBLIC));
   public static final ConfKeyInfo<List> excludedQueries =
       new ConfKeyInfo<>(
           "yb.query_stats.excluded_queries",
           ScopeType.UNIVERSE,
           "Excluded Queries",
-          "TODO - Leave this for feature owners to fill in",
+          "List of queries to exclude from slow queries.",
           ConfDataType.StringListType,
-          ImmutableList.of(ConfKeyTags.BETA));
+          ImmutableList.of(ConfKeyTags.PUBLIC));
+  public static final ConfKeyInfo<Integer> slowQueryLength =
+      new ConfKeyInfo<>(
+          "yb.query_stats.slow_queries.query_length",
+          ScopeType.UNIVERSE,
+          "Query character limit",
+          "Query character limit in slow queries.",
+          ConfDataType.IntegerType,
+          ImmutableList.of(ConfKeyTags.PUBLIC));
   public static final ConfKeyInfo<String> ansibleStrategy =
       new ConfKeyInfo<>(
           "yb.ansible.strategy",
@@ -1127,5 +1123,13 @@ public class UniverseConfKeys extends RuntimeConfigKeysModule {
           "Max master heartbeat delay",
           "Maximum value of heartbeat delay allowed before master is considered to have failed",
           ConfDataType.DurationType,
+          ImmutableList.of(ConfKeyTags.INTERNAL));
+  public static final ConfKeyInfo<Boolean> nodeAgentNodeActionUseJavaClient =
+      new ConfKeyInfo<>(
+          "yb.node_agent.node_action.use_java_client",
+          ScopeType.UNIVERSE,
+          "Use Node Agent Java Client for Node Actions",
+          "Use node agent java client to run node actions on the remote nodes",
+          ConfDataType.BooleanType,
           ImmutableList.of(ConfKeyTags.INTERNAL));
 }

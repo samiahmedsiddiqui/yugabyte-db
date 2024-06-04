@@ -19,11 +19,25 @@ On this page:
 
 ## Change log
 
+### April 22, 2024
+
+**New Features**
+
+- Support for incremental backups for faster backups with greater frequency. Incremental backups only include the data that has changed since the last backup, be it a full or incremental backup.
+- Ability to size each region in partition by region clusters to its load. Number of nodes, number of vCPUs, disk size, and IOPS can now be set independently for each region. Add extra horsepower in high-traffic regions, and provision lower-traffic regions with fewer nodes.
+
+### April 17, 2024
+
+**Database**
+
+- Ability to choose from different tracks for Sandbox clusters. Sandbox clusters now default to using the Innovation track; you can also choose the Preview track.
+- Innovation track updated to 2.18.7.0.
+
 ### February 28, 2024
 
 **Database**
 
-- Production track updated to 2.14.5.0.
+- Production track updated to 2.14.15.0.
 
 ### February 8, 2024
 

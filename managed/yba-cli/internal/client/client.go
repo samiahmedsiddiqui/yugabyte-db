@@ -99,7 +99,9 @@ func NewAuthAPIClientInitialize(url *url.URL, apiToken string) (*AuthAPIClient, 
 		cfg.Scheme = "http"
 	}
 
-	cfg.DefaultHeader = map[string]string{"X-AUTH-YW-API-TOKEN": apiToken}
+	cfg.DefaultHeader = map[string]string{
+		"X-AUTH-YW-API-TOKEN": apiToken,
+	}
 
 	apiClient := ybaclient.NewAPIClient(cfg)
 
@@ -195,7 +197,7 @@ func (a *AuthAPIClient) IsCLISupported() {
 	if !allowed {
 		errMessage := fmt.Sprintf(
 			"YugabyteDB Anywhere CLI is not supported for YugabyteDB Anywhere Host version %s. "+
-			"Please use a version greater than or equal to Stable: %s, Preview: %s\n",
+				"Please use a version greater than or equal to Stable: %s, Preview: %s\n",
 			version,
 			allowedVersions.Stable,
 			allowedVersions.Preview)

@@ -28,7 +28,9 @@ import {
   KEY_PAIR_MANAGEMENT_OPTIONS,
   NTPSetupType,
   ProviderCode,
-  VPCSetupType
+  ProviderOperation,
+  VPCSetupType,
+  AzuProviderCredentialType
 } from '../../constants';
 import { FieldGroup } from '../components/FieldGroup';
 import {
@@ -45,6 +47,7 @@ import { FormContainer } from '../components/FormContainer';
 import { ACCEPTABLE_CHARS } from '../../../../config/constants';
 import { FormField } from '../components/FormField';
 import { FieldLabel } from '../components/FieldLabel';
+import { SubmitInProgress } from '../components/SubmitInProgress';
 import { CreateInfraProvider } from '../../InfraProvider';
 import { RegionOperation } from '../configureRegion/constants';
 import { NTP_SERVER_REGEX } from '../constants';
@@ -73,11 +76,6 @@ interface AZUProviderCreateFormProps {
   onBack: () => void;
 }
 
-enum ProviderCredentialType {
-  HOST_INSTANCE_MI = 'hostInstanceMI',
-  SPECIFIED_SERVICE_PRINCIPAL = 'specifiedServicePrincipal'
-}
-
 export interface AZUProviderCreateFormFieldValues {
   azuClientId: string;
   azuClientSecret: string;
@@ -98,7 +96,7 @@ export interface AZUProviderCreateFormFieldValues {
   sshPrivateKeyContent: File;
   sshUser: string;
   imageBundles: ImageBundle[];
-  providerCredentialType: ProviderCredentialType;
+  providerCredentialType: AzuProviderCredentialType;
 }
 
 export const DEFAULT_FORM_VALUES: Partial<AZUProviderCreateFormFieldValues> = {
@@ -109,7 +107,7 @@ export const DEFAULT_FORM_VALUES: Partial<AZUProviderCreateFormFieldValues> = {
   regions: [] as CloudVendorRegionField[],
   sshKeypairManagement: KeyPairManagement.YBA_MANAGED,
   sshPort: DEFAULT_SSH_PORT,
-  providerCredentialType: ProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL
+  providerCredentialType: AzuProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL
 } as const;
 
 const VALIDATION_SCHEMA = object().shape({
@@ -121,7 +119,7 @@ const VALIDATION_SCHEMA = object().shape({
     ),
   azuClientId: string().required('Azure Client ID is required.'),
   azuClientSecret: mixed().when('providerCredentialType', {
-    is: ProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL,
+    is: AzuProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL,
     then: mixed().required('Azure Client Secret is required.')
   }),
   azuRG: string().required('Azure Resource Group is required.'),
@@ -158,6 +156,7 @@ export const AZUProviderCreateForm = ({
   const [isDeleteRegionModalOpen, setIsDeleteRegionModalOpen] = useState<boolean>(false);
   const [regionSelection, setRegionSelection] = useState<CloudVendorRegionField>();
   const [regionOperation, setRegionOperation] = useState<RegionOperation>(RegionOperation.ADD);
+  const [isValidationErrorExist, setValidationErrorExist] = useState(false);
   const { t } = useTranslation();
   const formMethods = useForm<AZUProviderCreateFormFieldValues>({
     defaultValues: DEFAULT_FORM_VALUES,
@@ -210,7 +209,11 @@ export const AZUProviderCreateForm = ({
     setIsRegionFormModalOpen(false);
   };
 
-  const onFormSubmit: SubmitHandler<AZUProviderCreateFormFieldValues> = async (formValues) => {
+  const onFormSubmit = async (
+    formValues: AZUProviderCreateFormFieldValues,
+    shouldValidate: boolean,
+    ignoreValidationErrors = false
+  ) => {
     if (formValues.ntpSetupType === NTPSetupType.SPECIFIED && !formValues.ntpServers.length) {
       formMethods.setError('ntpServers', {
         type: 'min',
@@ -220,11 +223,12 @@ export const AZUProviderCreateForm = ({
     }
 
     try {
+      setValidationErrorExist(false);
       const providerPayload = await constructProviderPayload(formValues);
       try {
         await createInfraProvider(providerPayload, {
-          shouldValidate: isValidationEnabled,
-          ignoreValidationErrors: false,
+          shouldValidate: shouldValidate,
+          ignoreValidationErrors: ignoreValidationErrors,
           mutateOptions: {
             onError: (err) => {
               handleFormSubmitServerError(
@@ -232,6 +236,7 @@ export const AZUProviderCreateForm = ({
                 formMethods,
                 AZURE_FORM_MAPPERS
               );
+              setValidationErrorExist(true);
             }
           }
         });
@@ -241,6 +246,16 @@ export const AZUProviderCreateForm = ({
     } catch (error: any) {
       toast.error(error.message ?? error);
     }
+  };
+
+  const onFormValidateAndSubmit: SubmitHandler<AZUProviderCreateFormFieldValues> = async (
+    formValues
+  ) => await onFormSubmit(formValues, isValidationEnabled);
+  const onFormForceSubmit: SubmitHandler<AZUProviderCreateFormFieldValues> = async (formValues) =>
+    await onFormSubmit(formValues, isValidationEnabled, true);
+
+  const skipValidationAndSubmit = () => {
+    onFormForceSubmit(formMethods.getValues());
   };
 
   const regions = formMethods.watch('regions', DEFAULT_FORM_VALUES.regions);
@@ -256,11 +271,11 @@ export const AZUProviderCreateForm = ({
 
   const credentialOptions: OptionProps[] = [
     {
-      value: ProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL,
+      value: AzuProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL,
       label: 'Specify Client Secret'
     },
     {
-      value: ProviderCredentialType.HOST_INSTANCE_MI,
+      value: AzuProviderCredentialType.HOST_INSTANCE_MI,
       label: `Use Managed Identity from this YBA host's instance`,
       disabled: hostInfoQuery.data === undefined || getYBAHost(hostInfoQuery.data) !== YBAHost.AZU
     }
@@ -280,7 +295,10 @@ export const AZUProviderCreateForm = ({
   return (
     <Box display="flex" justifyContent="center">
       <FormProvider {...formMethods}>
-        <FormContainer name="azuProviderForm" onSubmit={formMethods.handleSubmit(onFormSubmit)}>
+        <FormContainer
+          name="azuProviderForm"
+          onSubmit={formMethods.handleSubmit(onFormValidateAndSubmit)}
+        >
           <Typography variant="h3">Create Azure Provider Configuration</Typography>
           <FormField providerNameField={true}>
             <FieldLabel>Provider Name</FieldLabel>
@@ -316,7 +334,7 @@ export const AZUProviderCreateForm = ({
                   orientation={RadioGroupOrientation.HORIZONTAL}
                 />
               </FormField>
-              {providerCredentialType === ProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL && (
+              {providerCredentialType === AzuProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL && (
                 <>
                   <FormField>
                     <FieldLabel>Client Secret</FieldLabel>
@@ -414,12 +432,13 @@ export const AZUProviderCreateForm = ({
             >
               <RegionList
                 providerCode={ProviderCode.AZU}
+                providerOperation={ProviderOperation.CREATE}
                 regions={regions}
                 setRegionSelection={setRegionSelection}
                 showAddRegionFormModal={showAddRegionFormModal}
                 showEditRegionFormModal={showEditRegionFormModal}
                 showDeleteRegionModal={showDeleteRegionModal}
-                disabled={isFormDisabled}
+                isDisabled={isFormDisabled}
                 isError={!!formMethods.formState.errors.regions}
                 errors={formMethods.formState.errors.regions as any}
               />
@@ -431,8 +450,9 @@ export const AZUProviderCreateForm = ({
             </FieldGroup>
             <LinuxVersionCatalog
               control={formMethods.control as any}
-              providerType={CloudType.azu}
-              viewMode="CREATE"
+              providerType={ProviderCode.AZU}
+              providerOperation={ProviderOperation.CREATE}
+              isDisabled={isFormDisabled}
             />
             <FieldGroup heading="SSH Key Pairs">
               {sshConfigureMsg}
@@ -510,19 +530,30 @@ export const AZUProviderCreateForm = ({
               </FormField>
             </FieldGroup>
             {(formMethods.formState.isValidating || formMethods.formState.isSubmitting) && (
-              <Box display="flex" gridGap="5px" marginLeft="auto">
-                <CircularProgress size={16} color="primary" thickness={5} />
-              </Box>
+              <SubmitInProgress isValidationEnabled={isValidationEnabled} />
             )}
           </Box>
           <Box marginTop="16px">
             <YBButton
-              btnText="Create Provider Configuration"
+              btnText={
+                isValidationEnabled
+                  ? 'Validate and Save Configuration'
+                  : 'Create Provider Configuration'
+              }
               btnClass="btn btn-default save-btn"
               btnType="submit"
               disabled={isFormDisabled || formMethods.formState.isValidating}
               data-testid={`${FORM_NAME}-SubmitButton`}
             />
+            {isValidationEnabled && isValidationErrorExist && (
+              <YBButton
+                btnText="Ignore and save provider configuration anyway"
+                btnClass="btn btn-default float-right mr-10"
+                onClick={skipValidationAndSubmit}
+                disabled={isFormDisabled || formMethods.formState.isValidating}
+                data-testid={`${FORM_NAME}-IgnoreAndSave`}
+              />
+            )}
             <YBButton
               btnText="Back"
               btnClass="btn btn-default"
@@ -587,7 +618,7 @@ const constructProviderPayload = async (
         [ProviderCode.AZU]: {
           azuClientId: formValues.azuClientId,
           ...(formValues.providerCredentialType ===
-            ProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL && {
+            AzuProviderCredentialType.SPECIFIED_SERVICE_PRINCIPAL && {
             azuClientSecret: formValues.azuClientSecret
           }),
           ...(formValues.azuHostedZoneId && { azuHostedZoneId: formValues.azuHostedZoneId }),

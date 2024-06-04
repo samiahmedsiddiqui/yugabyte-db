@@ -68,7 +68,7 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
     UserIntent userIntent = new UserIntent();
     userIntent.numNodes = numNodes;
     userIntent.provider = defaultProvider.getUuid().toString();
-    userIntent.ybSoftwareVersion = "yb-version";
+    userIntent.ybSoftwareVersion = "2.8.1.0-b1";
     userIntent.accessKeyCode = "demo-access";
     userIntent.replicationFactor = replicationFactor;
     userIntent.regionList = ImmutableList.of(region.getUuid());
@@ -135,12 +135,12 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
       when(mockClient.setFlag(any(), any(), any(), anyBoolean())).thenReturn(true);
       when(mockClient.waitForMaster(any(), anyLong())).thenReturn(true);
       when(mockClient.getLeaderMasterHostAndPort())
-          .thenReturn(HostAndPort.fromParts("1.1.1.1", 1234));
+          .thenReturn(HostAndPort.fromParts("10.0.0.1", 1234));
       setMockLiveTabletServers();
     } catch (Exception e) {
       fail();
     }
-
+    setDumpEntitiesMock(defaultUniverse, "", false);
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     mockWaits(mockClient, 3);
     UniverseModifyBaseTest.mockGetMasterRegistrationResponse(

@@ -73,14 +73,18 @@ PgCreateDatabase::PgCreateDatabase(PgSession::ScopedRefPtr pg_session,
                                    const char *database_name,
                                    const PgOid database_oid,
                                    const PgOid source_database_oid,
+                                   const char* source_database_name,
                                    const PgOid next_oid,
+                                   const int64_t clone_time,
                                    const bool colocated)
     : PgDdl(std::move(pg_session)) {
   req_.set_database_name(database_name);
   req_.set_database_oid(database_oid);
   req_.set_source_database_oid(source_database_oid);
+  req_.set_source_database_name(source_database_name);
   req_.set_next_oid(next_oid);
   req_.set_colocated(colocated);
+  req_.set_clone_time(clone_time);
 }
 
 PgCreateDatabase::~PgCreateDatabase() {
@@ -170,8 +174,9 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
                              const char *table_name,
                              const PgObjectId& table_id,
                              bool is_shared_table,
+                             bool is_sys_catalog_table,
                              bool if_not_exist,
-                             bool add_primary_key,
+                             PgYbrowidMode ybrowid_mode,
                              bool is_colocated_via_database,
                              const PgObjectId& tablegroup_oid,
                              const ColocationId colocation_id,
@@ -185,8 +190,7 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
   req_.set_database_name(database_name);
   req_.set_table_name(table_name);
   req_.set_num_tablets(-1);
-  req_.set_is_pg_catalog_table(strcmp(schema_name, "pg_catalog") == 0 ||
-                               strcmp(schema_name, "information_schema") == 0);
+  req_.set_is_pg_catalog_table(is_sys_catalog_table);
   req_.set_is_shared_table(is_shared_table);
   req_.set_if_not_exist(if_not_exist);
   req_.set_is_colocated_via_database(is_colocated_via_database);
@@ -202,14 +206,15 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
   req_.set_is_truncate(is_truncate);
 
   // Add internal primary key column to a Postgres table without a user-specified primary key.
-  if (add_primary_key) {
-    // For regular user table, ybrowid should be a hash key because ybrowid is a random uuid.
-    // For colocated or sys catalog table, ybrowid should be a range key because they are
-    // unpartitioned tables in a single tablet.
-    bool is_hash =
-        !req_.is_pg_catalog_table() && !is_colocated_via_database && !tablegroup_oid.IsValid();
-    CHECK_OK(AddColumn("ybrowid", static_cast<int32_t>(PgSystemAttrNum::kYBRowId),
-                       YB_YQL_DATA_TYPE_BINARY, is_hash, true /* is_range */));
+  switch (ybrowid_mode) {
+    case PG_YBROWID_MODE_NONE:
+      return;
+    case PG_YBROWID_MODE_HASH: FALLTHROUGH_INTENDED;
+    case PG_YBROWID_MODE_RANGE:
+      bool is_hash = ybrowid_mode == PG_YBROWID_MODE_HASH;
+      CHECK_OK(AddColumn("ybrowid", static_cast<int32_t>(PgSystemAttrNum::kYBRowId),
+                         YB_YQL_DATA_TYPE_BINARY, is_hash, true /* is_range */));
+      break;
   }
 }
 
@@ -240,6 +245,16 @@ Status PgCreateTable::SetNumTablets(int32_t num_tablets) {
   }
 
   req_.set_num_tablets(num_tablets);
+  return Status::OK();
+}
+
+Status PgCreateTable::SetVectorOptions(YbPgVectorIdxOptions *options) {
+  auto options_pb = req_.mutable_vector_idx_options();
+  options_pb->set_dist_type(static_cast<PgVectorDistanceType>(options->dist_type));
+  options_pb->set_idx_type(static_cast<PgVectorIndexType>(options->idx_type));
+  options_pb->set_dimensions(options->dimensions);
+
+  req_.set_is_unique_index(false);
   return Status::OK();
 }
 
@@ -469,11 +484,13 @@ Status PgDropDBSequences::Exec() {
 
 PgCreateReplicationSlot::PgCreateReplicationSlot(PgSession::ScopedRefPtr pg_session,
                                                  const char *slot_name,
+                                                 const char *plugin_name,
                                                  PgOid database_oid,
                                                  YBCPgReplicationSlotSnapshotAction snapshot_action)
     : PgDdl(pg_session) {
   req_.set_database_oid(database_oid);
   req_.set_replication_slot_name(slot_name);
+  req_.set_output_plugin_name(plugin_name);
 
   switch (snapshot_action) {
     case YB_REPLICATION_SLOT_NOEXPORT_SNAPSHOT:

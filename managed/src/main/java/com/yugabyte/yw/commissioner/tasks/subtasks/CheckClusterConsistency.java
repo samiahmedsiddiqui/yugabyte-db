@@ -14,6 +14,7 @@ import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -66,15 +67,32 @@ public class CheckClusterConsistency extends ServerSubTaskBase {
       log.debug("Skipping check for ybm");
       return;
     }
+    String softwareVersion =
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.ybSoftwareVersion;
+    if (CommonUtils.isReleaseBefore(CommonUtils.MIN_LIVE_TABLET_SERVERS_RELEASE, softwareVersion)) {
+      log.debug("ListLiveTabletServers is not supported for {} version", softwareVersion);
+      return;
+    }
+    String runtimeConfigInfo =
+        "Please contact Yugabyte Support. To override"
+            + " this check (not recommended), briefly disable the runtime config "
+            + UniverseConfKeys.verifyClusterStateBeforeTask.getKey()
+            + ".";
     try (YBClient ybClient = ybService.getClient(masterAddresses, certificate)) {
       errors = doCheckServers(ybClient, universe, cloudEnabled);
     } catch (Exception e) {
-      throw new RuntimeException("Failed to compare current state", e);
+      throw new RuntimeException(
+          "Unable to verify cluster consistency (CheckClusterConsistency). "
+              + runtimeConfigInfo
+              + " Encountered error: "
+              + e);
     }
     if (!errors.isEmpty()) {
       throw new PlatformServiceException(
           BAD_REQUEST,
-          "Current cluster state doesn't correspond to desired state: "
+          "YBA metadata seems inconsistent with actual universe state. "
+              + runtimeConfigInfo
+              + " Error list: "
               + errors.stream().collect(Collectors.joining(",")));
     }
   }

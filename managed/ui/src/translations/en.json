@@ -53,8 +53,12 @@
       "failedToFetchTargetUniverse": "Unable to fetch universe details for target universe UUID: {{universeUuid}}",
       "failedToFetchDrPrimaryUniverse": "Unable to fetch universe details for DR primary universe UUID: {{universeUuid}}",
       "failedToFetchDrReplicaUniverse": "Unable to fetch universe details for DR replica universe UUID: {{universeUuid}}",
-      "failedToFetchTargetUniverseNamespaces": "Unable to fetch namespaces for target universe UUID: {{}}",
-      "failedToFetchDrReplicaNamespaces": "Unable to fetch namespaces for DR replica universe UUID: {{}}",
+      "failedToFetchSourceUniverseNamespaces": "Unable to fetch namespaces for source universe UUID: {{universeUuid}}",
+      "failedToFetchDrPrimaryNamespaces": "Unable to fetch namespaces for DR primary universe UUID: {{universeUuid}}",
+      "failedToFetchTargetUniverseNamespaces": "Unable to fetch namespaces for target universe UUID: {{universeUuid}}",
+      "failedToFetchDrReplicaNamespaces": "Unable to fetch namespaces for DR replica universe UUID: {{universeUuid}}",
+      "failedToFetchSourceUniverseTables": "Unable to fetch tables for source universe UUID: {{universeUuid}}",
+      "failedToFetchDrPrimaryTables": "Unable to fetch tables for DR primary universe UUID: {{universeUuid}}",
       "failedToFetchMetrics": "Failed to fetch metrics.",
       "failedToFetchAlertTemplates": "Failed to fetch alert templates.",
       "failedToFetchAlertConfigs": "Failed to fetch alert configurations.",
@@ -760,8 +764,11 @@
             "drConfigTabs": "DR Config Tabs"
           },
           "tab": {
-            "metrics": "Metrics",
-            "tables": "Tables"
+            "metrics": {
+              "label": "Metrics",
+              "metricsUnavailableDuringFailover": "Metrics are unavailable during failover."
+            },
+            "tables": { "label": "Tables" }
           },
           "status": {
             "Initializing": "Initializing",
@@ -842,7 +849,7 @@
               },
               "confirmAlert": {
                 "instruction": "Confirm alert threshold for acceptable replication lag",
-                "infoText": "Replication lag measures how far behind in time the DR replica lags the DR primary. In a failover scenario, the longer the lag, the more data is at risk of being lost. To be notified if the lag exceeds a specific threshold so that you can take remedial measures, set a Universe alert for Replication Lag. Learn More",
+                "infoText": "Replication lag measures how far behind in time the DR replica lags the DR primary. In a failover scenario, the longer the lag, the more data is at risk of being lost. To be notified if the lag exceeds a specific threshold so that you can take remedial measures, set a Universe alert for Replication Lag. <configureReplicationLagAlertDocLink>Learn More</configureReplicationLagAlertDocLink>",
                 "currentLowestReplicationLagLabel": "Lowest replication lag alert threshold on this DR primary universe ({{sourceUniverseName}}):",
                 "setUpReplicationLagAlertPrompt": "<paragraph>This DR primary universe does not have any replication lag alert configured. <manageAlertConfigLink>Configure an alert</manageAlertConfigLink></paragraph>",
                 "editReplicationLagAlertPrompt": "<manageAlertConfigLink>Change this alert</manageAlertConfigLink>",
@@ -918,12 +925,12 @@
           },
           "editTablesModal": {
             "title": "Select Databases and Tables",
-            "instruction": {
-              "dr": "Select the tables to enable disaster recovery for",
-              "xCluster": "Select the tables to enable xCluster replication for"
-            },
             "step": {
               "selectTables": {
+                "instruction": {
+                  "dr": "Select the tables to enable disaster recovery for",
+                  "xCluster": "Select the tables to enable xCluster replication for"
+                },
                 "nextButton": "Next: Confirm Full Copy"
               },
               "configureBootstrap": {
@@ -947,7 +954,6 @@
               "requestFailureLabel": "Edit tables request failed",
               "taskFailure": "Edit tables task failed.",
               "fetchSourceUniverseDetailsFailure": "Failed to fetch source universe details.",
-              "undefinedXClusterTableType": "The tables in this config have unknown or mixed type.",
               "undefinedSourceUniverseUuid": "The xCluster config does not have an associated source universe.",
               "undefinedTargetUniverseUuid": "The xCluster config does not have an assoicated target universe."
             },
@@ -970,11 +976,26 @@
           },
           "configureReplicationLagAlert": "Max acceptable lag time"
         },
+        "config": {
+          "tableStatus": {
+            "Running": "Operational",
+            "Warning": "Warning",
+            "Failed": "Failed",
+            "Error": "Error",
+            "Updating": "In Progress",
+            "Validated": "Validated",
+            "Bootstrapping": "Bootstrapping",
+            "UnableToFetch": "Unable to Fetch",
+            "Dropped": "Dropped from DB"
+          }
+        },
         "selectTable": {
           "selectionDescriptorDr": "List of databases and tables in the DR primary universe.",
           "selectionDescriptorXCluster": "List of databases and tables in the source universe.",
           "tableSelectionCount": "{{selectedTableCount}} out of {{availableTableCount}} table(s) selected",
           "databaseSelectionCount": "{{selectedDatabaseCount}} out of {{availableDatabaseCount}} database(s) selected",
+          "droppedTablesInfoTextDr": "<bold>{{droppedTableCount}}</bold> table(s) in the xCluster DR configuration have been dropped on the DR primary univese. These table(s) will be removed from the configuration upon submission of this select table request.",
+          "droppedTablesInfoTextXCluster": "<bold>{{droppedTableCount}}</bold> table(s) in the xCluster replication configuration have been dropped on the source universe. These tables will be removed from the configuration upon submission of this select table request.",
           "matchingTableNoteDr": "<bold>Note!</bold> To avoid creating unnecessary full copies for selected databases, ensure the corresponding databases on the DR replica contain the same tables as in the DR primary.",
           "matchingTableNoteXCluster": "<bold>Note!</bold> To avoid creating unnecessary full copies for selected databases, ensure the corresponding databases on the target universe contain the same tables as in the source universe.",
           "error": {
@@ -1029,7 +1050,7 @@
           "lowestReplicationLagAlertThresholdLabel": "Lowest Replication Lag Alert Threshold"
         },
         "error": {
-          "undefinedXClusterTableType": "The tables in this config have unknown or mixed type.",
+          "undefinedXClusterTableType": "Unable to determine the table type of the current xCluster configuration. Please ensure the source universe is reachable and contains at least one table among those configured for xCluster replication.",
           "undefinedSourceUniverseUuid": "The xCluster config does not have an associated source universe.",
           "undefinedTargetUniverseUuid": "The xCluster config does not have an assoicated target universe.",
           "failedToFindSourceUniverse": "Unable to find a universe with the source universe UUID: {{universeUuid}}",
@@ -1648,18 +1669,18 @@
       }
     },
     "releases": {
-      "headerTitle": "Releases",
+      "headerTitle": "YugabyteDB Releases",
       "tag": "Tag",
       "tags": {
-        "LINUX": "Linux",
+        "LINUX": "VMs",
         "KUBERNETES": "Kubernetes",
         "x86_64": "VM x86",
         "aarch64": "VM ARM",
         "kubernetes": "Kubernetes"
       },
       "state": {
-        "active": "Active",
-        "disabled": "Disabled",
+        "active": "Allowed",
+        "disabled": "Not Allowed",
         "Incomplete": "Incomplete"
       },
       "type": {
@@ -1668,6 +1689,8 @@
         "PREVIEW (DEFAULT)": "PREVIEW",
         "PREVIEW": "PREVIEW"
       },
+      "fileUploadLabel": "File Upload",
+      "urlLabel": "URL",
       "fetchMetadata": "Fetch Metadata",
       "bannerFileUploadMessage": "Fetching artifacts may take some time. please wait for it to finish and then add the release",
       "genericError": "Failed to fetch list of releases",
@@ -1681,10 +1704,10 @@
       "releaseDate": "Release Date",
       "releaseDetails": "Release Details",
       "releaseNote": "Release Note",
-      "releaseSupport": "Release Support",
+      "releaseSupport": "Release Type",
       "releaseUsage": "Usage",
-      "enableDeployment": "Enable Deployment",
-      "disableDeployment": "Disable Deployment",
+      "enableDeployment": "Allow Deployment",
+      "disableDeployment": "Disallow Deployment",
       "importArchitecture": "Imported Architecture",
       "releaseDeployment": "Deployment",
       "deploymentType": "Deployment Type",
@@ -1700,6 +1723,7 @@
         "importMethod": "Import Method",
         "location": "Location"
       },
+      "disableActionsTooltipMessage": "This action is disabled as this release is currently used by one or multiple universes",
       "incompleteTooltipMessage": "Kubernetes (Helm) artifacts require a YugabyteDB build before the release can be used. Please select Add Architecture and upload the appropriate release *.tar.gz file.",
       "allowedReleases": "Show only allowed releases",
       "releaseType": "Release Type:",
@@ -1708,13 +1732,13 @@
       "inUseUniverses": "In-Use Universes",
       "notInUse": "Not in Use",
       "reviewReleaseMetadataSection": {
-        "viewReleaseDetails": "View Release Details",
+        "viewReleaseDetails": "Review Release Details",
         "version": "VERSION",
         "deploymentType": "DEPLOYMENT TYPE",
         "architecture": "ARCHITECTURE",
-        "releaseSupport": "RELEASE SUPPORT",
+        "releaseSupport": "RELEASE TYPE",
         "releaseDate": "RELEASE DATE",
-        "unableFetchRelease": "Unable to fetch release details.Provide the following information"
+        "unableFetchRelease": "Unable to fetch release details. Provide the following information"
       },
       "editArchitectureModal": {
         "uploadDBInstaller": "Upload Database Installer(Linux) or helm chart (Kubernetes)",
@@ -1735,7 +1759,8 @@
         "updateArtifactsFailure": "Failed to update release artifacts",
         "extractMetadataFileSuccess": "Extracted metadata from file successfully",
         "extractMetadataFileFailure": "Failed to extract metadata from the file",
-        "extractMetadataUrlFailure": "Failed to extract metadata from URL"
+        "extractMetadataUrlFailure": "Failed to extract metadata from URL",
+        "urlTooltipText": "Choose the URL option if the installation package is hosted on either an internal server or a public S3 bucket."
       },
       "disableReleaseModal": {
         "disableMessage": "Are you sure you want to {{release_status}} the release {{release_version}}?",

@@ -38,8 +38,8 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 
-#include "yb/cdc/cdc_service.h"
-
+#include "yb/cdc/xcluster_util.h"
+#include "yb/client/xcluster_client.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/json_util.h"
 
@@ -1521,15 +1521,18 @@ Status clone_namespace_action(
   return Status::OK();
 }
 
-const auto is_clone_done_args = "<source_namespace_id> <seq_no>";
-Status is_clone_done_action(
+const auto list_clones_args = "<source_namespace_id> [<seq_no>]";
+Status list_clones_action(
     const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
-  RETURN_NOT_OK(CheckArgumentsCount(args.size(), 2, 2));
+  RETURN_NOT_OK(CheckArgumentsCount(args.size(), 1, 2));
 
   auto source_namespace_id = args[0];
-  uint32_t seq_no = narrow_cast<uint32_t>(std::stoul(args[1]));
+  std::optional<uint32_t> seq_no;
+  if (args.size() >= 2) {
+    seq_no = narrow_cast<uint32_t>(std::stoul(args[1]));
+  }
 
-  return PrintJsonResult(client->IsCloneDone(source_namespace_id, seq_no));
+  return PrintJsonResult(client->ListClones(source_namespace_id, seq_no));
 }
 
 const auto edit_snapshot_schedule_args =
@@ -1800,19 +1803,6 @@ Status write_universe_key_to_file_action(
   return Status::OK();
 }
 
-const auto create_cdc_stream_args = "<table_id>";
-Status create_cdc_stream_action(
-    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
-  if (args.size() < 1) {
-    return ClusterAdminCli::kInvalidArguments;
-  }
-  const string table_id = args[0];
-  RETURN_NOT_OK_PREPEND(
-      client->CreateCDCStream(table_id),
-      Format("Unable to create CDC stream for table $0", table_id));
-  return Status::OK();
-}
-
 const auto create_change_data_stream_args =
    "<namespace> [<checkpoint_type>] [<record_type>] [<consistent_snapshot_option>]";
 Status create_change_data_stream_action(
@@ -2026,7 +2016,8 @@ const auto alter_universe_replication_args =
     "add_table [<comma_separated_list_of_table_ids>] "
     "[<comma_separated_list_of_producer_bootstrap_ids>] | "
     "remove_table [<comma_separated_list_of_table_ids>] [ignore-errors] | "
-    "rename_id <new_producer_universe_id>)";
+    "rename_id <new_producer_universe_id> | "
+    "remove_namespace <source_namespace_id>)";
 Status alter_universe_replication_action(
     const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
   if (args.size() < 3 || args.size() > 4) {
@@ -2043,6 +2034,7 @@ Status alter_universe_replication_action(
   vector<string> bootstrap_ids_to_add;
   string new_replication_group_id = "";
   bool remove_table_ignore_errors = false;
+  NamespaceId source_namespace_to_remove;
 
   vector<string> newElem, *lst;
   if (args[1] == "set_master_addresses") {
@@ -2057,6 +2049,9 @@ Status alter_universe_replication_action(
   } else if (args[1] == "rename_id") {
     lst = nullptr;
     new_replication_group_id = args[2];
+  } else if (args[1] == "remove_namespace") {
+    lst = nullptr;
+    source_namespace_to_remove = args[2];
   } else {
     return ClusterAdminCli::kInvalidArguments;
   }
@@ -2073,7 +2068,7 @@ Status alter_universe_replication_action(
   RETURN_NOT_OK_PREPEND(
       client->AlterUniverseReplication(
           replication_group_id, master_addresses, add_tables, remove_tables, bootstrap_ids_to_add,
-          new_replication_group_id, remove_table_ignore_errors),
+          new_replication_group_id, source_namespace_to_remove, remove_table_ignore_errors),
       Format("Unable to alter replication for universe $0", replication_group_id));
 
   return Status::OK();
@@ -2258,7 +2253,7 @@ Status get_xcluster_safe_time_action(
   return PrintJsonResult(client->GetXClusterSafeTime(include_lag_and_skew));
 }
 
-const auto create_xcluster_checkpoint_args = "<replication_group_id> <database_names>";
+const auto create_xcluster_checkpoint_args = "<replication_group_id> <namespace_names>";
 Status create_xcluster_checkpoint_action(
     const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
   if (args.size() != 2) {
@@ -2268,13 +2263,16 @@ Status create_xcluster_checkpoint_action(
   auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
   std::vector<NamespaceName> namespace_names;
   boost::split(namespace_names, args[1], boost::is_any_of(","));
+  std::vector<NamespaceName> namespace_ids;
 
-  auto namespace_ids =
-      VERIFY_RESULT(client->CheckpointXClusterReplication(replication_group_id, namespace_names));
+  for (const auto& namespace_name : namespace_names) {
+    const auto& namespace_info = VERIFY_RESULT_REF(
+        client->GetNamespaceInfo(YQLDatabase::YQL_DATABASE_PGSQL, namespace_name));
+    namespace_ids.push_back(namespace_info.id());
+  }
 
-  SCHECK_EQ(
-      namespace_ids.size(), namespace_names.size(), IllegalState,
-      "Number of namespace ids does not match number of namespace names");
+  RETURN_NOT_OK(
+      client->XClusterClient().CreateOutboundReplicationGroup(replication_group_id, namespace_ids));
 
   std::cout << "Waiting for checkpointing of database(s) to complete" << std::endl << std::endl;
 
@@ -2311,7 +2309,7 @@ Status create_xcluster_checkpoint_action(
   return Status::OK();
 }
 
-const auto is_xcluster_bootstrap_required_args = "<replication_group_id> <database_names>";
+const auto is_xcluster_bootstrap_required_args = "<replication_group_id> <namespace_names>";
 Status is_xcluster_bootstrap_required_action(
     const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
   if (args.size() != 2) {
@@ -2347,7 +2345,8 @@ Status setup_xcluster_replication_action(
 
   auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
 
-  RETURN_NOT_OK(client->CreateXClusterReplication(replication_group_id, args[1]));
+  RETURN_NOT_OK(client->XClusterClient().CreateXClusterReplicationFromCheckpoint(
+      replication_group_id, args[1]));
 
   RETURN_NOT_OK(client->WaitForCreateXClusterReplication(replication_group_id, args[1]));
 
@@ -2357,19 +2356,277 @@ Status setup_xcluster_replication_action(
   return Status::OK();
 }
 
-const auto drop_xcluster_replication_args = "<replication_group_id>";
+const auto drop_xcluster_replication_args = "<replication_group_id> [<target_master_addresses>]";
 Status drop_xcluster_replication_action(
     const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
-  if (args.size() != 1) {
+  if (args.size() != 1 && args.size() != 2) {
     return ClusterAdminCli::kInvalidArguments;
   }
 
   auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
 
-  RETURN_NOT_OK(client->DeleteXClusterOutboundReplicationGroup(replication_group_id));
+  std::string target_master_addresses;
+  if (args.size() == 2) {
+    target_master_addresses = args[1];
+  }
+
+  RETURN_NOT_OK(client->XClusterClient().DeleteOutboundReplicationGroup(
+      replication_group_id, target_master_addresses));
 
   std::cout << "Outbound xCluster Replication group " << replication_group_id
             << " deleted successfully" << endl;
+
+  return Status::OK();
+}
+
+const auto add_namespace_to_xcluster_checkpoint_args = "<replication_group_id> <namespace_name>";
+Status add_namespace_to_xcluster_checkpoint_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 2) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  const auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto& namespace_name = args[1];
+  const auto& namespace_info =
+      VERIFY_RESULT_REF(client->GetNamespaceInfo(YQLDatabase::YQL_DATABASE_PGSQL, namespace_name));
+  const auto& namespace_id = namespace_info.id();
+
+  RETURN_NOT_OK(client->XClusterClient().AddNamespaceToOutboundReplicationGroup(
+      replication_group_id, namespace_id));
+
+  std::cout << "Waiting for checkpointing of database to complete" << std::endl << std::endl;
+
+  auto is_bootstrap_required =
+      VERIFY_RESULT(client->IsXClusterBootstrapRequired(replication_group_id, namespace_id));
+
+  std::cout << "Successfully checkpointed database " << namespace_name
+            << " for xCluster replication group " << replication_group_id << std::endl
+            << std::endl;
+
+  std::cout << "Bootstrap is " << (is_bootstrap_required ? "" : "not ")
+            << "required for adding database to xCluster replication" << std::endl;
+
+  if (is_bootstrap_required) {
+    std::cout
+        << "Perform a distributed Backup of the database and Restore it on the target universe";
+  } else {
+    std::cout
+        << "Create equivalent YSQL objects (schemas, tables, indexes, ...) for the database in "
+           "the target universe";
+  }
+
+  std::cout << std::endl
+            << "After completing the above step run `add_namespace_to_xcluster_replication`"
+            << std::endl;
+
+  return Status::OK();
+}
+
+const auto add_namespace_to_xcluster_replication_args =
+    "<replication_group_id> <namespace_name> <target_master_addresses>";
+Status add_namespace_to_xcluster_replication_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 3) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto& namespace_info =
+      VERIFY_RESULT_REF(client->GetNamespaceInfo(YQLDatabase::YQL_DATABASE_PGSQL, args[1]));
+
+  const auto& target_master_addresses = args[2];
+
+  RETURN_NOT_OK(client->XClusterClient().AddNamespaceToXClusterReplication(
+      replication_group_id, target_master_addresses, namespace_info.id()));
+
+  RETURN_NOT_OK(
+      client->WaitForAlterXClusterReplication(replication_group_id, target_master_addresses));
+
+  std::cout << "Successfully added " << namespace_info.name() << " to xCluster Replication group "
+            << replication_group_id << endl;
+
+  return Status::OK();
+}
+
+const auto remove_namespace_from_xcluster_replication_args =
+    "<replication_group_id> <namespace_name> [<target_master_addresses>]";
+Status remove_namespace_from_xcluster_replication_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 2 && args.size() != 3) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto& namespace_info =
+      VERIFY_RESULT_REF(client->GetNamespaceInfo(YQLDatabase::YQL_DATABASE_PGSQL, args[1]));
+
+  std::string target_master_addresses;
+  if (args.size() == 3) {
+    target_master_addresses = args[2];
+  }
+
+  RETURN_NOT_OK(client->XClusterClient().RemoveNamespaceFromOutboundReplicationGroup(
+      replication_group_id, namespace_info.id(), target_master_addresses));
+
+  std::cout << "Successfully removed " << namespace_info.name()
+            << " from xCluster Replication group " << replication_group_id << endl;
+
+  return Status::OK();
+}
+
+const auto repair_xcluster_outbound_replication_add_table_args =
+    "<replication_group_id> <table_id> <stream_id>";
+Status repair_xcluster_outbound_replication_add_table_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 3) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  const auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto& table_id = args[1];
+  const auto stream_id = VERIFY_RESULT(xrepl::StreamId::FromString(args[2]));
+
+  RETURN_NOT_OK(client->XClusterClient().RepairOutboundXClusterReplicationGroupAddTable(
+      replication_group_id, table_id, stream_id));
+
+  std::cout << "Table " << table_id << " successfully added to outbound xCluster Replication group "
+            << replication_group_id << endl;
+
+  return Status::OK();
+}
+
+const auto repair_xcluster_outbound_replication_remove_table_args =
+    "<replication_group_id> <table_id>";
+Status repair_xcluster_outbound_replication_remove_table_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 2) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto& table_id = args[1];
+
+  RETURN_NOT_OK(client->XClusterClient().RepairOutboundXClusterReplicationGroupRemoveTable(
+      replication_group_id, table_id));
+
+  std::cout << "Table " << table_id
+            << " successfully removed from outbound xCluster Replication group "
+            << replication_group_id << endl;
+
+  return Status::OK();
+}
+
+const auto list_xcluster_outbound_replication_groups_args = "[namespace_id]";
+Status list_xcluster_outbound_replication_groups_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() > 1) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  NamespaceId namespace_id;
+  if (args.size() > 0) {
+    namespace_id = args[0];
+  }
+
+  auto group_ids =
+      VERIFY_RESULT(client->XClusterClient().GetXClusterOutboundReplicationGroups(namespace_id));
+
+  std::cout << group_ids.size() << " Outbound Replication Groups found"
+            << (namespace_id.empty() ? "" : Format(" for namespace $0", namespace_id)) << ": "
+            << std::endl
+            << yb::AsString(group_ids) << std::endl;
+
+  return Status::OK();
+}
+
+const auto get_xcluster_outbound_replication_group_info_args = "<replication_group_id>";
+Status get_xcluster_outbound_replication_group_info_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 1) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  const auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto group_info = VERIFY_RESULT(
+      client->XClusterClient().GetXClusterOutboundReplicationGroupInfo(replication_group_id));
+
+  const auto& namespace_map = VERIFY_RESULT_REF(client->GetNamespaceMap());
+
+  std::cout << "Outbound Replication Group: " << replication_group_id << std::endl;
+
+  for (const auto& [namespace_id, table_info] : group_info) {
+    std::cout << std::endl << "Namespace ID: " << namespace_id << std::endl;
+    auto* namespace_info = FindOrNull(namespace_map, namespace_id);
+    std::cout << "Namespace name: " << (namespace_info ? namespace_info->id.name() : "<N/A>")
+              << std::endl
+              << "Table Id\t\tStream Id" << std::endl;
+    for (const auto& [table_id, stream_id] : table_info) {
+      std::cout << table_id << "\t\t" << stream_id << std::endl;
+    }
+  }
+
+  return Status::OK();
+}
+
+const auto list_universe_replications_args = "[namespace_id]";
+Status list_universe_replications_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() > 1) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  NamespaceId namespace_id;
+  if (args.size() > 0) {
+    namespace_id = args[0];
+  }
+
+  auto group_ids = VERIFY_RESULT(client->XClusterClient().GetUniverseReplications(namespace_id));
+
+  std::cout << group_ids.size() << " Universe Replication Groups found"
+            << (namespace_id.empty() ? "" : Format(" for namespace $0", namespace_id)) << ": "
+            << std::endl
+            << yb::AsString(group_ids) << std::endl;
+
+  return Status::OK();
+}
+
+const auto get_universe_replication_info_args = "<replication_group_id>";
+Status get_universe_replication_info_action(
+    const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
+  if (args.size() != 1) {
+    return ClusterAdminCli::kInvalidArguments;
+  }
+
+  const auto replication_group_id = xcluster::ReplicationGroupId(args[0]);
+  const auto group_info =
+      VERIFY_RESULT(client->XClusterClient().GetUniverseReplicationInfo(replication_group_id));
+
+  const auto& namespace_map = VERIFY_RESULT_REF(client->GetNamespaceMap());
+
+  std::cout << "Replication Group Id: " << replication_group_id << std::endl;
+  std::cout << "Source master addresses: " << group_info.source_master_addrs << std::endl;
+  std::cout << "Type: " << xcluster::ShortReplicationType(group_info.replication_type) << std::endl;
+
+  if (group_info.replication_type == XClusterReplicationType::XCLUSTER_YSQL_DB_SCOPED) {
+    std::cout << std::endl
+              << "DB Scoped info(s):" << std::endl
+              << "Namespace name\t\tTarget Namespace ID\t\tSource Namespace ID" << std::endl;
+    for (const auto& [target_namespace_id, source_namespace_id] :
+         group_info.db_scope_namespace_id_map) {
+      auto* namespace_info = FindOrNull(namespace_map, target_namespace_id);
+      std::cout << (namespace_info ? namespace_info->id.name() : "<N/A>") << "\t\t"
+                << target_namespace_id << "\t\t" << source_namespace_id << std::endl;
+    }
+  }
+
+  std::cout << std::endl
+            << "Tables:" << std::endl
+            << "Target Table ID\t\tSource Table ID\t\tStreamId" << std::endl;
+  for (const auto& tables : group_info.table_infos) {
+    std::cout << tables.target_table_id << "\t\t" << tables.source_table_id << "\t\t"
+              << tables.stream_id << std::endl;
+  }
 
   return Status::OK();
 }
@@ -2448,7 +2705,7 @@ void ClusterAdminCli::RegisterCommandHandlers() {
   REGISTER_COMMAND(delete_snapshot_schedule);
   REGISTER_COMMAND(restore_snapshot_schedule);
   REGISTER_COMMAND(clone_namespace);
-  REGISTER_COMMAND(is_clone_done);
+  REGISTER_COMMAND(list_clones);
   REGISTER_COMMAND(edit_snapshot_schedule);
   REGISTER_COMMAND(create_keyspace_snapshot);
   REGISTER_COMMAND(create_database_snapshot);
@@ -2468,32 +2725,43 @@ void ClusterAdminCli::RegisterCommandHandlers() {
   REGISTER_COMMAND(rotate_universe_key_in_memory);
   REGISTER_COMMAND(disable_encryption_in_memory);
   REGISTER_COMMAND(write_universe_key_to_file);
-  // CDC commands
-  REGISTER_COMMAND(create_cdc_stream);
+  // CDCSDK commands
   REGISTER_COMMAND(create_change_data_stream);
-  REGISTER_COMMAND(delete_cdc_stream);
   REGISTER_COMMAND(delete_change_data_stream);
-  REGISTER_COMMAND(list_cdc_streams);
   REGISTER_COMMAND(list_change_data_streams);
   REGISTER_COMMAND(get_change_data_stream_info);
   REGISTER_COMMAND(ysql_backfill_change_data_stream_with_replication_slot);
-  // xCluster commands
+  // xCluster Source commands
+  REGISTER_COMMAND(bootstrap_cdc_producer);
+  REGISTER_COMMAND(list_cdc_streams);
+  REGISTER_COMMAND(delete_cdc_stream);
+  REGISTER_COMMAND(pause_producer_xcluster_streams);
+  REGISTER_COMMAND(wait_for_replication_drain);
+  // xCluster Target commands
   REGISTER_COMMAND(setup_universe_replication);
   REGISTER_COMMAND(delete_universe_replication);
   REGISTER_COMMAND(alter_universe_replication);
-  REGISTER_COMMAND(change_xcluster_role);
-  REGISTER_COMMAND(set_universe_replication_enabled);
-  REGISTER_COMMAND(pause_producer_xcluster_streams);
-  REGISTER_COMMAND(bootstrap_cdc_producer);
-  REGISTER_COMMAND(wait_for_replication_drain);
   REGISTER_COMMAND(setup_namespace_universe_replication);
+  REGISTER_COMMAND(set_universe_replication_enabled);
   REGISTER_COMMAND(get_replication_status);
   REGISTER_COMMAND(get_xcluster_safe_time);
+  REGISTER_COMMAND(list_universe_replications);
+  REGISTER_COMMAND(get_universe_replication_info);
+  // xCluster common commands
+  REGISTER_COMMAND(change_xcluster_role);
+
   // xCluster V2 commands
   REGISTER_COMMAND(create_xcluster_checkpoint);
   REGISTER_COMMAND(is_xcluster_bootstrap_required);
   REGISTER_COMMAND(setup_xcluster_replication);
   REGISTER_COMMAND(drop_xcluster_replication);
+  REGISTER_COMMAND(add_namespace_to_xcluster_checkpoint);
+  REGISTER_COMMAND(add_namespace_to_xcluster_replication);
+  REGISTER_COMMAND(remove_namespace_from_xcluster_replication);
+  REGISTER_COMMAND(repair_xcluster_outbound_replication_add_table);
+  REGISTER_COMMAND(repair_xcluster_outbound_replication_remove_table);
+  REGISTER_COMMAND(list_xcluster_outbound_replication_groups);
+  REGISTER_COMMAND(get_xcluster_outbound_replication_group_info);
 }
 
 Result<std::vector<client::YBTableName>> ResolveTableNames(

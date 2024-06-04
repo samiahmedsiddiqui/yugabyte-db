@@ -1257,6 +1257,19 @@ public class AsyncYBClient implements AutoCloseable {
       null);
   }
 
+  public Deferred<AlterUniverseReplicationResponse> alterUniverseReplicationRemoveTables(
+    String replicationGroupName,
+    Set<String> sourceTableIdsToRemove,
+    boolean removeTableIgnoreErrors) {
+    return alterUniverseReplication(
+      replicationGroupName,
+      new HashMap<>(),
+      sourceTableIdsToRemove,
+      new HashSet<>(),
+      null,
+      removeTableIgnoreErrors);
+  }
+
   public Deferred<AlterUniverseReplicationResponse>
   alterUniverseReplicationSourceMasterAddresses(
     String replicationGroupName,
@@ -1280,6 +1293,20 @@ public class AsyncYBClient implements AutoCloseable {
       newReplicationGroupName);
   }
 
+  private Deferred<AlterUniverseReplicationResponse> alterUniverseReplication(
+    String replicationGroupName,
+    Map<String, String> sourceTableIdsToAddBootstrapIdMap,
+    Set<String> sourceTableIdsToRemove,
+    Set<CommonNet.HostPortPB> sourceMasterAddresses,
+    String newReplicationGroupName) {
+      return alterUniverseReplication(replicationGroupName,
+      sourceTableIdsToAddBootstrapIdMap,
+      sourceTableIdsToRemove,
+      sourceMasterAddresses,
+      newReplicationGroupName,
+      false);
+    }
+
   /**
    * Alter existing xCluster replication relationships by modifying which tables to replicate from a
    * source universe, as well as the master addresses of the source universe
@@ -1297,6 +1324,7 @@ public class AsyncYBClient implements AutoCloseable {
    * @param sourceMasterAddresses New list of master addresses for the source universe
    * @param newReplicationGroupName The new source universe's UUID and the config name if desired to
    *                                be changed (format: sourceUniverseUUID_configName)
+   * @param removeTableIgnoreErrors Ignore errors while removing tables
    * @return a deferred object that yields an alter xCluster replication response.
    */
   private Deferred<AlterUniverseReplicationResponse> alterUniverseReplication(
@@ -1304,7 +1332,8 @@ public class AsyncYBClient implements AutoCloseable {
     Map<String, String> sourceTableIdsToAddBootstrapIdMap,
     Set<String> sourceTableIdsToRemove,
     Set<CommonNet.HostPortPB> sourceMasterAddresses,
-    String newReplicationGroupName) {
+    String newReplicationGroupName,
+    boolean removeTableIgnoreErrors) {
     int addedTables = sourceTableIdsToAddBootstrapIdMap.isEmpty() ? 0 : 1;
     int removedTables = sourceTableIdsToRemove.isEmpty() ? 0 : 1;
     int changedMasterAddresses = sourceMasterAddresses.isEmpty() ? 0 : 1;
@@ -1322,7 +1351,8 @@ public class AsyncYBClient implements AutoCloseable {
         sourceTableIdsToAddBootstrapIdMap,
         sourceTableIdsToRemove,
         sourceMasterAddresses,
-        newReplicationGroupName);
+        newReplicationGroupName,
+        removeTableIgnoreErrors);
     request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(request);
   }
@@ -1479,6 +1509,101 @@ public class AsyncYBClient implements AutoCloseable {
     request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(request);
   }
+
+  // DB Scoped replication methods.
+  // --------------------------------------------------------------------------------
+
+  /**
+   *  Checkpoints the source universe's databases.
+   *
+   * @param replicationGroupId name of the replication group to create
+   * @param namespaceIds set of namespace ids to checkpoint.
+   * @return A deferred object that yields a {@link XClusterCreateOutboundReplicationGroupResponse}
+   */
+  public Deferred<XClusterCreateOutboundReplicationGroupResponse>
+      xClusterCreateOutboundReplicationGroup(String replicationGroupId, Set<String> namespaceIds) {
+    checkIsClosed();
+    XClusterCreateOutboundReplicationGroupRequest request =
+        new XClusterCreateOutboundReplicationGroupRequest(
+          this.masterTable, replicationGroupId, namespaceIds);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   *  Checks whether checkpointing one of the source universe's namespaces from
+   *    xClusterCreateOutboundReplicationGroup is complete with 'notReady' boolean and
+   *    also whether or not the database requires bootstrapping.
+   * @param replicationGroupId name of the replication group to check
+   * @param namespaceId name of database to validate.
+   * @return A deferred object that yields a {@link IsXClusterBootstrapRequiredResponse}
+   *   which contains whether checkpointing is complete with 'notReady' and whether
+   *   bootstrapping is required with initialBootstrapRequired
+   */
+  public Deferred<IsXClusterBootstrapRequiredResponse> isXClusterBootstrapRequired(
+        String replicationGroupId, String namespaceId) {
+    checkIsClosed();
+    IsXClusterBootstrapRequiredRequest request = new IsXClusterBootstrapRequiredRequest(
+        this.masterTable, replicationGroupId, namespaceId);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   * Set up replication with specified replication group name and target universe.
+   * @param replicationGroupId name of the replication group to set up
+   * @param targetMasterAddresses target univere's master addresses
+   * @return  A deferred object that yields a {@link CreateXClusterReplicationResponse}
+   */
+  public Deferred<CreateXClusterReplicationResponse> createXClusterReplication(
+      String replicationGroupId, Set<CommonNet.HostPortPB> targetMasterAddresses) {
+    checkIsClosed();
+    CreateXClusterReplicationRequest request = new CreateXClusterReplicationRequest(
+        this.masterTable, replicationGroupId, targetMasterAddresses);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   * Checks whether the set up replication has succeeded.
+   * @param replicationGroupId name of the replication group to validate
+   * @param targetMasterAddresses target univere's master addresses used to set up replicaiton
+   * @return A deferred object that yields a {@link IsCreateXClusterReplicationDoneResponse}
+   *   containing whether the the replication has succeeded with 'done' bit, along with
+   *   replicationError errors
+   */
+  public Deferred<IsCreateXClusterReplicationDoneResponse> isCreateXClusterReplicationDone(
+      String replicationGroupId, Set<CommonNet.HostPortPB> targetMasterAddresses) {
+    checkIsClosed();
+    IsCreateXClusterReplicationDoneRequest request = new IsCreateXClusterReplicationDoneRequest(
+        this.masterTable, replicationGroupId, targetMasterAddresses);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /**
+   * Deletes the replication by running on the source universe. If target universe master
+   *   addresses are set, will delete both outbound and inbound replication. If target universe
+   *   master addresses are not set, will only delete the outbound replication on the source
+   *   universe.
+   * @param replicationGroupId name of the replication group to delete
+   * @param targetMasterAddresses target universe master addresses correcponding to replication.
+   * @return A deferred object that yields a {@link XClusterDeleteOutboundReplicationGroupResponse}
+   *
+   */
+  public Deferred<XClusterDeleteOutboundReplicationGroupResponse>
+      xClusterDeleteOutboundReplicationGroup(
+      String replicationGroupId, @Nullable Set<CommonNet.HostPortPB> targetMasterAddresses) {
+    checkIsClosed();
+    XClusterDeleteOutboundReplicationGroupRequest request =
+        new XClusterDeleteOutboundReplicationGroupRequest(
+        this.masterTable, replicationGroupId, targetMasterAddresses);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  // --------------------------------------------------------------------------------
+  // End of DB Scoped replication methods.
 
   /**
    * It returns information about a database/namespace after we pass in the databse name.

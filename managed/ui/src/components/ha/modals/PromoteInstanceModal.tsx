@@ -1,11 +1,12 @@
-import { FC, useRef } from 'react';
+import { FC, useRef, useState } from 'react';
 import { Field, FormikActions, FormikProps } from 'formik';
 import moment from 'moment';
 import * as Yup from 'yup';
+import { useSelector } from 'react-redux';
 import { useMutation, useQuery, useQueryClient } from 'react-query';
 import { browserHistory } from 'react-router';
 import { Alert } from 'react-bootstrap';
-import { Box, useTheme } from '@material-ui/core';
+import { Box, makeStyles, Typography, useTheme } from '@material-ui/core';
 import { AxiosError } from 'axios';
 
 import { YBModalForm } from '../../common/forms';
@@ -13,6 +14,9 @@ import { api, QUERY_KEY } from '../../../redesign/helpers/api';
 import { YBLoading } from '../../common/indicators';
 import { YBCheckBox, YBFormSelect } from '../../common/forms/fields';
 import { handleServerError } from '../../../utils/errorHandlingUtils';
+import InfoIcon from '../../../redesign/assets/info-message.svg';
+import { YBInput, YBTooltip } from '../../../redesign/components';
+import { formatDatetime, YBTimeFormats } from '../../../redesign/helpers/DateUtils';
 
 import './PromoteInstanceModal.scss';
 
@@ -25,30 +29,39 @@ interface PromoteInstanceModalProps {
 
 interface PromoteInstanceFormValues {
   backupFile: { value: string; label: string } | null;
-  confirmed: boolean;
   isForcePromote: boolean;
 }
 
 const INITIAL_VALUES: PromoteInstanceFormValues = {
   backupFile: null,
-  confirmed: false,
   isForcePromote: false
 };
 
 const validationSchema = Yup.object().shape({
-  backupFile: Yup.object().nullable().required('Backup file is required'),
-  confirmed: Yup.boolean().oneOf([true])
+  backupFile: Yup.object().nullable().required('Backup file is required')
 });
 
-const adaptHaBackupToFormFieldOption = (value: string): PromoteInstanceFormValues['backupFile'] => {
+const adaptHaBackupToFormFieldOption = (value: string, currentUserTimezone?: string): PromoteInstanceFormValues['backupFile'] => {
   // backup_21-02-20-00-40.tgz --> 21-02-20-00-40
   const timestamp = value.replace('backup_', '').replace('.tgz', '');
-  const label = moment.utc(timestamp, 'YY-MM-DD-HH:mm').local().format('LLL');
+  // we always get the backup list time in UTC
+  const formattedTimestamp = moment.utc(timestamp, 'YY-MM-DD-HH:mm').toDate();
+  const label = formatDatetime(formattedTimestamp, YBTimeFormats.YB_DEFAULT_TIMESTAMP , currentUserTimezone);
 
   return { value, label };
 };
 
 const POST_PROMOTION_REDIRECT_URL = '/login';
+
+const useStyles = makeStyles((theme) => ({
+  confirmTextInputBox: {
+    fontWeight: 500,
+    width: '350px'
+  },
+  fieldLabel: {
+    marginBottom: theme.spacing(1)
+  }
+}));
 
 export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
   visible,
@@ -56,9 +69,12 @@ export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
   configId,
   instanceId
 }) => {
+  const [confirmationText, setConfirmationText] = useState<string>('');
   const formik = useRef({} as FormikProps<PromoteInstanceFormValues>);
   const theme = useTheme();
+  const classes = useStyles();
   const queryClient = useQueryClient();
+  const currentUserTimezone = useSelector((state: any) => state?.customer?.currentUser?.data?.timezone);
 
   const { isLoading, data } = useQuery(
     [QUERY_KEY.getHABackups, configId],
@@ -68,7 +84,7 @@ export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
       onSuccess: (data) => {
         // pre-select first backup file from the list
         if (Array.isArray(data) && data.length) {
-          formik.current.setFieldValue('backupFile', adaptHaBackupToFormFieldOption(data[0]));
+          formik.current.setFieldValue('backupFile', adaptHaBackupToFormFieldOption(data[0], currentUserTimezone));
         }
       }
     }
@@ -90,10 +106,11 @@ export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
     }
   );
 
-  const backupsList = (data ?? []).map(adaptHaBackupToFormFieldOption);
+  const backupsList = (data ?? []).map(backup => adaptHaBackupToFormFieldOption(backup, currentUserTimezone));
 
   const closeModal = () => {
     if (!formik.current.isSubmitting) {
+      setConfirmationText('');
       onClose();
     }
   };
@@ -107,6 +124,8 @@ export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
     });
   };
 
+  const isSubmitDisabled = confirmationText !== 'PROMOTE';
+
   if (visible) {
     return (
       <YBModalForm
@@ -119,20 +138,27 @@ export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
         title="Make Active"
         onHide={closeModal}
         onFormSubmit={submitForm}
+        isSubmitDisabled={isSubmitDisabled}
         footerAccessory={
           <Box display="flex" gridGap={theme.spacing(1)}>
             <Field
-              name="confirmed"
-              dataTestId="confirmedCheckbox"
-              component={YBCheckBox}
-              label="Confirm promotion"
-            />
-            <Field
               name="isForcePromote"
-              dataTestId="isForcePromoteCheckbox"
+              dataTestId="PromoteInstanceModal-IsForcePromoteCheckbox"
               component={YBCheckBox}
               label="Force promotion"
             />
+            {/* This tooltip needs to be have a z-index greater than the z-index on the modal (3100)*/}
+            <YBTooltip
+              title={
+                <Typography variant="body2">
+                  When the HA standby instance is unable to reach the HA primary, promotion will not
+                  be allowed by YBA unless this force promote option is on.
+                </Typography>
+              }
+              PopperProps={{ style: { zIndex: 4000, pointerEvents: 'auto' } }}
+            >
+              <img src={InfoIcon} />
+            </YBTooltip>
           </Box>
         }
         render={(formikProps: FormikProps<PromoteInstanceFormValues>) => {
@@ -150,12 +176,22 @@ export const PromoteInstanceModal: FC<PromoteInstanceModalProps> = ({
                     the data from the selected backup. After promotion succeeds you will need to
                     re-sign in with the credentials of the previously active platform instance.
                   </Alert>
-                  <Field
-                    name="backupFile"
-                    component={YBFormSelect}
-                    options={backupsList}
-                    label="Select the backup to restore from"
-                    isSearchable
+                  <Typography variant="body2" className={classes.fieldLabel}>
+                    <Field
+                      name="backupFile"
+                      component={YBFormSelect}
+                      options={backupsList}
+                      label="Select the backup to restore from"
+                      isSearchable
+                    />
+                    Please type PROMOTE to confirm.
+                  </Typography>
+                  <YBInput
+                    className={classes.confirmTextInputBox}
+                    inputProps={{ 'data-testid': 'PromoteInstanceModal-ConfirmTextInputField' }}
+                    placeholder="PROMOTE"
+                    value={confirmationText}
+                    onChange={(event) => setConfirmationText(event.target.value)}
                   />
                 </div>
               )}

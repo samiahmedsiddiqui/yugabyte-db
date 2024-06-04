@@ -29,6 +29,7 @@
 
 #include "access/xact.h"
 #include "pg_yb_utils.h"
+#include "replication/walsender_private.h"
 #include "replication/yb_decode.h"
 #include "utils/rel.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
@@ -71,9 +72,12 @@ void
 YBLogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
 							   XLogReaderState *record)
 {
+	TimestampTz start_time = GetCurrentTimestamp();
+
 	elog(DEBUG4,
-		 "YBLogicalDecodingProcessRecord: Decoding record with action = %d.",
-		 record->yb_virtual_wal_record->action);
+		 "YBLogicalDecodingProcessRecord: Decoding record with action = %d. "
+		 "yb_read_time is set to %d",
+		 record->yb_virtual_wal_record->action, yb_is_read_time_ht);
 
 	/* Check if we need a relcache refresh. */
 	YBHandleRelcacheRefresh(ctx, record);
@@ -83,6 +87,12 @@ YBLogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
 	{
 		/* Nothing to handle here. */
 		case YB_PG_ROW_MESSAGE_ACTION_DDL:
+			elog(DEBUG4,
+				 "Received DDL record for table: %d, xid: %d, commit_time: "
+				 "%" PRIu64,
+				 record->yb_virtual_wal_record->table_oid,
+				 record->yb_virtual_wal_record->xid,
+				 record->yb_virtual_wal_record->commit_time);
 			break;
 
 		case YB_PG_ROW_MESSAGE_ACTION_BEGIN:
@@ -129,6 +139,9 @@ YBLogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
 		case YB_PG_ROW_MESSAGE_ACTION_UNKNOWN:
 			pg_unreachable();
 	}
+
+	YbWalSndTotalTimeInYBDecodeMicros +=
+		YbCalculateTimeDifferenceInMicros(start_time);
 }
 
 /*
@@ -262,6 +275,8 @@ YBDecodeUpdate(LogicalDecodingContext *ctx, XLogReaderState *record)
 		ctx->reorder, after_op_tuple->t_len + HEAPTUPLESIZE);
 	after_op_tuple_buf->tuple = *after_op_tuple;
 	after_op_tuple_buf->yb_is_omitted = after_op_is_omitted;
+	after_op_tuple_buf->yb_is_omitted_size =
+		(should_handle_omitted_case) ? nattrs : 0;
 
 	before_op_tuple =
 		heap_form_tuple(tupdesc, before_op_datums, before_op_is_nulls);
@@ -269,6 +284,12 @@ YBDecodeUpdate(LogicalDecodingContext *ctx, XLogReaderState *record)
 		ctx->reorder, before_op_tuple->t_len + HEAPTUPLESIZE);
 	before_op_tuple_buf->tuple = *before_op_tuple;
 	before_op_tuple_buf->yb_is_omitted = before_op_is_omitted;
+	before_op_tuple_buf->yb_is_omitted_size =
+		(should_handle_omitted_case) ? nattrs : 0;
+
+	elog(DEBUG2, "The before_op heap tuple: %s and after_op heap tuple: %s",
+		 YbHeapTupleToString(before_op_tuple, tupdesc),
+		 YbHeapTupleToString(after_op_tuple, tupdesc));
 
 	change->data.tp.newtuple = after_op_tuple_buf;
 	change->data.tp.oldtuple = before_op_tuple_buf;
@@ -410,6 +431,9 @@ YBGetHeapTuplesForRecord(const YBCPgVirtualWalRecord *yb_record,
 	}
 
 	tuple = heap_form_tuple(tupdesc, datums, is_nulls);
+	elog(DEBUG2, "The heap tuple: %s for operation: %s",
+		 YbHeapTupleToString(tuple, tupdesc),
+		 (change_type == REORDER_BUFFER_CHANGE_INSERT) ? "INSERT" : "DELETE");
 
 	RelationClose(relation);
 	return tuple;
@@ -465,40 +489,22 @@ YBHandleRelcacheRefresh(LogicalDecodingContext *ctx, XLogReaderState *record)
 		case YB_PG_ROW_MESSAGE_ACTION_UPDATE: switch_fallthrough();
 		case YB_PG_ROW_MESSAGE_ACTION_DELETE:
 		{
-			bool needs_invalidation =
-				ctx->yb_handle_relcache_invalidation_startup;
-			
-			if (!needs_invalidation)
-				hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
-							HASH_FIND, &needs_invalidation);
+			bool needs_invalidation = false;
+
+			hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
+						HASH_FIND, &needs_invalidation);
 
 			if (needs_invalidation)
 			{
-				uint64_t	read_time_ht;
-				char		read_time[50];
-				bool		for_startup;
+				uint64_t read_time_ht;
 
-				for_startup = ctx->yb_handle_relcache_invalidation_startup;
-				if (for_startup)
-				{
-					/*
-					 * Use the record_commit_time we received from the
-					 * replication slot metadata (cdc state table).
-					 */
-					read_time_ht =
-						MyReplicationSlot->data.yb_initial_record_commit_time_ht;
-					ctx->yb_handle_relcache_invalidation_startup = false;
-				}
-				else
-				{
-					/* Use the commit_time of the DML. */
-					read_time_ht = record->yb_virtual_wal_record->commit_time;
-				}
+				/* Use the commit_time of the DML. */
+				read_time_ht = record->yb_virtual_wal_record->commit_time;
 
-				sprintf(read_time, "%" PRIu64 " ht", read_time_ht);
-				elog(DEBUG1, "Setting yb_read_time to %s", read_time);
-				assign_yb_read_time(read_time, NULL);
-				YbRelationCacheInvalidate();
+				elog(DEBUG2,
+					 "Setting yb_read_time to record's commit_time: %" PRIu64,
+					 read_time_ht);
+				YBCUpdateYbReadTimeAndInvalidateRelcache(read_time_ht);
 
 				/*
 				 * Let the plugin know that the schema for this table has
@@ -507,13 +513,10 @@ YBHandleRelcacheRefresh(LogicalDecodingContext *ctx, XLogReaderState *record)
 				 */
 				YBReorderBufferSchemaChange(ctx->reorder, table_oid);
 
-				if (!for_startup)
-				{
-					bool		found;
-					hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
-								HASH_REMOVE, &found);
-					Assert(found);
-				}
+				bool found;
+				hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
+							HASH_REMOVE, &found);
+				Assert(found);
 			}
 			break;
 		}
@@ -530,14 +533,14 @@ static void
 YBLogTupleDescIfRequested(const YBCPgVirtualWalRecord *yb_record,
 						  TupleDesc tupdesc)
 {
-	/* Log tuple descriptor for DEBUG1 onwards. */
-	if (log_min_messages <= DEBUG1)
+	/* Log tuple descriptor for DEBUG2 onwards. */
+	if (log_min_messages <= DEBUG2)
 	{
-		elog(DEBUG1, "Printing tuple descriptor for relation %d\n",
+		elog(DEBUG2, "Printing tuple descriptor for relation %d\n",
 			 yb_record->table_oid);
 		for (int attr_idx = 0; attr_idx < tupdesc->natts; attr_idx++)
 		{
-			elog(DEBUG1, "Col %d: name = %s, dropped = %d, type = %d\n",
+			elog(DEBUG2, "Col %d: name = %s, dropped = %d, type = %d\n",
 						 attr_idx, tupdesc->attrs[attr_idx].attname.data,
 						 tupdesc->attrs[attr_idx].attisdropped,
 						 tupdesc->attrs[attr_idx].atttypid);

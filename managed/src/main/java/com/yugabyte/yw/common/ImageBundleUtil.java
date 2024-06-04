@@ -67,15 +67,24 @@ public class ImageBundleUtil {
           bundle.update();
         }
         if (properties.getMachineImage() == null) {
-          Region r = Region.getByCode(bundle.getProvider(), region);
-          properties.setMachineImage(r.getYbImage());
-          if (properties.getMachineImage() == null) {
-            // In case it is still null, we will try to fetch from the regionMetadata.
-            Architecture arch = r.getArchitecture();
-            if (arch == null) {
-              arch = Architecture.x86_64;
+          if (bundle.getMetadata().getType() != ImageBundleType.CUSTOM) {
+            Region r = Region.getByCode(bundle.getProvider(), region);
+            // In case, AMI id is not present in the bundle - we will extract the AMI
+            // from YBA's metadata for YBA managed bundles else we will fail.
+            if (properties.getMachineImage() == null) {
+              // In case it is still null, we will try to fetch from the regionMetadata.
+              Architecture arch = r.getArchitecture();
+              if (arch == null) {
+                arch = Architecture.x86_64;
+              }
+              properties.setMachineImage(cloudQueryHelper.getDefaultImage(r, arch.toString()));
             }
-            properties.setMachineImage(cloudQueryHelper.getDefaultImage(r, arch.toString()));
+          } else {
+            throw new PlatformServiceException(
+                INTERNAL_SERVER_ERROR,
+                String.format(
+                    "AMI information is missing from bundle %s for region %s",
+                    bundle.getName(), region));
           }
         }
         if (properties.getSshPort() == null) {
@@ -84,7 +93,7 @@ public class ImageBundleUtil {
         if (properties.getSshUser() == null) {
           properties.setSshUser(providerDetails.getSshUser());
         }
-      } else {
+      } else if (!regionsBundleInfo.containsKey(region)) {
         throw new PlatformServiceException(
             INTERNAL_SERVER_ERROR, "Region information is missing from the image bundle.");
       }
@@ -194,7 +203,23 @@ public class ImageBundleUtil {
     boolean aarch64YBADefaultBundleMarkedDefault = false;
     List<ImageBundle> getYbaDefaultImageBundles =
         ImageBundle.getYBADefaultBundles(provider.getUuid());
-    if (getYbaDefaultImageBundles.size() != 0) {
+    if (getYbaDefaultImageBundles.size() == 0) {
+      // These will be the bundles created before migration & does not contain the metadata.
+      List<ImageBundle> providerBundles = provider.getImageBundles();
+      x86YBADefaultBundleMarkedDefault =
+          provider.getImageBundles().stream()
+              .noneMatch(
+                  bundle ->
+                      bundle.getDetails().getArch() == Architecture.x86_64
+                          && bundle.getUseAsDefault());
+
+      aarch64YBADefaultBundleMarkedDefault =
+          provider.getImageBundles().stream()
+              .noneMatch(
+                  bundle ->
+                      bundle.getDetails().getArch() == Architecture.aarch64
+                          && bundle.getUseAsDefault());
+    } else {
       for (ImageBundle ybaDefaultBundle : getYbaDefaultImageBundles) {
         if (ybaDefaultBundle.getDetails() == null) {
           continue;
@@ -235,6 +260,35 @@ public class ImageBundleUtil {
         aarch64YBADefaultBundleMarkedDefault,
         true,
         enableVMOSPatching);
+  }
+
+  public boolean migrateYBADefaultBundles(
+      Map<String, String> currOSVersionDBMap, Provider provider) {
+    String providerCode = provider.getCode();
+    if (currOSVersionDBMap != null
+        && currOSVersionDBMap.containsKey("version")
+        && !currOSVersionDBMap
+            .get("version")
+            .equals(CloudImageBundleSetup.CLOUD_OS_MAP.get(providerCode).getVersion())) {
+      return true;
+    }
+
+    List<ImageBundle> getYbaDefaultImageBundles =
+        ImageBundle.getYBADefaultBundles(provider.getUuid());
+    if (getYbaDefaultImageBundles.size() != 0) {
+      ImageBundle ybaDefaultBundle = getYbaDefaultImageBundles.get(0);
+      if (ybaDefaultBundle.getMetadata() == null
+          || (ybaDefaultBundle.getMetadata() != null
+              && ybaDefaultBundle.getMetadata().getVersion() != null
+              && !(ybaDefaultBundle.getMetadata().getVersion())
+                  .equals(CloudImageBundleSetup.CLOUD_OS_MAP.get(providerCode).getVersion()))) {
+        return true;
+      }
+    } else if (getYbaDefaultImageBundles.size() == 0) {
+      return true;
+    }
+
+    return false;
   }
 
   public Map<UUID, ImageBundle> collectUniversesImageBundles() {

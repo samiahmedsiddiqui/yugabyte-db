@@ -421,12 +421,25 @@ public class ReleaseManager {
   }
 
   public List<String> getLocalReleaseVersions() {
+    return getLocalReleaseVersions(true);
+  }
+
+  public List<String> getLocalReleaseVersions(boolean includeKubernetes) {
     if (!confGetter.getGlobalConf(GlobalConfKeys.enableReleasesRedesign)) {
       return new ArrayList<String>(getLocalReleases().keySet());
     } else {
       // Get the version of every release that has at least 1 "ReleaseLocalFile" artifact
       return Release.getAll().stream()
-          .filter(r -> ReleaseArtifact.getForReleaseLocalFile(r.getReleaseUUID()).size() != 0)
+          .filter(
+              r -> {
+                List<ReleaseArtifact> artifacts =
+                    ReleaseArtifact.getForReleaseLocalFile(r.getReleaseUUID());
+                if (includeKubernetes) {
+                  return artifacts.size() != 0;
+                } else {
+                  return artifacts.stream().filter(a -> !a.isKubernetes()).count() > 0;
+                }
+              })
           .map(r -> r.getVersion())
           .collect(Collectors.toList());
     }
@@ -637,47 +650,18 @@ public class ReleaseManager {
                     .map(rlf -> rlf.getLocalFilePath())
                     .collect(Collectors.toList()));
         try {
+          // x86/arm builds
           Files.walk(Paths.get(ybReleasesPath))
               .filter(
                   getPackageFilter(
                       "glob:**yugabyte*{centos,alma,linux,el}*{x86_64,aarch64}.tar.gz"))
               .filter(p -> !currentFilePaths.contains(p.toString())) // Filter files already known
-              .forEach(
-                  p -> {
-                    ReleasesUtils.ExtractedMetadata metadata = null;
-                    try {
-                      log.debug("checking local file {}", p.toString());
-                      metadata = releasesUtils.metadataFromPath(p);
-                      String rawVersion = metadata.version.split("-")[0];
-                      if (metadata.platform == ReleaseArtifact.Platform.KUBERNETES) {
-                        localReleaseNameValidation(rawVersion, null, p.toString());
-                      } else {
-                        localReleaseNameValidation(rawVersion, p.toString(), null);
-                      }
-                    } catch (RuntimeException e) {
-                      log.error(
-                          "local release "
-                              + p.getFileName().toString()
-                              + " failed validation: "
-                              + e.getLocalizedMessage());
-                      // continue forEach
-                      return;
-                    }
-                    ReleaseLocalFile rlf = ReleaseLocalFile.create(p.toString());
-                    ReleaseArtifact artifact =
-                        ReleaseArtifact.create(
-                            metadata.sha256,
-                            metadata.platform,
-                            metadata.architecture,
-                            rlf.getFileUUID());
-                    Release release = Release.getByVersion(metadata.version, metadata.releaseTag);
-                    if (release == null) {
-                      release =
-                          Release.create(
-                              metadata.version, metadata.release_type, metadata.releaseTag);
-                    }
-                    release.addArtifact(artifact);
-                  });
+              .forEach(p -> createLocalRelease(p));
+          // helm charts
+          Files.walk(Paths.get(ybReleasesPath))
+              .filter(ybChartFilter)
+              .filter(p -> !currentFilePaths.contains(p.toString())) // Filter files already known
+              .forEach(p -> createLocalRelease(p));
         } catch (Exception e) {
           log.error("failed to read local releases", e);
         }
@@ -715,6 +699,40 @@ public class ReleaseManager {
             ybcReleasesPath);
       }
     }
+  }
+
+  private void createLocalRelease(Path p) {
+    ReleasesUtils.ExtractedMetadata metadata = null;
+    try {
+      log.debug("checking local file {}", p.toString());
+      metadata = releasesUtils.metadataFromPath(p);
+      String rawVersion = p.getName(p.getNameCount() - 2).toString();
+      if (metadata.platform == ReleaseArtifact.Platform.KUBERNETES) {
+        // ITEST helm charts may not have the version populated correctly. However, we should assume
+        // that the version specified via the directory name is correct (and that is validated
+        // later).
+        metadata.version = rawVersion;
+        localReleaseNameValidation(rawVersion, null, p.toString());
+      } else {
+        localReleaseNameValidation(rawVersion, p.toString(), null);
+      }
+    } catch (RuntimeException e) {
+      log.error(
+          "local release "
+              + p.getFileName().toString()
+              + " failed validation: "
+              + e.getLocalizedMessage());
+      return;
+    }
+    ReleaseLocalFile rlf = ReleaseLocalFile.create(p.toString());
+    ReleaseArtifact artifact =
+        ReleaseArtifact.create(
+            metadata.sha256, metadata.platform, metadata.architecture, rlf.getFileUUID());
+    Release release = Release.getByVersion(metadata.version);
+    if (release == null) {
+      release = Release.create(metadata.version, metadata.release_type, metadata.releaseTag);
+    }
+    release.addArtifact(artifact);
   }
 
   private void importLocalLegacyReleases(
@@ -789,7 +807,7 @@ public class ReleaseManager {
         throw new RuntimeException(
             "The version of DB that you have specified in the folder name in the "
                 + "imported local release does not match the version of DB in the "
-                + "package name in the imported local release (specifed through the "
+                + "package name in the imported local release (specified through the "
                 + "file path). Please make sure that you have named the directory and "
                 + ".tar.gz file appropriately so that the DB version in the package "
                 + "name matches the DB version in the folder name.");
@@ -818,7 +836,7 @@ public class ReleaseManager {
           throw new RuntimeException(
               "The version of DB that you have specified in the folder name in the "
                   + "imported local release does not match the version of DB in the "
-                  + "package name in the imported local release (specifed through the "
+                  + "package name in the imported local release (specified through the "
                   + "chart path). Please make sure that you have named the directory and "
                   + ".tar.gz file appropriately so that the DB version in the package "
                   + "name matches the DB version in the folder name.");

@@ -274,8 +274,11 @@ public class GFlagsUtil {
       extra_gflags.put(LEADER_LEASE_DURATION_MS, String.valueOf(6000));
       extra_gflags.put(LEADER_FAILURE_MAX_MISSED_HEARTBEAT_PERIODS, String.valueOf(5));
     }
-
-    boolean cloudEnabled = config.getBoolean("yb.cloud.enabled");
+    // TODO cloudEnabled is supposed to be a static config but this is read from runtime config to
+    // make itests work.
+    boolean cloudEnabled =
+        confGetter.getConfForScope(
+            Customer.get(universe.getCustomerId()), CustomerConfKeys.cloudEnabled);
     NodeDetails node = universe.getNode(taskParam.nodeName);
     boolean isDualNet =
         cloudEnabled
@@ -706,7 +709,7 @@ public class GFlagsUtil {
         ysqlPgConfCsvEntries.add(
             encodeBooleanPgAuditFlag("pgaudit.log_relation", ysqlAuditConfig.isLogRelation()));
         ysqlPgConfCsvEntries.add(
-            encodeBooleanPgAuditFlag("pgaudit.log_row", ysqlAuditConfig.isLogRow()));
+            encodeBooleanPgAuditFlag("pgaudit.log_rows", ysqlAuditConfig.isLogRows()));
         ysqlPgConfCsvEntries.add(
             encodeBooleanPgAuditFlag("pgaudit.log_statement", ysqlAuditConfig.isLogStatement()));
         ysqlPgConfCsvEntries.add(

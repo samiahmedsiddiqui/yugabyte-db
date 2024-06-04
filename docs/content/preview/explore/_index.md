@@ -25,7 +25,7 @@ The following table describes the YugabyteDB features you can explore, along wit
 | :--- | :--- | :--- |
 | [SQL features](ysql-language-features/) | Learn about YugabyteDB's compatibility with PostgreSQL, including data types, queries, expressions, operators, extensions, and more. | Single-node<br/>local/cloud |
 | [YCQL features](ycql-language/) | Learn about YugabyteDB's Apache Cassandra-compatible YCQL language features. | Single-node<br/>local/cloud |
-| [Going beyond SQL](ysql-language-features/going-beyond-sql/) | Learn about reducing read latency via follower reads and moving data closer to users using tablespaces. | Multi-node<br/>local |
+| [Going beyond SQL](going-beyond-sql/) | Learn about YugabyteDB exclusive features such as follower reads, tablespaces, built-in connection pooling, and more. | Multi-node<br/>local |
 | [Resiliency](fault-tolerance/) | Learn how YugabyteDB achieves resiliency when a node fails. | Multi-node<br/>local |
 | [Horizontal scalability](linear-scalability/) | See how YugabyteDB handles loads while dynamically adding or removing nodes. | Multi-node<br/>local |
 | [Transactions](transactions/) | Understand how distributed transactions and isolation levels work in YugabyteDB. | Single-node<br/>local/cloud |
@@ -107,55 +107,7 @@ For more information, refer to [Quick Start](../quick-start/linux/#create-a-loca
 
   {{% tab header="Multi-node universe" lang="Multi-node universe" %}}
 
-If a local universe is currently running, first [destroy it](../reference/configuration/yugabyted/#destroy-a-local-cluster).
-
-Start a local three-node universe with an RF of `3` by first creating a single node universe, as follows:
-
-```sh
-./bin/yugabyted start \
-                --advertise_address=127.0.0.1 \
-                --base_dir=/tmp/ybd1 \
-                --cloud_location=aws.us-east-2.us-east-2a
-```
-
-On macOS, the additional nodes need loopback addresses configured, as follows:
-
-```sh
-sudo ifconfig lo0 alias 127.0.0.2
-sudo ifconfig lo0 alias 127.0.0.3
-```
-
-Next, join two more nodes with the previous node. yugabyted automatically applies a replication factor of `3` when a third node is added, as follows:
-
-```sh
-./bin/yugabyted start \
-                --advertise_address=127.0.0.2 \
-                --base_dir=/tmp/ybd2 \
-                --cloud_location=aws.us-east-2.us-east-2b \
-                --join=127.0.0.1
-```
-
-```sh
-./bin/yugabyted start \
-                --advertise_address=127.0.0.3 \
-                --base_dir=/tmp/ybd3 \
-                --cloud_location=aws.us-east-2.us-east-2c \
-                --join=127.0.0.1
-```
-
-After starting the yugabyted processes on all the nodes, configure the data placement constraint of the universe, as follows:
-
-```sh
-./bin/yugabyted configure data_placement --fault_tolerance=zone --base_dir=/tmp/ybd1
-```
-
-This command can be executed on any node where you already started YugabyteDB.
-
-To check the status of a running multi-node universe, run the following command:
-
-```sh
-./bin/yugabyted status --base_dir=/tmp/ybd1
-```
+{{<setup/local>}}
 
   {{% /tab %}}
 

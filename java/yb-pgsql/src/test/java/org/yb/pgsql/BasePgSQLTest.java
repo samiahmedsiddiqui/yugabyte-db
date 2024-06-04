@@ -45,7 +45,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.Scanner;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -120,10 +119,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   protected static final String SNAPSHOT_TOO_OLD_PSQL_STATE = "72000";
   protected static final String DEADLOCK_DETECTED_PSQL_STATE = "40P01";
 
-  // Postgres flags.
-  private static final String MASTERS_FLAG = "FLAGS_pggate_master_addresses";
-  private static final String YB_ENABLED_IN_PG_ENV_VAR_NAME = "YB_ENABLED_IN_POSTGRES";
-
   // Metric names.
   protected static final String METRIC_PREFIX = "handler_latency_yb_ysqlserver_SQLProcessor_";
   protected static final String SELECT_STMT_METRIC = METRIC_PREFIX + "SelectStmt";
@@ -163,6 +158,17 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
         "connections will be using same physical conn, due to which it will affect the memory " +
         "allocated to connection1 by connection2";
 
+  protected static final String CATALOG_CACHE_MISS_NEED_UNIQUE_PHYSICAL_CONN =
+      "Test needs two different physical connections while testing catalog cache misses." +
+      "With Connection Manager, logical connections will share the same physical connection " +
+      "due to which catalog cache hits occur for the same query executed on different logical " +
+      "connections";
+
+  protected static final String GUC_REPLAY_AFFECTS_CONN_STATE =
+      "Skipping this test with Connection Manager enabled. Connection Manager replays session " +
+        "variables at the beginning of transaction boundaries, causing erroneous results in " +
+        "the test, leading to failure.";
+
   // CQL and Redis settings, will be reset before each test via resetSettings method.
   protected boolean startCqlProxy = false;
   protected boolean startRedisProxy = false;
@@ -186,38 +192,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
       new ConcurrentSkipListSet<>();
 
   protected static boolean pgInitialized = false;
-
-  public void runPgRegressTest(
-      File inputDir, String schedule, long maxRuntimeMillis, File executable) throws Exception {
-    final int tserverIndex = 0;
-    PgRegressRunner pgRegress = new PgRegressRunner(inputDir, schedule, maxRuntimeMillis);
-    ProcessBuilder procBuilder = new PgRegressBuilder(executable)
-        .setDirs(inputDir, pgRegress.outputDir())
-        .setSchedule(schedule)
-        .setHost(getPgHost(tserverIndex))
-        .setPort(getPgPort(tserverIndex))
-        .setUser(DEFAULT_PG_USER)
-        .setDatabase("yugabyte")
-        .setEnvVars(getPgRegressEnvVars())
-        .getProcessBuilder();
-    pgRegress.run(procBuilder);
-  }
-
-  public void runPgRegressTest(File inputDir, String schedule) throws Exception {
-    runPgRegressTest(
-        inputDir, schedule, 0 /* maxRuntimeMillis */,
-        PgRegressBuilder.PG_REGRESS_EXECUTABLE);
-  }
-
-  public void runPgRegressTest(String schedule, long maxRuntimeMillis) throws Exception {
-    runPgRegressTest(
-        PgRegressBuilder.PG_REGRESS_DIR /* inputDir */, schedule, maxRuntimeMillis,
-        PgRegressBuilder.PG_REGRESS_EXECUTABLE);
-  }
-
-  public void runPgRegressTest(String schedule) throws Exception {
-    runPgRegressTest(schedule, 0 /* maxRuntimeMillis */);
-  }
 
   public static void perfAssertLessThan(double time1, double time2) {
     if (TestUtils.isReleaseBuild()) {
@@ -286,6 +260,7 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
     flagMap.put("ysql_beta_features", "true");
     flagMap.put("ysql_enable_reindex", "true");
+    flagMap.put("TEST_ysql_hide_catalog_version_increment_log", "true");
 
     return flagMap;
   }
@@ -323,9 +298,10 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   }
 
   @Before
-  public void initYBBackupUtil() {
+  public void initYBBackupUtil() throws Exception {
     YBBackupUtil.setMasterAddresses(masterAddresses);
     YBBackupUtil.setPostgresContactPoint(miniCluster.getPostgresContactPoints().get(0));
+    YBBackupUtil.maybeStartYbControllers(miniCluster);
   }
 
   @Before
@@ -430,27 +406,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
   public int getPgPort(int tserverIndex) {
     return miniCluster.getPostgresContactPoints().get(tserverIndex).getPort();
-  }
-
-  protected Map<String, String> getPgRegressEnvVars() {
-    Map<String, String> pgRegressEnvVars = new TreeMap<>();
-    pgRegressEnvVars.put(MASTERS_FLAG, masterAddresses);
-    pgRegressEnvVars.put(YB_ENABLED_IN_PG_ENV_VAR_NAME, "1");
-
-    for (Map.Entry<String, String> entry : System.getenv().entrySet()) {
-      String envVarName = entry.getKey();
-      if (envVarName.startsWith("postgres_FLAGS_")) {
-        String downstreamEnvVarName = envVarName.substring(9);
-        LOG.info("Found env var " + envVarName + ", setting " + downstreamEnvVarName + " for " +
-                 "pg_regress to " + entry.getValue());
-        pgRegressEnvVars.put(downstreamEnvVarName, entry.getValue());
-      }
-    }
-
-    // A temporary workaround for a failure to look up a user name by uid in an LDAP environment.
-    pgRegressEnvVars.put("YB_PG_FALLBACK_SYSTEM_USER_NAME", "yugabyte");
-
-    return pgRegressEnvVars;
   }
 
   @After

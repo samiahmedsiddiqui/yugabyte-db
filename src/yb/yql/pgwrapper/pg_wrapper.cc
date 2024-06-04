@@ -188,6 +188,9 @@ DEFINE_RUNTIME_PG_FLAG(int32, yb_wait_for_backends_catalog_version_timeout, 5 * 
 DEFINE_RUNTIME_PG_FLAG(int32, yb_bnl_batch_size, 1024,
     "Batch size of nested loop joins.");
 
+DEFINE_RUNTIME_PG_FLAG(int32, yb_explicit_row_locking_batch_size, 1,
+    "Batch size of explicit row locking.");
+
 DEFINE_RUNTIME_PG_FLAG(string, yb_xcluster_consistency_level, "database",
     "Controls the consistency level of xCluster replicated databases. Valid values are "
     "\"database\" and \"tablet\".");
@@ -241,6 +244,13 @@ DEFINE_RUNTIME_PG_PREVIEW_FLAG(bool, yb_enable_replication_commands, false,
 DEFINE_RUNTIME_PG_PREVIEW_FLAG(bool, yb_enable_replica_identity, false,
     "Enable replica identity command for Alter Table query");
 
+DEFINE_RUNTIME_PG_FLAG(
+    string, yb_default_replica_identity, "CHANGE",
+    "The default replica identity to be assigned to user defined tables at the time of creation. "
+    "The flag is case sensitive and can take four possible values, 'FULL', 'DEFAULT', 'NOTHING' "
+    "and 'CHANGE'. If any value other than these is assigned to the flag, the replica identity "
+    "CHANGE will be used as default at the time of table creation.");
+
 DEFINE_RUNTIME_PG_PREVIEW_FLAG(int32, yb_parallel_range_rows, 0,
     "The number of rows to plan per parallel worker, zero disables the feature");
 
@@ -255,6 +265,9 @@ DEFINE_RUNTIME_PG_FLAG(uint32, yb_walsender_poll_sleep_duration_empty_ms, 1 * 10
 
 DEFINE_RUNTIME_PG_FLAG(int32, yb_toast_catcache_threshold, -1,
     "Size threshold in bytes for a catcache tuple to be compressed.");
+
+DEFINE_RUNTIME_PG_FLAG(string, yb_read_after_commit_visibility, "strict",
+  "Determines the behavior of read-after-commit-visibility guarantee.");
 
 static bool ValidateXclusterConsistencyLevel(const char* flagname, const std::string& value) {
   if (value != "database" && value != "tablet") {
@@ -280,6 +293,11 @@ DEPRECATE_FLAG(int32, ysql_yb_ash_sampling_interval, "2024_03");
 
 DEFINE_RUNTIME_PG_FLAG(int32, yb_ash_sample_size, 500,
     "Number of samples captured from each component per sampling event");
+
+DEFINE_NON_RUNTIME_string(ysql_cron_database_name, "yugabyte",
+    "Database in which pg_cron metadata is kept.");
+
+DECLARE_bool(enable_pg_cron);
 
 using gflags::CommandLineFlagInfo;
 using std::string;
@@ -445,6 +463,10 @@ Result<string> WritePostgresConfig(const PgProcessConf& conf) {
   metricsLibs.push_back("pgaudit");
   metricsLibs.push_back("pg_hint_plan");
 
+  if (FLAGS_enable_pg_cron) {
+    metricsLibs.push_back("pg_cron");
+  }
+
   vector<string> lines;
   string line;
   while (std::getline(conf_file, line)) {
@@ -481,6 +503,9 @@ Result<string> WritePostgresConfig(const PgProcessConf& conf) {
                            conf.cert_base_name));
     lines.push_back(Format("ssl_ca_file='$0/ca.crt'", conf.certs_for_client_dir));
   }
+
+  // Add cron.database_name
+  lines.push_back(Format("cron.database_name='$0'", FLAGS_ysql_cron_database_name));
 
   // Finally add gFlags.
   // If the file contains multiple entries for the same parameter, all but the last one are

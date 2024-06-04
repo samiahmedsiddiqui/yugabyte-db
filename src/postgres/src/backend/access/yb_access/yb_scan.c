@@ -328,6 +328,38 @@ ybcBindTupleExprCondIn(YbScanDesc ybScan,
 }
 
 /*
+ * Utility method to bind const to column.
+ */
+void
+YbBindDatumToColumn(YBCPgStatement stmt,
+					int attr_num,
+					Oid type_id,
+					Oid collation_id,
+					Datum datum,
+					bool is_null,
+					const YBCPgTypeEntity *null_type_entity)
+{
+	YBCPgExpr	expr;
+	const YBCPgTypeEntity *type_entity;
+
+	if (is_null && null_type_entity)
+		type_entity = null_type_entity;
+	else
+		type_entity = YbDataTypeFromOidMod(InvalidAttrNumber, type_id);
+
+	YBCPgCollationInfo collation_info;
+	YBGetCollationInfo(collation_id, type_entity, datum, is_null,
+					   &collation_info);
+
+	HandleYBStatus(YBCPgNewConstant(stmt, type_entity,
+									collation_info.collate_is_valid_non_c,
+									collation_info.sortkey,
+									datum, is_null, &expr));
+
+	HandleYBStatus(YBCPgDmlBindColumn(stmt, attr_num, expr));
+}
+
+/*
  * Add a system column as target to the given statement handle.
  */
 void
@@ -468,20 +500,20 @@ static HeapTuple ybcFetchNextHeapTuple(YbScanDesc ybScan, ScanDirection dir)
 										 &syscols,
 										 &has_data);
 
-		if (IsolationIsSerializable())
-			HandleYBStatus(status);
-		else if (status)
+		if (status && !IsolationIsSerializable())
 		{
-			if (ybScan->exec_params != NULL &&
-				YBCIsTxnConflictError(YBCStatusTransactionError(status)))
+			const uint16_t txn_error = YBCStatusTransactionError(status);
+			if (ybScan->exec_params != NULL && YBCIsTxnConflictError(txn_error))
 			{
 				elog(DEBUG2, "Error when trying to lock row. "
 					 "pg_wait_policy=%d docdb_wait_policy=%d "
 					 "txn_errcode=%d message=%s",
 					 ybScan->exec_params->pg_wait_policy,
 					 ybScan->exec_params->docdb_wait_policy,
-					 YBCStatusTransactionError(status),
+					 txn_error,
 					 YBCStatusMessageBegin(status));
+				YBCFreeStatus(status);
+				status = NULL;
 				if (ybScan->exec_params->pg_wait_policy == LockWaitError)
 					ereport(ERROR,
 							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
@@ -493,12 +525,16 @@ static HeapTuple ybcFetchNextHeapTuple(YbScanDesc ybScan, ScanDirection dir)
 							 errmsg("could not serialize access due to concurrent update"),
 							 yb_txn_errcode(YBCGetTxnConflictErrorCode())));
 			}
-			else if (YBCIsTxnSkipLockingError(YBCStatusTransactionError(status)))
+			else if (YBCIsTxnSkipLockingError(txn_error))
+			{
 				/* For skip locking, it's correct to simply return no results. */
 				has_data = false;
-			else
-				HandleYBStatus(status);
+				YBCFreeStatus(status);
+				status = NULL;
+			}
 		}
+
+		HandleYBStatus(status);
 
 		if (has_data)
 		{
@@ -1454,7 +1490,7 @@ YbBindRowComparisonKeys(YbScanDesc ybScan, YbScanPlan scan_plan,
 		}
 	}
 
-	bool needs_recheck = !can_pushdown;
+	bool needs_recheck = true;
 
 	if (can_pushdown)
 	{
@@ -1554,7 +1590,8 @@ YbBindRowComparisonKeys(YbScanDesc ybScan, YbScanPlan scan_plan,
 			{
 				int att_idx = YBAttnumToBmsIndex(
 				ybScan->relation, subkeys[subkey_index]->sk_attno);
-				is_not_null[att_idx] = true;
+				/* Set the first column in this RC to not null. */
+				is_not_null[att_idx] |= subkey_index == 0;
 
 				subkey_index++;
 			}
@@ -3616,17 +3653,50 @@ HeapTuple YBCFetchTuple(Relation relation, Datum ybctid)
 	return tuple;
 }
 
-HTSU_Result
-YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode, LockWaitPolicy pg_wait_policy,
-			 EState* estate)
+// TODO: Substitute the YBSetRowLockPolicy with this function
+static int
+YBCGetRowLockPolicy(LockWaitPolicy pg_wait_policy)
 {
 	int docdb_wait_policy;
-
 	YBSetRowLockPolicy(&docdb_wait_policy, pg_wait_policy);
+	return docdb_wait_policy;
+}
+
+/*
+ * The return value of this function depends on whether we are batching or not.
+ * Currently, batching is enabled if the GUC yb_explicit_row_locking_batch_size > 1
+ * and the wait policy is not "SKIP LOCKED".
+ * If we are batching, then the return value is just a placeholder, as we are not
+ * acquiring the lock on the row before returning.
+ * Otherwise, the returned HTSU_Result is adjusted in case of an error in acquiring the lock.
+ */
+HTSU_Result
+YBCLockTuple(
+	Relation relation, Datum ybctid, RowMarkType mode,
+	LockWaitPolicy pg_wait_policy, EState* estate)
+{
+	int docdb_wait_policy = YBCGetRowLockPolicy(pg_wait_policy);
+	const YBCPgExplicitRowLockParams lock_params = {
+		.rowmark = mode,
+		.pg_wait_policy = pg_wait_policy,
+		.docdb_wait_policy = docdb_wait_policy};
+
+	const Oid relfile_oid = YbGetRelfileNodeId(relation);
+	const Oid db_oid = YBCGetDatabaseOid(relation);
+
+	if (yb_explicit_row_locking_batch_size > 1
+	    && lock_params.pg_wait_policy != LockWaitSkip)
+	{
+		// TODO: Error message requires conversion
+		HandleYBStatus(YBCAddExplicitRowLockIntent(
+			relfile_oid, ybctid, db_oid, &lock_params, YBCIsRegionLocal(relation)));
+		YBCPgAddIntoForeignKeyReferenceCache(relfile_oid, ybctid);
+		return HeapTupleMayBeUpdated;
+	}
 
 	YBCPgStatement ybc_stmt;
-	HandleYBStatus(YBCPgNewSelect(YBCGetDatabaseOid(relation),
-								  YbGetRelfileNodeId(relation),
+	HandleYBStatus(YBCPgNewSelect(db_oid,
+								  relfile_oid,
 								  NULL /* prepare_params */,
 								  YBCIsRegionLocal(relation),
 								  &ybc_stmt));
@@ -3637,9 +3707,9 @@ YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode, LockWaitPolicy p
 
 	YBCPgExecParameters exec_params = {0};
 	exec_params.limit_count = 1;
-	exec_params.rowmark = mode;
-	exec_params.pg_wait_policy = pg_wait_policy;
-	exec_params.docdb_wait_policy = docdb_wait_policy;
+	exec_params.rowmark = lock_params.rowmark;
+	exec_params.pg_wait_policy = lock_params.pg_wait_policy;
+	exec_params.docdb_wait_policy = lock_params.docdb_wait_policy;
 	exec_params.stmt_in_txn_limit_ht_for_reads =
 		estate->yb_exec_params.stmt_in_txn_limit_ht_for_reads;
 
@@ -3651,7 +3721,7 @@ YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode, LockWaitPolicy p
 		/*
 		 * Execute the select statement to lock the tuple with given ybctid.
 		 */
-		HandleYBStatus(YBCPgExecSelect(ybc_stmt, &exec_params /* exec_params */));
+		HandleYBStatus(YBCPgExecSelect(ybc_stmt, &exec_params));
 
 		bool has_data = false;
 		Datum *values = NULL;
@@ -3662,15 +3732,9 @@ YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode, LockWaitPolicy p
 		 * Below is done to ensure the read request is flushed to tserver.
 		 */
 		HandleYBStatus(
-				YBCPgDmlFetch(
-						ybc_stmt,
-						0,
-						(uint64_t *) values,
-						nulls,
-						&syscols,
-						&has_data));
-		YBCPgAddIntoForeignKeyReferenceCache(
-			YbGetRelfileNodeId(relation), ybctid);
+			YBCPgDmlFetch(
+				ybc_stmt, 0, (uint64_t *) values, nulls, &syscols, &has_data));
+		YBCPgAddIntoForeignKeyReferenceCache(relfile_oid, ybctid);
 	}
 	PG_CATCH();
 	{
@@ -3698,6 +3762,13 @@ YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode, LockWaitPolicy p
 
 	YBCPgDeleteStatement(ybc_stmt);
 	return res;
+}
+
+void
+YBCFlushTupleLocks()
+{
+	// TODO: Error message requires conversion
+	HandleYBStatus(YBCFlushExplicitRowLockIntents());
 }
 
 /*
@@ -4208,8 +4279,8 @@ ppk_buffer_fetch_callback(void *param, const char *key, size_t key_size)
 static void
 yb_fetch_partition_keys(YBParallelPartitionKeys ppk)
 {
-	const char *lower_bound_key;
-	size_t lower_bound_key_size;
+	const char *latest_key;
+	size_t latest_key_size;
 	uint64_t max_num_ranges;
 	FetchKeysParam fkp = {0, ppk};
 
@@ -4219,17 +4290,15 @@ yb_fetch_partition_keys(YBParallelPartitionKeys ppk)
 	Assert(ppk->key_count > 0);
 	keylen_t key_len;
 	memcpy(&key_len, KEY_LEN(ppk, ppk->high_offset), sizeof(keylen_t));
-	lower_bound_key_size = key_len;
-	if (lower_bound_key_size)
-		/*
-		 * It is safe to refer the key data in place, since the highest key
-		 * can not be removed until fetch is in progress.
-		 * The bound being referenced here remains the highest key until after
-		 * the request to DocDB is done.
-		 */
-		lower_bound_key = KEY_DATA(ppk, ppk->high_offset);
-	else
-		lower_bound_key = NULL;
+	latest_key_size = key_len;
+	/* Empty key indicates the end of the keys, fetch shouldn't be possible. */
+	Assert(latest_key_size);
+	/*
+	 * It is safe to refer the key data in place, since the highest key can not
+	 * be removed from the buffer until fetch is completed.
+	 */
+	latest_key = KEY_DATA(ppk, ppk->high_offset);
+
 	/*
 	 * Find average key size so far. We expect reasonable number have already
 	 * been received during initialization.
@@ -4253,10 +4322,12 @@ yb_fetch_partition_keys(YBParallelPartitionKeys ppk)
 	 */
 	HandleYBStatus(YBCGetTableKeyRanges(
 		ppk->database_oid, ppk->table_relfilenode_oid,
-		lower_bound_key, lower_bound_key_size,
-		NULL /* upper_bound_key */, 0 /* upper_bound_key_size */,
-		max_num_ranges, 1024 * 1024 /* range_size_bytes */, ppk->is_forward,
-		(ppk->key_data_capacity / 3) - sizeof(keylen_t),
+		ppk->is_forward ? latest_key : NULL /* lower_bound_key */,
+		ppk->is_forward ? latest_key_size : 0 /* lower_bound_key_size */,
+		ppk->is_forward ? NULL : latest_key /* upper_bound_key */,
+		ppk->is_forward ? 0 : latest_key_size /* upper_bound_key_size */,
+		max_num_ranges,  yb_parallel_range_size, ppk->is_forward,
+		(ppk->key_data_capacity / 3) - sizeof(keylen_t) /* max_key_length */,
 		NULL /* current_tserver_ht */,
 		ppk_buffer_fetch_callback, &fkp));
 	SpinLockAcquire(&ppk->mutex);
@@ -4295,7 +4366,9 @@ ppk_buffer_initialize_callback(void *param, const char *key, size_t key_size)
 	}
 	if (key_size == 0)
 	{
-		elog(LOG, "All ranges are fetched at once.");
+		elog(LOG,
+			 "All ranges are fetched at once, received %.0f keys (%.0f bytes)",
+			 ppk->total_key_count, ppk->total_key_size);
 		ppk->fetch_status = FETCH_STATUS_DONE;
 	}
 	else if (!yb_add_key_unsynchronized(ppk, key, key_size))
@@ -4362,7 +4435,7 @@ ybParallelPrepare(YBParallelPartitionKeys ppk, Relation relation,
 		NULL /* lower_bound_key */, 0 /* lower_bound_key_size */,
 		NULL /* upper_bound_key */, 0 /* upper_bound_key_size */,
 		YB_PARTITION_KEYS_DEFAULT_FETCH_SIZE,
-		1024 * 1024 /* range_size_bytes */, is_forward,
+		yb_parallel_range_size, is_forward,
 		(ppk->key_data_capacity / 3) - sizeof(keylen_t),
 		ppk->used_ht_for_read ? NULL : &ppk->used_ht_for_read,
 		ppk_buffer_initialize_callback, ppk));
@@ -4443,12 +4516,23 @@ ybParallelNextRange(YBParallelPartitionKeys ppk,
 		}
 		else
 		{
+			/*
+			 * When performing forward scan, keys in the buffer are in the
+			 * ascending order, so first one is going to be the lower bound,
+			 * and second, if exists, the higher bound.
+			 * When performing backward scan, keys in the buffer are in the
+			 * descending order, so destination bouns are opposite.
+			 */
+			const char **first_key_dest_ptr = ppk->is_forward ? low_bound : high_bound;
+			size_t *first_key_size_ptr = ppk->is_forward ? low_bound_size : high_bound_size;
+			const char **second_key_dest_ptr = ppk->is_forward ? high_bound : low_bound;
+			size_t *second_key_size_ptr = ppk->is_forward ? high_bound_size : low_bound_size;
 			/* Have multiple keys, can take one. */
 			if (ppk->key_count > 1)
 			{
-				yb_copy_key_unsynchronized(ppk, low_bound, low_bound_size);
+				yb_copy_key_unsynchronized(ppk, first_key_dest_ptr, first_key_size_ptr);
 				yb_remove_key_unsynchronized(ppk);
-				yb_copy_key_unsynchronized(ppk, high_bound, high_bound_size);
+				yb_copy_key_unsynchronized(ppk, second_key_dest_ptr, second_key_size_ptr);
 				result = NEXT_RANGE_SUCCESS;
 			}
 			/* If the fetch is completed it is OK to take the last key. */
@@ -4456,11 +4540,10 @@ ybParallelNextRange(YBParallelPartitionKeys ppk,
 			{
 				if (ppk->key_count == 1)
 				{
-					yb_copy_key_unsynchronized(ppk, low_bound, low_bound_size);
+					yb_copy_key_unsynchronized(ppk, first_key_dest_ptr, first_key_size_ptr);
 					yb_remove_key_unsynchronized(ppk);
-					/* Last range have empty high bound. */
-					*high_bound = NULL;
-					*high_bound_size = 0;
+					*second_key_dest_ptr = NULL;
+					*second_key_size_ptr = 0;
 					result = NEXT_RANGE_SUCCESS;
 				}
 				else

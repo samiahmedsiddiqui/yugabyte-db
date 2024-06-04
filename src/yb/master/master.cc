@@ -50,12 +50,13 @@
 
 #include "yb/gutil/bind.h"
 
-#include "yb/master/master_fwd.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/flush_manager.h"
 #include "yb/master/master-path-handlers.h"
 #include "yb/master/master_backup.service.h"
 #include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_cluster_handler.h"
+#include "yb/master/master_fwd.h"
 #include "yb/master/master_service.h"
 #include "yb/master/master_tablet_service.h"
 #include "yb/master/master_util.h"
@@ -152,6 +153,8 @@ namespace master {
 Master::Master(const MasterOptions& opts)
     : DbServerBase("Master", opts, "yb.master", server::CreateMemTrackerForServer()),
       state_(kStopped),
+      metric_entity_cluster_(
+          METRIC_ENTITY_cluster.Instantiate(metric_registry_.get(), "yb.cluster")),
       ts_manager_(new TSManager()),
       catalog_manager_(new CatalogManager(this)),
       auto_flags_manager_(
@@ -160,12 +163,11 @@ Master::Master(const MasterOptions& opts)
       path_handlers_(new MasterPathHandlers(this)),
       flush_manager_(new FlushManager(this, catalog_manager())),
       tablet_health_manager_(new TabletHealthManager(this, catalog_manager())),
+      master_cluster_handler_(new MasterClusterHandler(catalog_manager_impl(), ts_manager_.get())),
       test_async_rpc_manager_(new TestAsyncRpcManager(this, catalog_manager())),
       init_future_(init_status_.get_future()),
       opts_(opts),
       maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)),
-      metric_entity_cluster_(
-          METRIC_ENTITY_cluster.Instantiate(metric_registry_.get(), "yb.cluster")),
       master_tablet_server_(new MasterTabletServer(this, metric_entity())) {
   SetConnectionContextFactory(rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(
       GetAtomicFlag(&FLAGS_inbound_rpc_memory_limit), mem_tracker()));
@@ -222,19 +224,19 @@ Status Master::Init() {
   return Status::OK();
 }
 
-Status Master::InitAutoFlags() {
+Status Master::InitAutoFlags(rpc::Messenger* messenger) {
   // Will we be in shell mode if we dont have a sys catalog yet?
   bool is_shell_mode_if_new =
       FLAGS_master_join_existing_universe || !opts().AreMasterAddressesProvided();
 
   RETURN_NOT_OK(auto_flags_manager_->Init(
-      options_.HostsString(),
+      messenger,
       [this]() {
         return fs_manager_->LookupTablet(kSysCatalogTabletId);
       } /* has_sys_catalog_func */,
       is_shell_mode_if_new));
 
-  return RpcAndWebServerBase::InitAutoFlags();
+  return RpcAndWebServerBase::InitAutoFlags(messenger);
 }
 
 Result<std::unordered_set<std::string>> Master::GetAvailableAutoFlagsForServer() const {
@@ -246,7 +248,7 @@ Status Master::InitAutoFlagsFromMasterLeader(const HostPort& leader_address) {
       opts().IsShellMode(), IllegalState,
       "Cannot load AutoFlags from another master when not in shell mode.");
 
-  return auto_flags_manager_->LoadFromMasterLeader(options_.HostsString(), {{leader_address}});
+  return auto_flags_manager_->LoadFromMasterLeader({{leader_address}});
 }
 
 MonoDelta Master::default_client_timeout() {
@@ -599,6 +601,10 @@ XClusterManager* Master::xcluster_manager_impl() const {
 
 SysCatalogTable& Master::sys_catalog() const {
   return *catalog_manager_->sys_catalog();
+}
+
+TabletSplitManager& Master::tablet_split_manager() const {
+  return *catalog_manager_->tablet_split_manager();
 }
 
 PermissionsManager& Master::permissions_manager() {

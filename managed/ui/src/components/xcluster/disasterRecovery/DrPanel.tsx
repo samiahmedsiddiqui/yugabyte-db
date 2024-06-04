@@ -15,7 +15,7 @@ import {
   PollingIntervalMs,
   TRANSITORY_XCLUSTER_CONFIG_STATUSES,
   XClusterConfigAction,
-  XClusterConfigType
+  XCLUSTER_UNIVERSE_TABLE_FILTERS
 } from '../constants';
 import { YBButton } from '../../../redesign/components';
 import { YBErrorIndicator, YBLoading } from '../../common/indicators';
@@ -23,8 +23,7 @@ import {
   api,
   drConfigQueryKey,
   metricQueryKey,
-  universeQueryKey,
-  xClusterQueryKey
+  universeQueryKey
 } from '../../../redesign/helpers/api';
 import { getEnabledConfigActions, getXClusterConfigUuids } from '../ReplicationUtils';
 import { getEnabledDrConfigActions, getXClusterConfig } from './utils';
@@ -44,10 +43,6 @@ import { RbacValidator } from '../../../redesign/features/rbac/common/RbacApiPer
 import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
 import { getUniverseStatus, UniverseState } from '../../universes/helpers/universeHelpers';
 import { EditConfigModal } from './editConfig/EditConfigModal';
-
-import { TableType } from '../../../redesign/helpers/dtos';
-import { fetchXClusterConfig } from '../../../actions/xClusterReplication';
-import { XClusterConfig } from '../dtos';
 
 interface DrPanelProps {
   currentUniverseUuid: string;
@@ -148,15 +143,6 @@ export const DrPanel = ({ currentUniverseUuid }: DrPanelProps) => {
     ...sourceXClusterConfigUuids,
     ...targetXClusterConfigUuids
   ];
-  // The unsafe cast is needed due to issue with useQueries typing
-  // Upgrading react-query to v3.28 may solve this issue: https://github.com/TanStack/query/issues/1675
-  const xClusterConfigQueries = useQueries(
-    universeXClusterConfigUUIDs.map((uuid: string) => ({
-      queryKey: xClusterQueryKey.detail(uuid),
-      queryFn: () => fetchXClusterConfig(uuid),
-      enabled: currentUniverseQuery.data?.universeDetails !== undefined
-    }))
-  ) as UseQueryResult<XClusterConfig>[];
 
   const { primaryUniverseUuid: sourceUniverseUuid, drReplicaUniverseUuid: targetUniverseUuid } =
     drConfigQuery.data ?? {};
@@ -573,7 +559,6 @@ export const DrPanel = ({ currentUniverseUuid }: DrPanelProps) => {
             isDrInterface={true}
             allowedTasks={allowedTasks}
             drConfig={drConfig}
-            configTableType={TableType.PGSQL_TABLE_TYPE}
             isVisible={isRestartConfigModalOpen}
             onHide={closeRestartConfigModal}
             xClusterConfig={xClusterConfig}

@@ -329,7 +329,7 @@ class ConflictResolver : public std::enable_shared_from_this<ConflictResolver> {
   void InvokeCallback(const Result<HybridTime>& result) {
     // ConflictResolution_ResolveConficts lasts until InvokeCallback.
     ADOPT_WAIT_STATE(wait_state_);
-    SET_WAIT_STATUS(OnCpu_Passive);
+    SET_WAIT_STATUS(OnCpu_Active);
     YB_TRANSACTION_DUMP(
         Conflicts, context_->transaction_id(),
         result.ok() ? *result : HybridTime::kInvalid,
@@ -473,6 +473,7 @@ class ConflictResolver : public std::enable_shared_from_this<ConflictResolver> {
   }
 
   void FetchTransactionStatuses() {
+    ASH_ENABLE_CONCURRENT_UPDATES();
     static const std::string kRequestReason = "conflict resolution"s;
     auto self = shared_from_this();
     pending_requests_.store(conflict_data_->NumActiveTransactions());
@@ -1483,7 +1484,8 @@ Status PopulateLockInfoFromParsedIntent(
   tablet::TableInfoPtr table_info;
   if (doc_key.has_colocation_id()) {
     table_info = VERIFY_RESULT(table_info_provider.GetTableInfo(doc_key.colocation_id()));
-    lock_info->set_table_id(table_info->table_id);
+    lock_info->set_pg_table_id(table_info->pg_table_id.empty() ?
+        table_info->table_id : table_info->pg_table_id);
   } else {
     table_info = VERIFY_RESULT(table_info_provider.GetTableInfo(kColocationIdNotSet));
   }

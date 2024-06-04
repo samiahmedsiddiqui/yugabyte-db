@@ -55,6 +55,7 @@
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/macros.h"
 #include "yb/master/master_fwd.h"
+#include "yb/master/master_heartbeat.pb.h"
 #include "yb/server/webserver_options.h"
 #include "yb/tserver/db_server_base.h"
 #include "yb/tserver/pg_mutation_counter.h"
@@ -89,6 +90,10 @@ class CDCServiceImpl;
 
 }
 
+namespace stateful_service {
+class PgCronLeaderService;
+}  // namespace stateful_service
+
 namespace tserver {
 
 class TserverAutoFlagsManager;
@@ -117,7 +122,11 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // complete by calling WaitInited().
   Status Init() override;
 
-  virtual Status InitAutoFlags() override;
+  virtual Status InitAutoFlags(rpc::Messenger* messenger) override;
+
+  virtual bool ShouldExportLocalCalls() override {
+    return true;
+  }
 
   Status GetRegistration(ServerRegistrationPB* reg,
     server::RpcOnly rpc_only = server::RpcOnly::kFalse) const override;
@@ -177,10 +186,20 @@ class TabletServer : public DbServerBase, public TabletServerIf {
     return shared_object();
   }
 
-  Status PopulateLiveTServers(const master::TSHeartbeatResponsePB& heartbeat_resp);
+  Status PopulateLiveTServers(const master::TSHeartbeatResponsePB& heartbeat_resp) EXCLUDES(lock_);
 
   Status GetLiveTServers(
-      std::vector<master::TSInformationPB> *live_tservers) const override;
+      std::vector<master::TSInformationPB> *live_tservers) const EXCLUDES(lock_) override;
+
+  // Returns connection info of all live tservers available at this tserver. The information about
+  // live tservers is refreshed by the master heartbeat.
+  virtual Result<std::vector<client::internal::RemoteTabletServerPtr>>
+      GetRemoteTabletServers() const EXCLUDES(lock_) override;
+
+  // Returns connection info for the passed in 'ts_uuids', if available. If unavailable,
+  // returns a bad status. The information about live tservers is refreshed by the master heartbeat.
+  virtual Result<std::vector<client::internal::RemoteTabletServerPtr>> GetRemoteTabletServers(
+      const std::unordered_set<std::string>& ts_uuids) const EXCLUDES(lock_) override;
 
   Status GetTabletStatus(const GetTabletStatusRequestPB* req,
                          GetTabletStatusResponsePB* resp) const override;
@@ -343,6 +362,10 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   void ClearAllMetaCachesOnServer() override;
 
+  Result<std::vector<tablet::TabletStatusPB>> GetLocalTabletsMetadata() const override;
+
+  void TEST_SetIsCronLeader(bool is_cron_leader);
+
  protected:
   virtual Status RegisterServices();
 
@@ -358,6 +381,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   Status SetupMessengerBuilder(rpc::MessengerBuilder* builder) override;
 
   Result<std::unordered_set<std::string>> GetAvailableAutoFlagsForServer() const override;
+
+  void SetCronLeaderLease(MonoTime cron_leader_lease_end);
 
   std::atomic<bool> initted_{false};
 
@@ -395,11 +420,19 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // Index at which master sent us the last config
   int64_t master_config_index_;
 
-  // List of tservers that are alive from the master's perspective.
-  std::vector<master::TSInformationPB> live_tservers_;
+  // Map of tserver connection info, keyed by the tserver uuid, that are alive from the master's
+  // perspective. It is refreshed on every successfull heartbeat exchange between the current
+  // tserver and the master leader.
+  std::unordered_map<std::string, master::TSInformationPB> live_tservers_ GUARDED_BY(lock_);
+
+  // Map of 'RemoteTablerServer' shared ptrs keyed by the corresponding tsever uuid. This is used
+  // to obtain a proxy handle to the local/remote tserver. It is updated synchronously with
+  // 'live_tservers_'.
+  std::unordered_map<std::string, client::internal::RemoteTabletServerPtr>
+      remote_tservers_ GUARDED_BY(lock_);
 
   // Lock to protect live_tservers_, cluster_uuid_.
-  mutable simple_spinlock lock_;
+  mutable rw_spinlock lock_;
 
   // Proxy to call this tablet server locally.
   std::shared_ptr<TabletServerServiceProxy> proxy_;
@@ -446,6 +479,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   void AutoInitServiceFlags();
 
   void InvalidatePgTableCache();
+  void InvalidatePgTableCache(const std::unordered_set<uint32_t>& db_oids_updated,
+                              const std::unordered_set<uint32_t>& db_oids_deleted);
 
   std::string log_prefix_;
 
@@ -475,6 +510,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   std::atomic<yb::server::RpcAndWebServerBase*> cql_server_{nullptr};
   std::atomic<yb::server::YCQLStatementStatsProvider*> cql_stmt_provider_{nullptr};
+
+  std::unique_ptr<stateful_service::PgCronLeaderService> pg_cron_leader_service_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletServer);
 };

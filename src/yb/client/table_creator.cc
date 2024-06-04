@@ -36,7 +36,6 @@ using std::string;
 DECLARE_bool(client_suppress_created_logs);
 DECLARE_uint32(change_metadata_backoff_max_jitter_ms);
 DECLARE_uint32(change_metadata_backoff_init_exponent);
-DECLARE_bool(ysql_yb_ddl_rollback_enabled);
 
 DEFINE_test_flag(bool, duplicate_create_table_request, false,
                  "Whether a table creator should send duplicate CreateTableRequestPB to master.");
@@ -206,6 +205,12 @@ YBTableCreator& YBTableCreator::is_local_index(bool is_local_index) {
 
 YBTableCreator& YBTableCreator::is_unique_index(bool is_unique_index) {
   index_info_->set_is_unique(is_unique_index);
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::add_vector_options(
+    const PgVectorIdxOptionsPB& vec_options) {
+  *index_info_->mutable_vector_idx_options() = vec_options;
   return *this;
 }
 

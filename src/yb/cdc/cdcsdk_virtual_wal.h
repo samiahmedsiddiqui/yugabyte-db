@@ -30,7 +30,8 @@ namespace cdc {
 
 class CDCSDKVirtualWAL {
  public:
-  explicit CDCSDKVirtualWAL(CDCServiceImpl* cdc_service) : cdc_service_(cdc_service) {}
+  explicit CDCSDKVirtualWAL(
+      CDCServiceImpl* cdc_service, const xrepl::StreamId& stream_id, const uint64_t session_id);
 
   using RecordInfo =
       std::pair<std::shared_ptr<CDCSDKUniqueRecordID>, std::shared_ptr<CDCSDKProtoRecordPB>>;
@@ -38,21 +39,20 @@ class CDCSDKVirtualWAL {
   using TabletRecordInfoPair = std::pair<TabletId, RecordInfo>;
 
   Status InitVirtualWALInternal(
-      const xrepl::StreamId& stream_id, const std::unordered_set<TableId>& table_list,
-      const HostPort hostport, const CoarseTimePoint deadline);
+      const std::unordered_set<TableId>& table_list, const HostPort hostport,
+      const CoarseTimePoint deadline);
 
   Status GetConsistentChangesInternal(
-      const xrepl::StreamId& stream_id, GetConsistentChangesResponsePB* resp,
-      const HostPort hostport, const CoarseTimePoint deadline);
+      GetConsistentChangesResponsePB* resp, const HostPort hostport,
+      const CoarseTimePoint deadline);
 
   // Returns the actually persisted restart_lsn.
   Result<uint64_t> UpdateAndPersistLSNInternal(
-      const xrepl::StreamId& stream_id, const uint64_t confirmed_flush_lsn,
-      const uint64_t restart_lsn_hint);
+      const uint64_t confirmed_flush_lsn, const uint64_t restart_lsn_hint);
 
   Status UpdatePublicationTableListInternal(
-      const xrepl::StreamId& stream_id, const std::unordered_set<TableId>& new_tables,
-      const HostPort hostport, const CoarseTimePoint deadline);
+      const std::unordered_set<TableId>& new_tables, const HostPort hostport,
+      const CoarseTimePoint deadline);
 
  private:
   struct GetChangesRequestInfo {
@@ -111,18 +111,17 @@ class CDCSDKVirtualWAL {
       TabletRecordInfoPair, std::vector<TabletRecordInfoPair>, CompareCDCSDKProtoRecords>;
 
   Status GetTabletListAndCheckpoint(
-      const xrepl::StreamId& stream_id, const TableId table_id, const HostPort hostport,
-      const CoarseTimePoint deadline, const TabletId& parent_tablet_id = "");
+      const TableId table_id, const HostPort hostport, const CoarseTimePoint deadline,
+      const TabletId& parent_tablet_id = "");
 
   Status UpdateTabletMapsOnSplit(
       const TabletId& parent_tablet_id, const std::vector<TabletId> children_tablets);
 
   Status GetChangesInternal(
-      const xrepl::StreamId& stream_id, const std::unordered_set<TabletId> tablet_to_poll_list,
-      const HostPort hostport, const CoarseTimePoint deadline);
+      const std::unordered_set<TabletId> tablet_to_poll_list, const HostPort hostport,
+      const CoarseTimePoint deadline);
 
-  Status PopulateGetChangesRequest(
-      const xrepl::StreamId& stream_id, const TabletId& tablet_id, GetChangesRequestPB* req);
+  Status PopulateGetChangesRequest(const TabletId& tablet_id, GetChangesRequestPB* req);
 
   Status AddRecordsToTabletQueue(const TabletId& tablet_id, const GetChangesResponsePB* resp);
 
@@ -133,16 +132,14 @@ class CDCSDKVirtualWAL {
       const TabletId& tablet_id, TabletRecordPriorityQueue* sorted_records);
 
   Result<TabletRecordInfoPair> GetNextRecordToBeShipped(
-      const xrepl::StreamId& stream_id, TabletRecordPriorityQueue* sorted_records,
-      std::vector<TabletId>* empty_tablet_queues, const HostPort hostport,
-      const CoarseTimePoint deadline);
+      TabletRecordPriorityQueue* sorted_records, std::vector<TabletId>* empty_tablet_queues,
+      const HostPort hostport, const CoarseTimePoint deadline);
 
   Result<TabletRecordInfoPair> FindConsistentRecord(
-      const xrepl::StreamId& stream_id, TabletRecordPriorityQueue* sorted_records,
-      std::vector<TabletId>* empty_tablet_queues, const HostPort hostport,
-      const CoarseTimePoint deadline);
+      TabletRecordPriorityQueue* sorted_records, std::vector<TabletId>* empty_tablet_queues,
+      const HostPort hostport, const CoarseTimePoint deadline);
 
-  Status InitLSNAndTxnIDGenerators(const xrepl::StreamId& stream_id);
+  Status InitLSNAndTxnIDGenerators();
 
   Result<uint64_t> GetRecordLSN(const std::shared_ptr<CDCSDKUniqueRecordID>& curr_unique_record_id);
 
@@ -154,18 +151,41 @@ class CDCSDKVirtualWAL {
   Status TruncateMetaMap(const uint64_t restart_lsn);
 
   Status UpdateSlotEntryInCDCState(
-      const xrepl::StreamId& stream_id, const uint64_t confirmed_flush_lsn,
-      const CommitRecordMetadata& record_metadata);
+      const uint64_t confirmed_flush_lsn, const CommitRecordMetadata& record_metadata);
 
   void ResetCommitDecisionVariables();
 
   Status CreatePublicationRefreshTabletQueue();
 
-  Status PushRecordToPublicationRefreshTabletQueue();
+  Status UpdatePubRefreshInfoInCDCState(bool update_pub_refresh_times);
 
-  std::vector<TabletId> GetTabletsForTable (const TableId& table_id);
+  Status PushPublicationRefreshRecord(uint64_t pub_refresh_time, bool should_apply);
+
+  Status PushNextPublicationRefreshRecord();
+
+  std::set<uint64_t> ParsePubRefreshTimes(const std::string& pub_refresh_times_str);
+
+  std::pair<uint64_t, bool> ParseLastDecidedPubRefreshTime(
+      const std::string& last_decided_pub_refresh_time_str);
+
+  std::string GetPubRefreshTimesString();
+
+  std::string GetLastDecidedPubRefreshTimeString();
+
+  std::vector<TabletId> GetTabletsForTable(const TableId& table_id);
+
+  Status ValidateTablesToBeAddedPresentInStream(
+      const std::unordered_set<TableId>& tables_to_be_added, const CoarseTimePoint deadline);
+
+  std::string LogPrefix() const;
 
   CDCServiceImpl* cdc_service_;
+
+  xrepl::StreamId stream_id_;
+
+  uint64_t vwal_session_id_;
+
+  std::string log_prefix_;
 
   std::unordered_set<TableId> publication_table_list_;
 
@@ -178,6 +198,10 @@ class CDCSDKVirtualWAL {
   std::unordered_map<TabletId, std::unordered_set<TableId>> tablet_id_to_table_id_map_;
 
   const std::string kPublicationRefreshTabletID = "publication_refresh_tablet_id";
+
+  // This dummy txn ID will be set in a pub refresh record, if the value of the flag
+  // cdcsdk_enable_dynamic_table_support is true corresponding to the record.
+  const std::string kDummyTransactionID = "dummy_transaction_id";
 
   // Tablet queues hold the records received from GetChanges RPC call on their respective tablets.
   std::unordered_map<TabletId, std::queue<std::shared_ptr<CDCSDKProtoRecordPB>>> tablet_queues_;
@@ -205,11 +229,21 @@ class CDCSDKVirtualWAL {
   // Holds the 1st commit record of a pg_txn. Reset to false after shipping the held commit record.
   std::shared_ptr<TabletRecordInfoPair> curr_active_txn_commit_record = nullptr;
 
-  // This will hold the time at which the publication's table list was last refreshed.
+  // This will hold the latest publication refresh time that was acknowledged, i.e
+  // last_pub_refresh_time is the maximum value of pub refresh time that is less than restart commit
+  // time.
   uint64_t last_pub_refresh_time;
 
-  // This will hold the interval between two publication table list refresh operations.
-  uint64_t pub_refresh_interval;
+  // This will hold the list of publication refresh times at which publication's tables list was
+  // refreshed, but have not yet been acknowledged, i.e the list of applied pub refresh times with
+  // value greater than or equal to the restart commit time.
+  std::set<uint64_t> pub_refresh_times;
+
+  // This will hold the commit time of the last pub refresh record pushed into the pub refresh
+  // queue, along with the value of the flag cdcsdk_enable_dynamic_table_support corresponding to
+  // the record. In other words, this holds the last decided pub refresh time along with the
+  // decision whether to perform pub refresh at that time or not.
+  std::pair<uint64_t, bool> last_decided_pub_refresh_time;
 
   // This map stores all information for the next GetChanges call on a per tablet basis except for
   // the explicit checkpoint. The key is the tablet id. The value is a struct used to populate the

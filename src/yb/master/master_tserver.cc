@@ -170,6 +170,18 @@ Status MasterTabletServer::GetLiveTServers(
   return Status::OK();
 }
 
+Result<std::vector<client::internal::RemoteTabletServerPtr>>
+    MasterTabletServer::GetRemoteTabletServers() const {
+  return STATUS_FORMAT(NotSupported,
+                       Format("GetRemoteTabletServers not implemented for master_tserver"));
+}
+
+Result<std::vector<client::internal::RemoteTabletServerPtr>>
+    MasterTabletServer::GetRemoteTabletServers(const std::unordered_set<std::string>&) const {
+  return STATUS_FORMAT(NotSupported,
+                       Format("GetRemoteTabletServers not implemented for master_tserver"));
+}
+
 const std::shared_ptr<MemTracker>& MasterTabletServer::mem_tracker() const {
   return master_->mem_tracker();
 }
@@ -196,6 +208,11 @@ Status MasterTabletServer::YCQLStatementStats(const tserver::PgYCQLStatementStat
     tserver::PgYCQLStatementStatsResponsePB* resp) const {
   LOG(FATAL) << "Unexpected call of YCQLStatementStats()";
   return Status::OK();
+}
+
+Result<std::vector<tablet::TabletStatusPB>> MasterTabletServer::GetLocalTabletsMetadata() const {
+  LOG(DFATAL) << "Unexpected call of GetLocalTabletsMetadata()";
+  return STATUS_FORMAT(InternalError, "Unexpected call of GetLocalTabletsMetadata()");
 }
 
 } // namespace master

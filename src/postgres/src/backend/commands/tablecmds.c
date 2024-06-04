@@ -5419,8 +5419,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
 			{
 				if (IsYBRelation(newrel))
 					YBCExecuteInsert(newrel,
-									 RelationGetDescr(newrel),
-									 tuple,
+					                 newslot,
 									 ONCONFLICT_NONE);
 				else
 					heap_insert(newrel, tuple, mycid, hi_options, bistate);
@@ -17357,7 +17356,7 @@ YbATValidateChangePrimaryKey(Relation rel, IndexStmt *stmt)
 				errhint("See https://github.com/yugabyte/yugabyte-db/issues/"
 						"16980. React with thumbs up to raise its priority")));
 
-	if (rel->rd_rel->relhasrules)
+	if (rel->rd_rules != NULL && rel->rd_rules->numLocks > 0)
 		ereport(ERROR,
 			   (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("changing primary key of a table with rules is not yet "
@@ -18211,8 +18210,7 @@ YbATCopyTableRowsUnchecked(Relation old_rel, Relation new_rel,
 		ExecStoreHeapTuple(tuple, newslot, false);
 
 		/* Write the tuple out to the new relation */
-		YBCExecuteInsert(new_rel, newslot->tts_tupleDescriptor, tuple,
-						 ONCONFLICT_NONE);
+		YBCExecuteInsert(new_rel, newslot, ONCONFLICT_NONE);
 
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
@@ -18863,7 +18861,7 @@ YbATValidateAlterColumnType(Relation rel)
 				errhint("See https://github.com/yugabyte/yugabyte-db/issues/"
 						"16980. React with thumbs up to raise its priority")));
 
-	if (rel->rd_rel->relhasrules)
+	if (rel->rd_rules != NULL && rel->rd_rules->numLocks > 0)
 		ereport(ERROR,
 			   (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("changing column type of a table with rules is not yet "

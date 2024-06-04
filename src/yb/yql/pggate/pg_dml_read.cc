@@ -411,6 +411,16 @@ Status PgDmlRead::SetRequestedYbctids(const std::vector<Slice> *ybctids) {
   return Status::OK();
 }
 
+Status PgDmlRead::ANNBindVector(PgExpr *vector) {
+  auto vec_options = read_req_->mutable_vector_idx_options();
+  return vector->EvalTo(vec_options->mutable_vector());
+}
+
+Status PgDmlRead::ANNSetPrefetchSize(int32_t prefetch_size) {
+  read_req_->mutable_vector_idx_options()->set_prefetch_size(prefetch_size);
+  return Status::OK();
+}
+
 Status PgDmlRead::Exec(const PgExecParameters *exec_params) {
   // Save IN/OUT parameters from Postgres.
   pg_exec_params_ = exec_params;
@@ -759,14 +769,14 @@ Status PgDmlRead::AddRowLowerBound(YBCPgStatement handle,
 }
 
 Status PgDmlRead::SubstitutePrimaryBindsWithYbctids(const PgExecParameters* exec_params,
-                                                    const std::vector<Slice> ybctids) {
+                                                    const std::vector<Slice>& ybctids) {
   for (auto& col : bind_.columns()) {
     col.UnbindValue();
   }
   read_req_->mutable_partition_column_values()->clear();
   read_req_->mutable_range_column_values()->clear();
   RETURN_NOT_OK(doc_op_->ExecuteInit(exec_params));
-  return UpdateRequestWithYbctids(&ybctids, false);
+  return UpdateRequestWithYbctids(ybctids);
 }
 
 // Function builds vector of ybctids from primary key binds.
@@ -866,8 +876,8 @@ Status PgDmlRead::BindHashCode(const std::optional<Bound>& start, const std::opt
   return Status::OK();
 }
 
-Status PgDmlRead::BindRange(const Slice &start_value, bool start_inclusive,
-                            const Slice &end_value, bool end_inclusive) {
+Status PgDmlRead::BindRange(const Slice &lower_bound, bool lower_bound_inclusive,
+                            const Slice &upper_bound, bool upper_bound_inclusive) {
   // Clean up operations remaining from the previous range's scan
   if (has_doc_op()) {
     RETURN_NOT_OK(down_cast<PgDocReadOp*>(doc_op_.get())->ResetPgsqlOps());
@@ -875,23 +885,23 @@ Status PgDmlRead::BindRange(const Slice &start_value, bool start_inclusive,
   if (secondary_index_query_) {
     secondary_index_query_->set_is_executed(false);
     return secondary_index_query_->BindRange(
-      start_value, start_inclusive, end_value, end_inclusive);
+      lower_bound, lower_bound_inclusive, upper_bound, upper_bound_inclusive);
   }
   // Set lower bound
-  if (start_value.empty()) {
+  if (lower_bound.empty()) {
     read_req_->clear_lower_bound();
   } else {
     auto* mutable_bound = read_req_->mutable_lower_bound();
-    mutable_bound->dup_key(start_value);
-    mutable_bound->set_is_inclusive(start_inclusive);
+    mutable_bound->dup_key(lower_bound);
+    mutable_bound->set_is_inclusive(lower_bound_inclusive);
   }
   // Set upper bound
-  if (end_value.empty()) {
+  if (upper_bound.empty()) {
     read_req_->clear_upper_bound();
   } else {
     auto* mutable_bound = read_req_->mutable_upper_bound();
-    mutable_bound->dup_key(end_value);
-    mutable_bound->set_is_inclusive(end_inclusive);
+    mutable_bound->dup_key(upper_bound);
+    mutable_bound->set_is_inclusive(upper_bound_inclusive);
   }
   return Status::OK();
 }

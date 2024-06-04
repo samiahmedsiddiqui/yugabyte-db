@@ -28,9 +28,7 @@ Consider a scenario where you have deployed your database across three regions -
 {{<nav/panels>}}
 {{<nav/panel name="local" active="true">}}
 <!-- local cluster setup instructions -->
-{{<collapse title="Set up a local cluster">}}
 {{<setup/local numnodes="3" rf="3" locations="aws.us-east.us-east-1a,aws.us-central.us-central-1a,aws.us-west.us-west-1a" fault-domain="region">}}
-{{</collapse>}}
 {{</nav/panel>}}
 
 {{<nav/panel name="anywhere">}} {{<setup/anywhere>}} {{</nav/panel>}}
@@ -64,9 +62,7 @@ If the third (least preferred) region fails, availability is not affected at all
 {{<collapse title="Simulate failure of the third region locally">}}
 To simulate the failure of the 3rd region locally, you can just stop the third node.
 
-```bash
-./bin/yugabyted stop --base_dir=/tmp/ybd3
-```
+{{%cluster/cmd op="stop" nodes="3"%}}
 
 {{</collapse>}}
 {{</nav/panel>}}
@@ -94,9 +90,7 @@ When the second preferred region fails, availability is not affected at all. Thi
 {{<collapse title="Simulate failure of the secondary region locally" >}}
 To simulate the failure of the secondary region locally, you can just stop the second node.
 
-```bash
-./bin/yugabyted stop --base_dir=/tmp/ybd2
-```
+{{%cluster/cmd op="stop" nodes="2"%}}
 
 {{</collapse>}}
 {{</nav/panel>}}
@@ -124,9 +118,7 @@ When the preferred region fails, there is no data loss but availability will be 
 {{<collapse title="Simulate failure of the primary region locally" >}}
 To simulate the failure of the primary region locally, you can just stop the first node.
 
-```bash
-./bin/yugabyted stop --base_dir=/tmp/ybd1
-```
+{{%cluster/cmd op="stop" nodes="1"%}}
 
 {{</collapse>}}
 {{</nav/panel>}}
@@ -164,6 +156,6 @@ The following illustration shows how the primary application (assuming it is sti
 
 There may be scenarios where you want to deploy the database in just one region. It is quite common for enterprises to have one data center as their primary and another data center just for failover. For this scenario, you can deploy YugabyteDB in your primary data center and set up another cluster in the second data center that gets the data from the primary cluster via asynchronous replication. This is also known as the 2DC or xCluster model.
 
-{{<tip>}}
+{{<lead link="../../../develop/build-global-apps/active-active-single-master">}}
 You can set this up by following the instructions of the [Active-Active Single-Master](../../../develop/build-global-apps/active-active-single-master) pattern.
-{{</tip>}}
+{{</lead>}}

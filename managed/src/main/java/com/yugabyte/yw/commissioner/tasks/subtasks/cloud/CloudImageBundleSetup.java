@@ -34,6 +34,7 @@ import java.util.stream.Collectors;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.BooleanUtils;
 import org.apache.commons.lang3.StringUtils;
 
 @Slf4j
@@ -52,9 +53,9 @@ public class CloudImageBundleSetup extends CloudTaskBase {
   private ImageBundleUtil imageBundleUtil;
   public static final Map<String, CloudOS> CLOUD_OS_MAP =
       ImmutableMap.of(
-          "aws", new CloudOS("8.9", "AlmaLinux"),
-          "gcp", new CloudOS("8.9", "AlmaLinux"),
-          "azu", new CloudOS("8.9", "AlmaLinux"));
+          "aws", new CloudOS("8.9_20240303", "AlmaLinux"),
+          "gcp", new CloudOS("8.9_v20240515", "AlmaLinux"),
+          "azu", new CloudOS("8.9_2023112501", "AlmaLinux"));
 
   @Inject
   public CloudImageBundleSetup(
@@ -286,6 +287,18 @@ public class CloudImageBundleSetup extends CloudTaskBase {
             });
       }
     }
+    // to be removed when we remove support for useIMDSv2 at provider level
+    if (provider.getCloudCode().equals(CloudType.aws)
+        && provider.getDetails().getCloudInfo() != null) {
+      if (BooleanUtils.isTrue(provider.getDetails().getCloudInfo().getAws().useIMDSv2)) {
+        for (ImageBundle bundle : ImageBundle.getAll(provider.getUuid())) {
+          ImageBundleDetails details = bundle.getDetails();
+          details.setUseIMDSv2(true);
+          bundle.setDetails(details);
+          bundle.save();
+        }
+      }
+    }
   }
 
   private void updateBundles(
@@ -313,6 +326,7 @@ public class CloudImageBundleSetup extends CloudTaskBase {
   private void updateYBAActiveImageBundles(
       Provider provider, ImageBundle bundle, List<Region> regions) {
     ImageBundleDetails details = bundle.getDetails();
+    CloudType cloudType = provider.getCloudCode();
     if (details == null) {
       log.error(
           String.format("Image Bundle %s is missing details. Can't continue", bundle.getName()));
@@ -329,7 +343,7 @@ public class CloudImageBundleSetup extends CloudTaskBase {
       String defaultRegionImage =
           cloudQueryHelper.getDefaultImage(region, bundle.getDetails().getArch().toString());
       info.setYbImage(defaultRegionImage);
-      details.setSshUser(provider.getDetails().getSshUser());
+      details.setSshUser(cloudType.getSshUser());
 
       regionBundleInfo.put(region.getCode(), info);
       details.setRegions(regionBundleInfo);
@@ -426,7 +440,7 @@ public class CloudImageBundleSetup extends CloudTaskBase {
             BAD_REQUEST,
             String.format(
                 "Provider %s already has %s as the default image bundle for architecture"
-                    + "type %s. Can't continue.",
+                    + " type %s. Can't continue.",
                 provider.getUuid(), defaultImageBundle.get().getUuid(), arch.toString()));
       }
     }

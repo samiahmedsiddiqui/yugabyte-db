@@ -542,8 +542,13 @@ extern bool yb_enable_saop_pushdown;
 
 /*
  * Enables the use of TOAST compression for the Postgres catcache.
-*/
+ */
 extern int yb_toast_catcache_threshold;
+
+/*
+ * Configure size of the parallel range in requests for parallel keys.
+ */
+extern int yb_parallel_range_size;
 
 //------------------------------------------------------------------------------
 // GUC variables needed by YB via their YB pointers.
@@ -610,6 +615,11 @@ extern char *yb_test_block_index_phase;
 extern char *yb_test_fail_index_state_change;
 
 /*
+ * GUC variable that specifies default replica identity for tables at the time of creation.
+ */
+extern char* yb_default_replica_identity ;
+
+/*
  * If set to true, any DDLs that rewrite tables/indexes will fail after
  * the new table is created.
  */
@@ -631,7 +641,7 @@ extern bool yb_test_table_rewrite_keep_old_table;
 */
 extern bool yb_enable_ddl_atomicity_infra;
 extern bool yb_ddl_rollback_enabled;
-static bool inline
+static inline bool
 YbDdlRollbackEnabled () {
 	return yb_enable_ddl_atomicity_infra && yb_ddl_rollback_enabled;
 }
@@ -1116,4 +1126,11 @@ extern Relation YbGetRelationWithOverwrittenReplicaIdentity(Oid relid,
 															char replident);
 
 extern void YBCUpdateYbReadTimeAndInvalidateRelcache(uint64_t read_time);
+
+extern uint64_t YbCalculateTimeDifferenceInMicros(TimestampTz yb_start_time);
+
+static inline bool YbIsNormalDbOidReserved(Oid db_oid) {
+	return db_oid == kYBCPgSequencesDataDatabaseOid;
+}
+
 #endif /* PG_YB_UTILS_H */

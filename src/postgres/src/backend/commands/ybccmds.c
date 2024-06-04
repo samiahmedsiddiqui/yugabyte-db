@@ -102,8 +102,8 @@ ColumnSortingOptions(SortByDir dir, SortByNulls nulls, bool* is_desc, bool* is_n
 /*  Database Functions. */
 
 void
-YBCCreateDatabase(Oid dboid, const char *dbname, Oid src_dboid, Oid next_oid, bool colocated,
-				  bool *retry_on_oid_collision)
+YBCCreateDatabase(Oid dboid, const char *dbname, Oid src_dboid, const char *src_dbname, Oid next_oid, bool colocated,
+				  bool *retry_on_oid_collision, int64 clone_time)
 {
 	if (YBIsDBCatalogVersionMode())
 	{
@@ -125,8 +125,10 @@ YBCCreateDatabase(Oid dboid, const char *dbname, Oid src_dboid, Oid next_oid, bo
 	HandleYBStatus(YBCPgNewCreateDatabase(dbname,
 										  dboid,
 										  src_dboid,
+										  src_dbname,
 										  next_oid,
 										  colocated,
+										  clone_time,
 										  &handle));
 
 	YBCStatus createdb_status = YBCPgExecCreateDatabase(handle);
@@ -468,8 +470,8 @@ YBTransformPartitionSplitPoints(YBCPgStatement yb_stmt,
 static void
 CreateTableHandleSplitOptions(YBCPgStatement handle, TupleDesc desc,
 							  OptSplit *split_options, Constraint *primary_key,
-							  Oid namespaceId, const bool colocated,
-							  const bool is_tablegroup)
+							  const bool colocated, const bool is_tablegroup,
+							  YBCPgYbrowidMode ybrowid_mode)
 {
 	/* Address both types of split options */
 	switch (split_options->split_type)
@@ -478,7 +480,8 @@ CreateTableHandleSplitOptions(YBCPgStatement handle, TupleDesc desc,
 		{
 			/* Make sure we have HASH columns */
 			bool hashable = true;
-			if (primary_key) {
+			if (primary_key)
+			{
 				/* If a primary key exists, we utilize it to check its ordering */
 				ListCell *head = list_head(primary_key->yb_index_params);
 				IndexElem *index_elem = (IndexElem*) lfirst(head);
@@ -488,16 +491,9 @@ CreateTableHandleSplitOptions(YBCPgStatement handle, TupleDesc desc,
 								   is_tablegroup,
 								   true /* is_first_key */) != SORTBY_HASH)
 					hashable = false;
-			} else {
-				/* In the abscence of a primary key, we use ybrowid as the PK to hash partition */
-				bool is_pg_catalog_table_ =
-					IsSystemNamespace(namespaceId) && IsToastNamespace(namespaceId);
-				/*
-				 * Checking if  table_oid is valid simple means if the table is
-				 * part of a tablegroup.
-				 */
-				hashable = !is_pg_catalog_table_ && !colocated;
 			}
+			else
+				hashable = ybrowid_mode == PG_YBROWID_MODE_HASH;
 
 			if (!hashable)
 				ereport(ERROR, (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -781,14 +777,32 @@ YBCCreateTable(CreateStmt *stmt, char *tableName, char relkind, TupleDesc desc,
 		recordDependencyOn(&myself, &tablegroup, DEPENDENCY_NORMAL);
 	}
 
+	bool is_sys_catalog_table = YbIsSysCatalogTabletRelationByIds(relationId,
+																  namespaceId,
+																  schema_name);
+	const bool is_tablegroup = OidIsValid(tablegroupId);
+	/*
+	 * The hidden ybrowid column is added when there is no primary key.  This
+	 * column is HASH or ASC sorted depending on certain criteria.
+	 */
+	YBCPgYbrowidMode ybrowid_mode;
+	if (primary_key)
+		ybrowid_mode = PG_YBROWID_MODE_NONE;
+	else if (is_colocated_via_database || is_tablegroup ||
+			 is_sys_catalog_table)
+		ybrowid_mode = PG_YBROWID_MODE_RANGE;
+	else
+		ybrowid_mode = PG_YBROWID_MODE_HASH;
+
 	HandleYBStatus(YBCPgNewCreateTable(db_name,
 									   schema_name,
 									   tableName,
 									   databaseId,
 									   relationId,
 									   is_shared_relation,
+									   is_sys_catalog_table,
 									   false, /* if_not_exists */
-									   primary_key == NULL /* add_primary_key */,
+									   ybrowid_mode,
 									   is_colocated_via_database,
 									   tablegroupId,
 									   colocationId,
@@ -800,7 +814,7 @@ YBCCreateTable(CreateStmt *stmt, char *tableName, char relkind, TupleDesc desc,
 									   &handle));
 
 	CreateTableAddColumns(handle, desc, primary_key, is_colocated_via_database,
-						  OidIsValid(tablegroupId) /* is_tablegroup */);
+						  is_tablegroup);
 
 	/* Handle SPLIT statement, if present */
 	OptSplit *split_options = stmt->split_options;
@@ -811,9 +825,8 @@ YBCCreateTable(CreateStmt *stmt, char *tableName, char relkind, TupleDesc desc,
 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 				 errmsg("cannot create colocated table with split option")));
 		CreateTableHandleSplitOptions(
-			handle, desc, split_options, primary_key, namespaceId,
-			is_colocated_via_database,
-			OidIsValid(tablegroupId) /* is_tablegroup */);
+			handle, desc, split_options, primary_key,
+			is_colocated_via_database, is_tablegroup, ybrowid_mode);
 	}
 	/* Create the table. */
 	HandleYBStatus(YBCPgExecCreateTable(handle));
@@ -1041,64 +1054,21 @@ CreateIndexHandleSplitOptions(YBCPgStatement handle,
 	}
 }
 
-/*
- * Similar to YBCCreateTable, pgTableId and oldRelfileNodeId are used during
- * table rewrite.
- */
 void
-YBCCreateIndex(const char *indexName,
-			   IndexInfo *indexInfo,
-			   TupleDesc indexTupleDesc,
-			   int16 *coloptions,
-			   Datum reloptions,
-			   Oid indexId,
-			   Relation rel,
-			   OptSplit *split_options,
-			   const bool skip_index_backfill,
-			   bool is_colocated,
-			   Oid tablegroupId,
-			   Oid colocationId,
-			   Oid tablespaceId,
-			   Oid pgTableId,
-			   Oid oldRelfileNodeId)
+YBCBindCreateIndexColumns(YBCPgStatement handle,
+						  IndexInfo *indexInfo,
+						  TupleDesc indexTupleDesc,
+						  int16 *coloptions,
+						  int numIndexKeyAttrs)
 {
-	char *db_name	  = get_database_name(YBCGetDatabaseOid(rel));
-	char *schema_name = get_namespace_name(RelationGetNamespace(rel));
-
-	if (!IsBootstrapProcessingMode())
-		YBC_LOG_INFO("Creating index %s.%s.%s",
-					 db_name,
-					 schema_name,
-					 indexName);
-
-	YBCPgStatement handle = NULL;
-
-	HandleYBStatus(YBCPgNewCreateIndex(db_name,
-									   schema_name,
-									   indexName,
-									   YBCGetDatabaseOid(rel),
-									   indexId,
-									   YbGetRelfileNodeId(rel),
-									   rel->rd_rel->relisshared,
-									   indexInfo->ii_Unique,
-									   skip_index_backfill,
-									   false /* if_not_exists */,
-									   MyDatabaseColocated && is_colocated
-									   /* is_colocated_via_database */,
-									   tablegroupId,
-									   colocationId,
-									   tablespaceId,
-									   pgTableId,
-									   oldRelfileNodeId,
-									   &handle));
-
 	for (int i = 0; i < indexTupleDesc->natts; i++)
 	{
 		Form_pg_attribute     att         = TupleDescAttr(indexTupleDesc, i);
 		char                  *attname    = NameStr(att->attname);
 		AttrNumber            attnum      = att->attnum;
 		const YBCPgTypeEntity *col_type   = YbDataTypeFromOidMod(attnum, att->atttypid);
-		const bool            is_key      = (i < indexInfo->ii_NumIndexKeyAttrs);
+
+		const bool            is_key      = (i < numIndexKeyAttrs);
 
 		if (is_key)
 		{
@@ -1129,6 +1099,69 @@ YBCCreateIndex(const char *indexName,
 												 is_desc,
 												 is_nulls_first));
 	}
+}
+
+/*
+ * Similar to YBCCreateTable, pgTableId and oldRelfileNodeId are used during
+ * table rewrite.
+ */
+void
+YBCCreateIndex(const char *indexName,
+			   IndexInfo *indexInfo,
+			   TupleDesc indexTupleDesc,
+			   int16 *coloptions,
+			   Datum reloptions,
+			   Oid indexId,
+			   Relation rel,
+			   OptSplit *split_options,
+			   const bool skip_index_backfill,
+			   bool is_colocated,
+			   Oid tablegroupId,
+			   Oid colocationId,
+			   Oid tablespaceId,
+			   Oid pgTableId,
+			   Oid oldRelfileNodeId)
+{
+	Oid namespaceId = RelationGetNamespace(rel);
+	char *db_name	  = get_database_name(YBCGetDatabaseOid(rel));
+	char *schema_name = get_namespace_name(namespaceId);
+	bool is_sys_catalog_index = YbIsSysCatalogTabletRelationByIds(indexId,
+																  namespaceId,
+																  schema_name);
+
+	if (!IsBootstrapProcessingMode())
+		YBC_LOG_INFO("Creating index %s.%s.%s",
+					 db_name,
+					 schema_name,
+					 indexName);
+
+	YBCPgStatement handle = NULL;
+
+	HandleYBStatus(YBCPgNewCreateIndex(db_name,
+									   schema_name,
+									   indexName,
+									   YBCGetDatabaseOid(rel),
+									   indexId,
+									   YbGetRelfileNodeId(rel),
+									   rel->rd_rel->relisshared,
+									   is_sys_catalog_index,
+									   indexInfo->ii_Unique,
+									   skip_index_backfill,
+									   false /* if_not_exists */,
+									   MyDatabaseColocated && is_colocated
+									   /* is_colocated_via_database */,
+									   tablegroupId,
+									   colocationId,
+									   tablespaceId,
+									   pgTableId,
+									   oldRelfileNodeId,
+									   &handle));
+
+	IndexAmRoutine *amroutine =
+		GetIndexAmRoutineByAmId(indexInfo->ii_Am, true);
+	Assert(amroutine != NULL && amroutine->yb_ambindschema != NULL);
+	amroutine->yb_ambindschema(
+		handle, indexInfo, indexTupleDesc, coloptions);
 
 	/* Handle SPLIT statement, if present */
 	if (split_options)
@@ -1872,6 +1905,7 @@ YBCValidatePlacement(const char *placement_info)
 
 void
 YBCCreateReplicationSlot(const char *slot_name,
+						 const char *plugin_name,
 						 CRSSnapshotAction snapshot_action,
 						 uint64_t *consistent_snapshot_time)
 {
@@ -1892,6 +1926,7 @@ YBCCreateReplicationSlot(const char *slot_name,
 	}
 
 	HandleYBStatus(YBCPgNewCreateReplicationSlot(slot_name,
+												 plugin_name,
 												 MyDatabaseId,
 												 repl_slot_snapshot_action,
 												 &handle));

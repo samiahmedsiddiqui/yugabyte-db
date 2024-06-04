@@ -24,17 +24,13 @@
 
 DECLARE_bool(ysql_enable_db_catalog_version_mode);
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-//--------------------------------------------------------------------------------------------------
-// DML
-//--------------------------------------------------------------------------------------------------
 class PgSelectIndex;
 
 class PgDml : public PgStatement {
  public:
-  virtual ~PgDml();
+  ~PgDml() override;
 
   // Append a target in SELECT or RETURNING.
   Status AppendTarget(PgExpr *target);
@@ -62,6 +58,12 @@ class PgDml : public PgStatement {
   // - For a primary-index-scan, this bind specify the value of the keys of the table.
   Status BindColumn(int attnum, PgExpr *attr_value);
 
+  // Bind query vector to the current vector index search.
+  Status ANNBindVector(PgExpr *query_vec);
+
+  // Bind prefetch size to the current vector index search.
+  Status ANNSetPrefetchSize(int32_t prefetch_size);
+
   // Bind the whole table.
   Status BindTable();
 
@@ -70,8 +72,6 @@ class PgDml : public PgStatement {
 
   // Process the secondary index request if it is nested within this statement.
   Result<bool> ProcessSecondaryIndexRequest(const PgExecParameters *exec_params);
-
-  Status UpdateRequestWithYbctids(const std::vector<Slice> *ybctids, bool keepOrder);
 
   // Fetch a row and return it to Postgres layer.
   Status Fetch(int32_t natts,
@@ -92,8 +92,6 @@ class PgDml : public PgStatement {
   // key, or neither.
   Result<YBCPgColumnInfo> GetColumnInfo(int attr_num) const;
 
-  bool has_regular_targets() const;
-
   bool has_aggregate_targets() const;
 
   bool has_system_targets() const;
@@ -105,8 +103,6 @@ class PgDml : public PgStatement {
   }
 
  protected:
-  // Method members.
-  // Constructor.
   PgDml(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_region_local);
   PgDml(PgSession::ScopedRefPtr pg_session,
         const PgObjectId& table_id,
@@ -155,6 +151,9 @@ class PgDml : public PgStatement {
   // Allocate a PgsqlColRefPB entriy in the protobuf request
   virtual LWPgsqlColRefPB *AllocColRefPB() = 0;
 
+  Status UpdateRequestWithYbctids(
+      const std::vector<Slice>& ybctids, KeepOrder keep_order = KeepOrder::kFalse);
+
   template<class Request>
   static void DoSetCatalogCacheVersion(
       Request* req, std::optional<PgOid> db_oid, uint64_t version) {
@@ -192,7 +191,6 @@ class PgDml : public PgStatement {
   // - "targets_" are either selected or returned expressions by DML statements.
   PgTable target_;
   std::vector<PgFetchedTarget*> targets_;
-  bool has_regular_targets_ = false;
   bool has_aggregate_targets_ = false;
   bool has_system_targets_ = false;
 
@@ -280,5 +278,4 @@ class PgDml : public PgStatement {
   // the tuple id (ybctid).
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

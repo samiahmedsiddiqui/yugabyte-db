@@ -55,7 +55,6 @@
 using std::string;
 
 DECLARE_bool(ysql_enable_pack_full_row_update);
-DECLARE_bool(ysql_ddl_transaction_wait_for_ddl_verification);
 
 namespace yb {
 using client::YBClient;
@@ -141,9 +140,6 @@ Status CDCSDKTestBase::SetUpWithParams(
   // Set max_replication_slots to a large value so that we don't run out of them during tests and
   // don't have to do cleanups after every test case.
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_max_replication_slots) = 500;
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_allowed_preview_flags_csv) = "ysql_yb_ddl_rollback_enabled";
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_ddl_rollback_enabled) = true;
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_transaction_wait_for_ddl_verification) = true;
 
   MiniClusterOptions opts;
   opts.num_masters = num_masters;
@@ -231,8 +227,8 @@ Result<YBTableName> CDCSDKTestBase::CreateTable(
       RETURN_NOT_OK(conn.ExecuteFormat("create schema $0;", schema_name));
     }
     RETURN_NOT_OK(conn.ExecuteFormat(
-        "CREATE TYPE $0.coupon_discount_type$1 AS ENUM ('FIXED$2','PERCENTAGE$3');", schema_name,
-        enum_suffix, enum_suffix, enum_suffix));
+        "CREATE TYPE $0.$1$2 AS ENUM ('FIXED$3','PERCENTAGE$4');", schema_name,
+        kEnumTypeName, enum_suffix, enum_suffix, enum_suffix));
   }
 
   std::string table_oid_string = "";
@@ -433,9 +429,6 @@ Result<xrepl::StreamId> CDCSDKTestBase::CreateConsistentSnapshotStreamWithReplic
   auto snapshot_name =
       VERIFY_RESULT(pgwrapper::GetValue<std::optional<std::string>>(result.get(), 0, 2));
   LOG(INFO) << "Snapshot Name: " << (snapshot_name.has_value() ? *snapshot_name : "NULL");
-
-  // TODO(#20816): Sleep for 1 second - temporary till sync implementation of CreateCDCStream.
-  SleepFor(MonoDelta::FromSeconds(1));
 
   // Fetch the stream_id of the replication slot.
   auto stream_id = VERIFY_RESULT(repl_conn.FetchRow<std::string>(Format(

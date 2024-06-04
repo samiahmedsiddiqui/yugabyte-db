@@ -250,6 +250,7 @@ message GetTransactionStatusRequestPB {
   optional fixed64 propagated_hybrid_time = 3;
   // Reserved for xcluster deprecated field external_hybrid_time.
   reserved 4;
+  optional int64 raft_config_opid_index = 5;
 }
 
 message GetTransactionStatusResponsePB {
@@ -278,6 +279,8 @@ message GetTransactionStatusResponsePB {
   // Note: The field might not be present on older versions of YB and hence its existence
   // should be checked before usage by the reader.
   repeated AppStatusPB deadlock_reason = 8;
+
+  optional TabletConsensusInfoPB tablet_consensus_info = 9;
 }
 
 message GetOldTransactionsRequestPB {
@@ -337,6 +340,7 @@ message UpdateTransactionWaitingForStatusRequestPB {
     optional bytes transaction_id = 1;
     repeated BlockingTransaction blocking_transaction = 2;
     optional fixed64 wait_start_time = 3;
+    optional int64 request_id = 4;
   }
 
   optional fixed64 propagated_hybrid_time = 1;
@@ -395,6 +399,10 @@ message ProbeTransactionDeadlockResponsePB {
   }
 
   repeated DeadlockedTxnInfo deadlock = 4;
+
+  // If set, it indicates that the blocking transaction/sub-transaction(s) info sent in
+  // ProbeTransactionDeadlockRequestPB has been resolved.
+  optional bool should_erase_probe = 5;
 }
 
 message GetTransactionStatusAtParticipantRequestPB {

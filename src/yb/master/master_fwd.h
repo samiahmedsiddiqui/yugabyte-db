@@ -51,9 +51,7 @@ class CatalogManager;
 class CatalogManagerIf;
 class CatalogManagerBgTasks;
 class CloneStateManager;
-class CDCConsumerSplitDriverIf;
 class XClusterRpcTasks;
-class CDCSplitDriverIf;
 class ClusterConfigInfo;
 class ClusterLoadBalancer;
 class FlushManager;
@@ -94,6 +92,7 @@ class YsqlBackendsManager;
 class YsqlTablegroupManager;
 class YsqlTablespaceManager;
 class YsqlTransactionDdl;
+class MasterClusterHandler;
 
 struct XClusterConsumerStreamInfo;
 struct PgTableReadData;

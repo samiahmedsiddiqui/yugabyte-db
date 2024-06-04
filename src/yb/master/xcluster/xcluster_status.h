@@ -16,12 +16,14 @@
 #include "yb/cdc/xcluster_types.h"
 #include "yb/cdc/xrepl_types.h"
 #include "yb/common/entity_ids_types.h"
+#include "yb/common/common_types.pb.h"
 
 namespace yb {
 
 namespace master {
 
 struct InboundXClusterReplicationGroupTableStatus {
+  std::string full_table_name;
   TableId source_table_id;
   xrepl::StreamId stream_id = xrepl::StreamId::Nil();
   TableId target_table_id;
@@ -36,18 +38,22 @@ struct InboundXClusterReplicationGroupTableStatus {
 struct XClusterInboundReplicationGroupStatus {
   xcluster::ReplicationGroupId replication_group_id;
   std::string state;
-  bool transactional = false;
+  XClusterReplicationType replication_type = XClusterReplicationType::XCLUSTER_NON_TRANSACTIONAL;
   std::string master_addrs;
   bool disable_stream = false;
   uint32 compatible_auto_flag_config_version = 0;
   uint32 validated_remote_auto_flags_config_version = 0;
   uint32 validated_local_auto_flags_config_version = 0;
   std::string db_scoped_info;
-  std::vector<InboundXClusterReplicationGroupTableStatus> table_statuses;
+  // Map of target namespace id to source namespace id. Only used in db scope replication.
+  std::unordered_map<NamespaceId, NamespaceId> db_scope_namespace_id_map;
+  std::unordered_map<NamespaceName, std::vector<InboundXClusterReplicationGroupTableStatus>>
+      table_statuses_by_namespace;
 };
 
 class XClusterOutboundTableStreamStatus {
  public:
+  std::string full_table_name;
   TableId table_id;
   xrepl::StreamId stream_id = xrepl::StreamId::Nil();
   std::string state;

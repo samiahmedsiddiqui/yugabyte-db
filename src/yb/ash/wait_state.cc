@@ -61,10 +61,13 @@ DEFINE_test_flag(uint32, yb_ash_sleep_at_wait_state_ms, 0,
     "How long to sleep/delay when entering a particular wait state.");
 DEFINE_test_flag(uint32, yb_ash_wait_code_to_sleep_at, 0,
     "If enabled, add a sleep/delay when we enter the specified wait state.");
-DEFINE_test_flag(bool, export_ash_uuids_as_hex_strings, yb::kIsDebug,
-    "Exports wait-state name as a human understandable string.");
+DEPRECATE_FLAG(bool, TEST_export_ash_uuids_as_hex_strings, "04_2024");
 DEFINE_test_flag(bool, ash_debug_aux, false, "Set ASH aux_info to the first 16 characters"
     " of the method tserver is running");
+DEFINE_test_flag(bool, ash_fetch_wait_states_for_raft_log, true, "Should ASH fetch "
+      "background task states, such as raft log sync/append.");
+DEFINE_test_flag(bool, ash_fetch_wait_states_for_rocksdb_flush_and_compaction, true,
+      "Should ASH fetch background task states, such as rocksdb flush and compaction.");
 
 namespace yb::ash {
 
@@ -75,12 +78,12 @@ thread_local WaitStateInfoPtr threadlocal_wait_state_;
 std::atomic_bool TEST_entered_wait_state_code_for_sleep{false};
 
 void MaybeSleepForTests(WaitStateInfo* state, WaitStateCode c) {
-  if (GetAtomicFlag(&FLAGS_TEST_yb_ash_wait_code_to_sleep_at) != to_underlying(c)) {
+  if (FLAGS_TEST_yb_ash_wait_code_to_sleep_at != to_underlying(c)) {
     return;
   }
 
   TEST_entered_wait_state_code_for_sleep.store(true, std::memory_order_release);
-  auto sleep_time_ms = GetAtomicFlag(&FLAGS_TEST_yb_ash_sleep_at_wait_state_ms);
+  auto sleep_time_ms = FLAGS_TEST_yb_ash_sleep_at_wait_state_ms;
   if (sleep_time_ms <= 0) {
     return;
   }
@@ -109,7 +112,7 @@ void WaitStateInfo::TEST_SleepForTests(uint32_t sleep_time_ms) {
     return;
   }
   SleepFor(MonoDelta::FromMilliseconds(decayed_sleep_time_ms));
-  if (GetAtomicFlag(&FLAGS_TEST_trace_ash_wait_code_updates)) {
+  if (FLAGS_TEST_trace_ash_wait_code_updates) {
     VTrace(0, yb::Format("Slept for $0 ms.", decayed_sleep_time_ms));
   }
   VLOG_IF(1, TEST_num_sleeps_ == 0) << "Sleeping at " << yb::GetStackTrace();
@@ -126,8 +129,8 @@ void AshMetadata::set_client_host_port(const HostPort &host_port) {
 
 std::string AshMetadata::ToString() const {
   return YB_STRUCT_TO_STRING(
-      yql_endpoint_tserver_uuid, root_request_id, query_id, session_id, rpc_request_id,
-      client_host_port);
+      yql_endpoint_tserver_uuid, root_request_id, query_id, session_id, database_id,
+      rpc_request_id, client_host_port);
 }
 
 std::string AshAuxInfo::ToString() const {
@@ -149,13 +152,16 @@ void AshAuxInfo::UpdateFrom(const AshAuxInfo &other) {
 WaitStateInfo::WaitStateInfo()
     : metadata_(AshMetadata{}) {}
 
-void WaitStateInfo::set_code(WaitStateCode c) {
-  if (GetAtomicFlag(&FLAGS_TEST_trace_ash_wait_code_updates)) {
-    VTrace(1, __func__);
-    VTrace(0, yb::Format("$0", ash::ToString(c)));
+void WaitStateInfo::set_code(WaitStateCode code, const char* location) {
+  if (FLAGS_TEST_trace_ash_wait_code_updates) {
+    if (FLAGS_tracing_level >= 1) {
+      VTrace(1, yb::Format("$0 at $1", ash::ToString(code), location));
+    } else {
+      VTrace(0, yb::Format("$0", ash::ToString(code)));
+    }
   }
-  code_ = c;
-  MaybeSleepForTests(this, c);
+  code_ = code;
+  MaybeSleepForTests(this, code);
 }
 
 WaitStateCode WaitStateInfo::code() const {
@@ -237,6 +243,23 @@ const WaitStateInfoPtr& WaitStateInfo::CurrentWaitState() {
   return threadlocal_wait_state_;
 }
 
+void WaitStateInfo::EnableConcurrentUpdates() {
+  concurrent_updates_allowed_ = true;
+  if (FLAGS_TEST_trace_ash_wait_code_updates) {
+    VTrace(0, yb::Format("Enabling concurrent updates"));
+  }
+}
+
+bool WaitStateInfo::IsConcurrentUpdatesEnabled() {
+  return concurrent_updates_allowed_;
+}
+
+void EnableConcurrentUpdates(const WaitStateInfoPtr& ptr) {
+  if (ptr) {
+    ptr->EnableConcurrentUpdates();
+  }
+}
+
 //
 // ScopedAdoptWaitState
 //
@@ -252,19 +275,25 @@ ScopedAdoptWaitState::~ScopedAdoptWaitState() {
 //
 // ScopedWaitStatus
 //
-ScopedWaitStatus::ScopedWaitStatus(WaitStateCode code)
+ScopedWaitStatus::ScopedWaitStatus(WaitStateCode code, const char* location)
     : code_(code),
+      location_(location),
       prev_code_(
           WaitStateInfo::CurrentWaitState()
               ? WaitStateInfo::CurrentWaitState()->mutable_code().exchange(code_)
               : code_) {
-  if (const auto& wait_state = WaitStateInfo::CurrentWaitState()) {
-    if (GetAtomicFlag(&FLAGS_TEST_trace_ash_wait_code_updates)) {
-      wait_state->VTrace(1, __func__);
+  const auto& wait_state = WaitStateInfo::CurrentWaitState();
+  if (!wait_state) {
+    return;
+  }
+  if (FLAGS_TEST_trace_ash_wait_code_updates) {
+    if (FLAGS_tracing_level >= 1) {
+      wait_state->VTrace(1, yb::Format("$0 at $1", ash::ToString(code), location));
+    } else {
       wait_state->VTrace(0, yb::Format("$0", ash::ToString(code)));
     }
   }
-  MaybeSleepForTests(WaitStateInfo::CurrentWaitState().get(), code);
+  MaybeSleepForTests(wait_state.get(), code);
 }
 
 ScopedWaitStatus::~ScopedWaitStatus() {
@@ -275,14 +304,27 @@ ScopedWaitStatus::~ScopedWaitStatus() {
 
   auto expected = code_;
   if (!wait_state->mutable_code().compare_exchange_strong(expected, prev_code_)) {
-    VLOG_WITH_FUNC(3) << "not reverting to prev_code_: " << prev_code_ << " since "
-                      << " current_code: " << expected << " is not " << code_;
+    if (FLAGS_TEST_trace_ash_wait_code_updates) {
+      wait_state->VTrace(
+          0,
+          yb::Format("Failed to revert to $0 at $1. We set it to $2 but it is now $3",
+              ash::ToString(prev_code_), location_, ash::ToString(code_), ash::ToString(expected)));
+    }
+    LOG_IF(DFATAL, !wait_state->IsConcurrentUpdatesEnabled())
+        << " In " << location_ << " wait-state " << wait_state.get() << " was updated to " << code_
+        << " from " << prev_code_ << " but it is currently " << expected
+        << ". Not expecting concurrent updates."
+        << "\nTrace so far:" << wait_state->DumpTraceToString();
     return;
   }
 
-  if (GetAtomicFlag(&FLAGS_TEST_trace_ash_wait_code_updates)) {
-    wait_state->VTrace(1, __func__);
-    wait_state->VTrace(0, yb::Format("$0", ash::ToString(prev_code_)));
+  if (FLAGS_TEST_trace_ash_wait_code_updates) {
+    if (FLAGS_tracing_level >= 1) {
+      wait_state->VTrace(
+          1, yb::Format("Reverted to $0 at $1", ash::ToString(prev_code_), location_));
+    } else {
+      wait_state->VTrace(0, yb::Format("Reverted to $0", ash::ToString(prev_code_)));
+    }
   }
   MaybeSleepForTests(wait_state.get(), prev_code_);
 }
@@ -370,6 +412,7 @@ WaitStateType GetWaitStateType(WaitStateCode code) {
     case WaitStateCode::kRocksDB_ReadBlockFromFile:
     case WaitStateCode::kRocksDB_OpenFile:
     case WaitStateCode::kRocksDB_WriteToFile:
+    case WaitStateCode::kRocksDB_CloseFile:
       return WaitStateType::kDiskIO;
 
     case WaitStateCode::kRocksDB_Flush:
@@ -378,9 +421,6 @@ WaitStateType GetWaitStateType(WaitStateCode code) {
 
     case WaitStateCode::kRocksDB_PriorityThreadPoolTaskPaused:
       return WaitStateType::kWaitOnCondition;
-
-    case WaitStateCode::kRocksDB_CloseFile:
-      return WaitStateType::kDiskIO;
 
     case WaitStateCode::kRocksDB_RateLimiter:
     case WaitStateCode::kRocksDB_WaitForSubcompaction:
@@ -407,6 +447,7 @@ namespace {
 
 WaitStateTracker flush_and_compaction_wait_states_tracker;
 WaitStateTracker raft_log_appender_wait_states_tracker;
+WaitStateTracker pg_shared_memory_perform_tracker;
 
 }  // namespace
 
@@ -416,6 +457,10 @@ WaitStateTracker& FlushAndCompactionWaitStatesTracker() {
 
 WaitStateTracker& RaftLogAppenderWaitStatesTracker() {
   return raft_log_appender_wait_states_tracker;
+}
+
+WaitStateTracker& SharedMemoryPgPerformTracker() {
+  return pg_shared_memory_perform_tracker;
 }
 
 }  // namespace yb::ash

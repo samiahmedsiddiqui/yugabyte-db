@@ -760,6 +760,15 @@ public enum TaskType {
   DeleteRemnantStreams(
       com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteRemnantStreams.class),
 
+  CreateOutboundReplicationGroup(
+      com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.CreateOutboundReplicationGroup.class),
+
+  XClusterDbReplicationSetup(
+      com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.XClusterDbReplicationSetup.class),
+
+  DeleteReplicationOnSource(
+      com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteReplicationOnSource.class),
+
   // Tasks belonging to subtasks.cloud classpath
   CloudAccessKeyCleanup(
       com.yugabyte.yw.commissioner.tasks.subtasks.cloud.CloudAccessKeyCleanup.class),

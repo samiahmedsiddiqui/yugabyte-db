@@ -105,12 +105,14 @@ Physical nodes (or cloud instances) are installed with a standard CentOS 7 serve
 1. Add a new `yugabyte:yugabyte` user and group with the default login shell `/bin/bash` that you set via the `-s` flag, as follows:
 
     ```bash
-    sudo useradd -s /bin/bash --create-home --home-dir <yugabyte_home> yugabyte  # (add user yugabyte and create its home directory as specified in <yugabyte_home>)
+    sudo useradd -u <yugabyte_user_uid> -s /bin/bash --create-home --home-dir <yugabyte_home> yugabyte  # (add user yugabyte and create its home directory as specified in <yugabyte_home>)
     sudo passwd yugabyte   # (add a password to the yugabyte user)
     sudo su - yugabyte   # (change to yugabyte user for execution of next steps)
     ```
 
-    `yugabyte_home` is the path to the Yugabyte home directory. If you set a custom path for the yugabyte user's home in the YugabyteDB Anywhere UI, you must use the same path here. Otherwise, you can omit the `--home-dir` flag.
+    - `yugabyte_user_uid` is a common UID for the `yugabyte` user to use across all nodes. Use the same UID for the `yugabyte` user on all nodes in the same cluster. If you don't use a common UID, you may run into issues, for example, if you are using NFS for backups.
+
+    - `yugabyte_home` is the path to the Yugabyte home directory. By default, this is `/home/yugabyte`. If you set a custom path for the yugabyte user's home in the YugabyteDB Anywhere UI, you must use the same path here. Otherwise, you can omit the `--home-dir` flag.
 
     Ensure that the `yugabyte` user has permissions to SSH into the YugabyteDB nodes (as defined in `/etc/ssh/sshd_config`).
 
@@ -724,13 +726,13 @@ To install the YugabyteDB node agent manually, as the `yugabyte` user, do the fo
 1. Run the following command to download the node agent's `.tgz` file which installs and starts the interactive configuration:
 
    ```sh
-   ./installer.sh -c install -u https://<yba_address>:9000 -t <api_token>
+   ./installer.sh -c install -u https://<yba_address> -t <api_token>
    ```
 
    For example, if you run the following:
 
    ```sh
-   ./installer.sh  -c install -u http://10.98.0.42:9000 -t 301fc382-cf06-4a1b-b5ef-0c8c45273aef
+   ./installer.sh  -c install -u https://10.98.0.42 -t 301fc382-cf06-4a1b-b5ef-0c8c45273aef
    ```
 
    You should get output similar to the following:
@@ -856,13 +858,13 @@ To reconfigure a node for use in a different provider, do the following:
 1. Run the `configure` command to start the interactive configuration. This also registers the node agent with YBA.
 
     ```sh
-    node-agent node configure -t <api_token> -u https://<yba_address>:9000
+    node-agent node configure -t <api_token> -u https://<yba_address>
     ```
 
     For example, if you run the following:
 
     ```sh
-    node-agent node configure -t 1ba391bc-b522-4c18-813e-71a0e76b060a -u http://10.98.0.42:9000
+    node-agent node configure -t 1ba391bc-b522-4c18-813e-71a0e76b060a -u https://10.98.0.42:9000
     ```
 
     ```output

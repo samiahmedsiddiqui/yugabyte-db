@@ -26,6 +26,7 @@
 
 #include "pg_yb_utils.h"
 
+#include <arpa/inet.h>
 #include <assert.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -829,6 +830,34 @@ typedef struct YbSessionStats
 
 static YbSessionStats yb_session_stats = {0};
 
+static void
+IpAddressToBytes(YBCPgAshConfig *ash_config)
+{
+	if (!YbAshIsClientAddrSet())
+		return;
+
+	uint8_t addr_family = ash_config->metadata->addr_family;
+
+	switch (addr_family)
+	{
+		case AF_UNIX:
+			switch_fallthrough();
+		case AF_UNSPEC:
+			break;
+		case AF_INET:
+			switch_fallthrough();
+		case AF_INET6:
+			if (inet_ntop(addr_family, ash_config->metadata->client_addr,
+						  ash_config->host, INET6_ADDRSTRLEN) == NULL)
+				ereport(LOG,
+						(errmsg("failed converting IP address from binary to string")));
+			break;
+		default:
+			ereport(LOG,
+					(errmsg("unknown address family found: %u", addr_family)));
+	}
+}
+
 void
 YBInitPostgresBackend(
 	const char *program_name,
@@ -860,12 +889,12 @@ YBInitPostgresBackend(
 		callbacks.PgstatReportWaitStart = &yb_pgstat_report_wait_start;
 		YBCPgAshConfig ash_config;
 		ash_config.metadata = &MyProc->yb_ash_metadata;
-		ash_config.is_metadata_set = &MyProc->yb_is_ash_metadata_set;
 		ash_config.yb_enable_ash = &yb_enable_ash;
+		IpAddressToBytes(&ash_config);
 		YBCInitPgGate(type_table, count, callbacks, session_id, &ash_config);
 		YBCInstallTxnDdlHook();
 		if (yb_ash_enable_infra)
-			YbAshInstallHooks();
+			YbAshInit();
 
 		/*
 		 * For each process, we create one YBC session for PostgreSQL to use
@@ -917,17 +946,37 @@ YBCCommitTransaction()
 	if (!IsYugaByteEnabled())
 		return;
 
-	HandleYBStatus(YBCPgCommitTransaction());
+	HandleYBStatus(YBCPgCommitPlainTransaction());
 }
 
 void
 YBCAbortTransaction()
 {
-	if (!IsYugaByteEnabled())
+	if (!IsYugaByteEnabled() || !YBTransactionsEnabled())
 		return;
 
-	if (YBTransactionsEnabled())
-		HandleYBStatus(YBCPgAbortTransaction());
+	/*
+	 * If a DDL operation during a DDL txn fails, the txn will be aborted before
+	 * we get here. However if there are failures afterwards (i.e. during
+	 * COMMIT or catalog version increment), then we might get here as part of
+	 * top level error recovery in PostgresMain() with the DDL txn state still
+	 * set in pggate. Clean it up in that case.
+	 */
+	 YBCStatus status = YBCPgClearSeparateDdlTxnMode();
+
+	/*
+	 * Aborting a transaction is likely to fail only when there are issues
+	 * communicating with the tserver. Close the backend connection in such
+	 * scenarios to avoid a recursive loop of aborting again and again as part
+	 * of error handling in PostgresMain() because of the error faced during
+	 * abort.
+	 */
+	if (unlikely(status))
+		elog(FATAL, "Failed to abort DDL transaction: %s", YBCMessageAsCString(status));
+
+	status = YBCPgAbortPlainTransaction();
+	if (unlikely(status))
+		elog(FATAL, "Failed to abort DML transaction: %s", YBCMessageAsCString(status));
 }
 
 void
@@ -1309,6 +1358,7 @@ bool yb_prefer_bnl = false;
 bool yb_explain_hide_non_deterministic_fields = false;
 bool yb_enable_saop_pushdown = true;
 int yb_toast_catcache_threshold = -1;
+int yb_parallel_range_size = 1024 * 1024;
 
 //------------------------------------------------------------------------------
 // YB Debug utils.
@@ -1330,6 +1380,8 @@ double yb_test_ybgin_disable_cost_factor = 2.0;
 char *yb_test_block_index_phase = "";
 
 char *yb_test_fail_index_state_change = "";
+
+char* yb_default_replica_identity = "CHANGE";
 
 bool yb_test_fail_table_rewrite_after_creation = false;
 
@@ -1423,6 +1475,7 @@ typedef struct DdlTransactionState
 	CatalogModificationAspects catalog_modification_aspects;
 	bool is_global_ddl;
 	NodeTag original_node_tag;
+	const char *original_ddl_command_tag;
 } DdlTransactionState;
 
 static DdlTransactionState ddl_transaction_state = {0};
@@ -1441,7 +1494,12 @@ YBResetEnableNonBreakingDDLMode()
 	/*
 	 * Reset yb_make_next_ddl_statement_nonbreaking to avoid its further side
 	 * effect that may not be intended.
+	 * 
+	 * Also, reset Connection Manager cache if the value was cached to begin
+	 * with.
 	 */
+	if (YbIsClientYsqlConnMgr() && yb_make_next_ddl_statement_nonbreaking)
+		YbSendParameterStatusForConnectionManager("yb_make_next_ddl_statement_nonbreaking", "false");
 	yb_make_next_ddl_statement_nonbreaking = false;
 }
 
@@ -1544,6 +1602,8 @@ YBDecrementDdlNestingLevel()
 	if (yb_test_fail_next_ddl)
 	{
 		yb_test_fail_next_ddl = false;
+		if (YbIsClientYsqlConnMgr())
+			YbSendParameterStatusForConnectionManager("yb_test_fail_next_ddl", "false");
 		elog(ERROR, "Failed DDL operation as requested");
 	}
 	if (ddl_transaction_state.nesting_level == 0)
@@ -1570,7 +1630,8 @@ YBDecrementDdlNestingLevel()
 				(mode & YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT) &&
 				YbIncrementMasterCatalogVersionTableEntry(
 					mode & YB_SYS_CAT_MOD_ASPECT_BREAKING_CHANGE,
-					ddl_transaction_state.is_global_ddl);
+					ddl_transaction_state.is_global_ddl,
+					ddl_transaction_state.original_ddl_command_tag);
 
 			is_silent_altering = (mode == YB_DDL_MODE_SILENT_ALTERING);
 		}
@@ -1668,6 +1729,8 @@ YbDdlModeOptional YbGetDdlMode(
 		 * be incremented.
 		 */
 		ddl_transaction_state.original_node_tag = node_tag;
+		ddl_transaction_state.original_ddl_command_tag =
+			CreateCommandTag(parsetree);
 	}
 	else
 	{
@@ -2796,7 +2859,7 @@ getSplitPointsInfo(Oid relid, YBCPgTableDesc yb_tabledesc,
 				   YbTableProperties yb_table_properties,
 				   Oid *pkeys_atttypid,
 				   YBCPgSplitDatum *split_datums,
-				   bool *has_null)
+				   bool *has_null, bool *has_gin_null)
 {
 	Assert(yb_table_properties->num_tablets > 1);
 
@@ -2836,7 +2899,8 @@ getSplitPointsInfo(Oid relid, YBCPgTableDesc yb_tabledesc,
 
 	/* Get Split point values as Postgres datums */
 	HandleYBStatus(YBCGetSplitPoints(yb_tabledesc, type_entities,
-									 type_attrs_arr, split_datums, has_null));
+									 type_attrs_arr, split_datums, has_null,
+									 has_gin_null));
 }
 
 /*
@@ -2856,10 +2920,11 @@ rangeSplitClause(Oid relid, YBCPgTableDesc yb_tabledesc,
 	StringInfo prev_split_point = makeStringInfo();
 	StringInfo cur_split_point = makeStringInfo();
 	bool has_null = false;
+	bool has_gin_null = false;
 
 	/* Get Split point values as Postgres datum */
 	getSplitPointsInfo(relid, yb_tabledesc, yb_table_properties, pkeys_atttypid,
-					   split_datums, &has_null);
+					   split_datums, &has_null, &has_gin_null);
 
 	/*
 	 * Check for existence of NULL in split points.
@@ -2874,6 +2939,24 @@ rangeSplitClause(Oid relid, YBCPgTableDesc yb_tabledesc,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("NULL value present in split points"),
 				 errdetail("Specifying NULL value in SPLIT AT VALUES clause is "
+						   "not supported.")));
+		return;
+	}
+
+	/*
+	 * Check for existence of GinNull in split points.
+	 * We don't support (1) decoding GinNull into Postgres datum and
+	 * (2) specify GinNull in SPLIT AT VALUES clause for both
+	 * CREATE TABLE and CREATE INDEX.
+	 * However, split points of GIN indexes generated by tablet splitting can have
+	 * GinNull in its split points.
+	 */
+	if (has_gin_null)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("GinNull value present in split points"),
+				 errdetail("Specifying GinNull value in SPLIT AT VALUES clause is "
 						   "not supported.")));
 		return;
 	}
@@ -2959,10 +3042,11 @@ getRangeSplitPointsList(Oid relid, YBCPgTableDesc yb_tabledesc,
 	Oid pkeys_atttypid[num_range_key_columns];
 	YBCPgSplitDatum split_datums[num_splits * num_range_key_columns];
 	bool has_null;
+	bool has_gin_null;
 
 	/* Get Split point values as YBCPgSplitDatum. */
 	getSplitPointsInfo(relid, yb_tabledesc, yb_table_properties,
-					   pkeys_atttypid, split_datums, &has_null);
+					   pkeys_atttypid, split_datums, &has_null, &has_gin_null);
 
 	/* Construct PartitionRangeDatums split points list. */
 	for (int split_idx = 0; split_idx < num_splits; ++split_idx)
@@ -3038,10 +3122,39 @@ yb_get_range_split_clause(PG_FUNCTION_ARGS)
 	 * Get SPLIT AT VALUES clause for range relations with more than one tablet.
 	 * Skip one-tablet range-partition relations such that this function
 	 * return an empty string for them.
+	 *
+	 * For YB backup, if an error is thrown from a PG backend, ysql_dump will
+	 * exit, generate an empty YSQLDUMP file, and block YB backup workflow.
+	 * Currently, we don't have the functionality to adjust options used for 
+	 * ysql_dump on YBA and YBM, so we don't have a way to to turn on/off
+	 * a backup-related feature used in ysql_dump.
+	 * There are known cases which caused decoding of split points to fail in
+	 * the past and are handled specifically now.
+	 * (1) null values appear in split points after tablet splitting
+	 * (2) GinNull values appear in split points after tablet splitting
+	 * (3) duplicate split points appear after tablet splitting on an
+	 *     index's hidden column
+	 * Thus, for the sake of YB backup, protect the split point decoding with
+	 * TRY CATCH block in case decoding fails due to other unknown cases.
+	 * Return an empty string if decoding fails.
 	 */
 	initStringInfo(&str);
-	if (yb_table_properties.num_tablets > 1)
-		rangeSplitClause(relid, yb_tabledesc, &yb_table_properties, &str);
+	PG_TRY();
+	{
+		if (yb_table_properties.num_tablets > 1)
+			rangeSplitClause(relid, yb_tabledesc, &yb_table_properties, &str);
+	}
+	PG_CATCH();
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("cannot decode split point in SPLIT AT VALUES clause "
+						 "of relation with oid %u", relid),
+				 errdetail("Returning an empty string instead.")));
+		/* Empty string if split point decoding fails. */
+		resetStringInfo(&str);
+	}
+	PG_END_TRY();
 	range_split_clause = str.data;
 
 	PG_RETURN_CSTRING(range_split_clause);
@@ -3201,6 +3314,117 @@ yb_server_zone(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	return CStringGetTextDatum(current_zone);
+}
+
+static bytea *
+bytesToBytea(const char *in, int len)
+{
+	bytea	   *out;
+
+	out = (bytea *) palloc(len + VARHDRSZ);
+	SET_VARSIZE(out, len + VARHDRSZ);
+	memcpy(VARDATA(out), in, len);
+
+	return out;
+}
+
+Datum
+yb_local_tablets(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	int			i;
+#define YB_TABLET_INFO_COLS 8
+
+	/* only superuser and yb_db_admin can query this function */
+	if (!superuser() && !IsYbDbAdminUser(GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("only superusers and yb_db_admin can query yb_local_tablets"))));
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not " \
+						"allowed in this context")));
+
+	/*
+	 * Switch context to construct returned data structures and store
+	 * returned values from tserver.
+	 */
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errmsg_internal("return type must be a row type")));
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	YBCPgTabletsDescriptor	*tablets = NULL;
+	size_t		num_tablets = 0;
+	HandleYBStatus(YBCLocalTablets(&tablets, &num_tablets));
+
+	for (i = 0; i < num_tablets; ++i)
+	{
+		YBCPgTabletsDescriptor *tablet = (YBCPgTabletsDescriptor *)tablets + i;
+		Datum		values[YB_TABLET_INFO_COLS];
+		bool		nulls[YB_TABLET_INFO_COLS];
+		bytea	   *partition_key_start;
+		bytea	   *partition_key_end;
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		values[0] = CStringGetTextDatum(tablet->tablet_id);
+		values[1] = CStringGetTextDatum(tablet->table_id);
+		values[2] = CStringGetTextDatum(tablet->table_type);
+		values[3] = CStringGetTextDatum(tablet->namespace_name);
+		values[4] = CStringGetTextDatum(tablet->pgschema_name);
+		values[5] = CStringGetTextDatum(tablet->table_name);
+
+		if (tablet->partition_key_start_len)
+		{
+			partition_key_start = bytesToBytea(tablet->partition_key_start,
+											   tablet->partition_key_start_len);
+			values[6] = PointerGetDatum(partition_key_start);
+		}
+		else
+			nulls[6] = true;
+
+		if (tablet->partition_key_end_len)
+		{
+			partition_key_end = bytesToBytea(tablet->partition_key_end,
+											 tablet->partition_key_end_len);
+			values[7] = PointerGetDatum(partition_key_end);
+		}
+		else
+			nulls[7] = true;
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+#undef YB_TABLET_INFO_COLS
+
+	/* clean up and return the tuplestore */
+	tuplestore_donestoring(tupstore);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return (Datum) 0;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -3873,12 +4097,15 @@ assign_yb_read_time(const char* newval, void *extra)
 	parse_yb_read_time(newval, &value_ull, &is_ht_unit);
 	yb_read_time = value_ull;
 	yb_is_read_time_ht = is_ht_unit;
-	ereport(NOTICE,
-			(errmsg("yb_read_time should be set with caution."),
-			 errdetail("No DDL operations should be performed while it is set and "
-			 		   "it should not be set to a timestamp before a DDL "
-					   "operation has been performed. It doesn't have well defined semantics"
-					   " for normal transactions and is only to be used after consultation")));
+	if (!am_walsender)
+	{
+		ereport(NOTICE,
+				(errmsg("yb_read_time should be set with caution."),
+				errdetail("No DDL operations should be performed while it is set and "
+						"it should not be set to a timestamp before a DDL "
+						"operation has been performed. It doesn't have well defined semantics"
+						" for normal transactions and is only to be used after consultation")));
+	}
 }
 
 void
@@ -4591,7 +4818,7 @@ Relation
 YbGetRelationWithOverwrittenReplicaIdentity(Oid relid, char replident)
 {
 	Relation relation;
-	
+
 	relation = RelationIdGetRelation(relid);
 	if (!RelationIsValid(relation))
 		elog(ERROR, "could not open relation with OID %u", relid);
@@ -4604,10 +4831,23 @@ YbGetRelationWithOverwrittenReplicaIdentity(Oid relid, char replident)
 void
 YBCUpdateYbReadTimeAndInvalidateRelcache(uint64_t read_time_ht)
 {
+	/* Shouldn't go backwards on yb_read_time */
+	Assert(yb_read_time <= read_time_ht);
 	char read_time[50];
 
 	sprintf(read_time, "%llu ht", (unsigned long long) read_time_ht);
 	elog(DEBUG1, "Setting yb_read_time to %s ", read_time);
 	assign_yb_read_time(read_time, NULL);
 	YbRelationCacheInvalidate();
+}
+
+uint64_t
+YbCalculateTimeDifferenceInMicros(TimestampTz yb_start_time)
+{
+	long secs;
+	int microsecs;
+
+	TimestampDifference(yb_start_time, GetCurrentTimestamp(), &secs,
+						&microsecs);
+	return secs * USECS_PER_SEC + microsecs;
 }

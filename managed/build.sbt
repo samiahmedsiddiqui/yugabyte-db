@@ -158,13 +158,13 @@ libraryDependencies ++= Seq(
   guice,
   "com.google.inject"            % "guice"                % "5.1.0",
   "com.google.inject.extensions" % "guice-assistedinject" % "5.1.0",
-  "org.postgresql" % "postgresql" % "42.3.3",
+  "org.postgresql" % "postgresql" % "42.3.9",
   "net.logstash.logback" % "logstash-logback-encoder" % "6.2",
   "ch.qos.logback" % "logback-classic" % "1.4.14",
   "org.codehaus.janino" % "janino" % "3.1.9",
   "org.apache.commons" % "commons-lang3" % "3.14.0",
   "org.apache.commons" % "commons-collections4" % "4.4",
-  "org.apache.commons" % "commons-compress" % "1.25.0",
+  "org.apache.commons" % "commons-compress" % "1.26.0",
   "org.apache.commons" % "commons-csv" % "1.10.0",
   "org.apache.httpcomponents.core5" % "httpcore5" % "5.2.4",
   "org.apache.httpcomponents.core5" % "httpcore5-h2" % "5.2.4",
@@ -174,7 +174,7 @@ libraryDependencies ++= Seq(
   "com.yugabyte" % "cassandra-driver-core" % "3.8.0-yb-7",
   "org.yaml" % "snakeyaml" % "2.1",
   "org.bouncycastle" % "bcpkix-jdk15on" % "1.61",
-  "org.springframework.security" % "spring-security-core" % "5.8.3",
+  "org.springframework.security" % "spring-security-core" % "5.8.11",
   "com.amazonaws" % "aws-java-sdk-ec2" % "1.12.599",
   "com.amazonaws" % "aws-java-sdk-kms" % "1.12.599",
   "com.amazonaws" % "aws-java-sdk-iam" % "1.12.599",
@@ -225,7 +225,7 @@ libraryDependencies ++= Seq(
   "io.kamon" %% "kamon-prometheus" % "2.5.9",
   "org.unix4j" % "unix4j-command" % "0.6",
   "com.bettercloud" % "vault-java-driver" % "5.1.0",
-  "org.apache.directory.api" % "api-all" % "2.1.0",
+  "org.apache.directory.api" % "api-all" % "2.1.6",
   "io.fabric8" % "crd-generator-apt" % "6.8.0",
   "io.fabric8" % "kubernetes-client" % "6.8.0",
   "io.fabric8" % "kubernetes-client-api" % "6.8.0",
@@ -904,7 +904,7 @@ runPlatform := {
   Project.extract(newState).runTask(runPlatformTask, newState)
 }
 
-libraryDependencies += "org.yb" % "yb-client" % "0.8.83-SNAPSHOT"
+libraryDependencies += "org.yb" % "yb-client" % "0.8.86-SNAPSHOT"
 libraryDependencies += "org.yb" % "ybc-client" % "2.1.0.0-b9"
 libraryDependencies += "org.yb" % "yb-perf-advisor" % "1.0.0-b33"
 

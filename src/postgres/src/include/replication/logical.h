@@ -97,9 +97,6 @@ typedef struct LogicalDecodingContext
 	 */
 	XLogRecPtr	yb_start_decoding_at;
 
-	/* True if we are yet to handle the relcache invalidation at the startup. */
-	bool		yb_handle_relcache_invalidation_startup;
-
 	/*
 	 * A per table_oid to oid map.
 	 *
@@ -140,5 +137,7 @@ extern void LogicalIncreaseRestartDecodingForSlot(XLogRecPtr current_lsn,
 extern void LogicalConfirmReceivedLocation(XLogRecPtr lsn);
 
 extern bool filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id);
+
+extern void YBValidateOutputPlugin(char *plugin);
 
 #endif

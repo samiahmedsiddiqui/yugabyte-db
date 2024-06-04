@@ -76,6 +76,10 @@
   to = "https://docs-archive.yugabyte.com/v2.8/deploy/docker/docker-swarm/"
   force = true
 
+[[redirects]]
+  from = "/preview/admin/docker-compose/"
+  to = "/preview/quick-start/docker/"
+
 ##########################################################
 # Move Hugo Aliases (that redirects using meta refresh tag)
 ##########################################################
@@ -91,6 +95,10 @@
 [[redirects]]
   from = "/architecture/core-functions/write-path/"
   to = "/preview/architecture/core-functions/write-path/"
+
+[[redirects]]
+  from = "/preview/architecture/core-functions/*"
+  to = "/preview/architecture/"
 
 [[redirects]]
   from = "/architecture/transactions/distributed-txns/"
@@ -157,8 +165,12 @@
   to = "/preview/explore/ycql-language/jsonb-ycql/"
 
 [[redirects]]
+  from = "/preview/explore/ysql-language-features/going-beyond-sql/*"
+  to = "/preview/explore/going-beyond-sql/:splat"
+
+[[redirects]]
   from = "/explore/tunable-reads/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/follower-reads-ycql/"
+  to = "/preview/explore/going-beyond-sql/follower-reads-ycql/"
 
 [[redirects]]
   from = "/preview/admin/cqlsh/"
@@ -411,11 +423,11 @@
 
 [[redirects]]
   from = "/preview/explore/follower-reads/fr-ycql/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/follower-reads-ycql/"
+  to = "/preview/explore/going-beyond-sql/follower-reads-ycql/"
 
 [[redirects]]
   from = "/preview/explore/high-performance/tunable-reads/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/follower-reads-ycql/"
+  to = "/preview/explore/going-beyond-sql/follower-reads-ycql/"
 
 [[redirects]]
   from = "/preview/explore/indexes-constraints/indexes-1/"
@@ -427,15 +439,15 @@
 
 [[redirects]]
   from = "/preview/explore/follower-reads/linux/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/follower-reads-ysql/"
+  to = "/preview/explore/going-beyond-sql/follower-reads-ysql/"
 
 [[redirects]]
   from = "/preview/explore/multi-region-deployments/follower-reads-ycql/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/follower-reads-ycql/"
+  to = "/preview/explore/going-beyond-sql/follower-reads-ycql/"
 
 [[redirects]]
   from = "/preview/explore/multi-region-deployments/follower-reads-ysql/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/follower-reads-ysql/"
+  to = "/preview/explore/going-beyond-sql/follower-reads-ysql/"
 
 [[redirects]]
   from = "/preview/explore/multi-region-deployments/read-replicas/"
@@ -491,7 +503,7 @@
 
 [[redirects]]
   from = "/preview/explore/ysql-language-features/tablespaces/"
-  to = "/preview/explore/ysql-language-features/going-beyond-sql/tablespaces/"
+  to = "/preview/explore/going-beyond-sql/tablespaces/"
 
 [[redirects]]
   from = "/preview/faq/"
@@ -578,12 +590,40 @@
   to = "/preview/secure/authentication/ldap-authentication-ysql/"
 
 [[redirects]]
+  from = "/preview/secure/authentication/enable-authentication/ysql"
+  to = "/preview/secure/authentication/enable-authentication/authentication-ysql"
+
+[[redirects]]
+  from = "/preview/secure/authentication/enable-authentication/ycql"
+  to = "/preview/secure/authentication/enable-authentication/authentication-ycql"
+
+[[redirects]]
   from = "/preview/yugabyte-cloud/cloud-overview/"
   to = "/preview/yugabyte-cloud/"
 
 [[redirects]]
-  from = "/preview/yugabyte-platform/configure-yugabyte-platform/set-up-cloud-provider/"
-  to = "/preview/yugabyte-platform/configure-yugabyte-platform/set-up-cloud-provider/aws/"
+  from = "preview/yugabyte-platform/configure-yugabyte-platform/set-up-cloud-provider/on-premises-manual/"
+  to = "/preview/yugabyte-platform/prepare/server-nodes-software/software-on-prem-manual/"
+
+[[redirects]]
+  from = "/preview/yugabyte-platform/configure-yugabyte-platform/set-up-cloud-provider/*"
+  to = "/preview/yugabyte-platform/configure-yugabyte-platform/:splat"
+
+[[redirects]]
+  from = "/preview/yugabyte-platform/configure-yugabyte-platform/configure/*"
+  to = "/preview/yugabyte-platform/configure-yugabyte-platform/"
+
+[[redirects]]
+  from = "/preview/yugabyte-platform/install-yugabyte-platform/prepare-environment/*"
+  to = "/preview/yugabyte-platform/prepare/cloud-permissions/"
+
+[[redirects]]
+  from = "/preview/yugabyte-platform/install-yugabyte-platform/install/*"
+  to = "/preview/yugabyte-platform/install-yugabyte-platform/install-software/installer/"
+
+[[redirects]]
+   from = "/preview/yugabyte-platform/install-yugabyte-platform/prerequisites/*"
+   to = "/preview/yugabyte-platform/prepare/server-yba/"
 
 [[redirects]]
   from = "/preview/yugabyte-platform/overview/"
@@ -599,7 +639,11 @@
 
 [[redirects]]
   from = "/quick-start/run-sample-apps/"
-  to = "/preview/develop/realworld-apps/explore-sample-apps/"
+  to = "/preview/tutorials/"
+
+[[redirects]]
+  from = "/preview/develop/realworld-apps/*"
+  to = "/preview/tutorials/"
 
 [[redirects]]
   from = "/quick-start/test-redis/"
@@ -614,7 +658,7 @@
 
 [[redirects]]
   from = "/latest/develop/*"
-  to = "/preview/develop/"
+  to = "/preview/develop/:splat"
   force = true
 
 [[redirects]]
@@ -654,6 +698,10 @@
   to = "/preview/yugabyte-voyager/:splat"
   force = true
 
+[[redirects]]
+  from = "/preview/yugabyte-voyager/reference/data-modeling/"
+  to = "/preview/develop/learn/data-modeling-ysql/"
+  force = true
 # Redirect for Reference connectors
 
 [[redirects]]
@@ -1236,10 +1284,6 @@
    from = "/preview/explore/observability/prometheus-integration/*"
    to = "/preview/explore/observability/prometheus-integration/macos/"
 
-[[redirects]]
-   from = "/preview/yugabyte-platform/install-yugabyte-platform/prerequisites/"
-   to = "/preview/yugabyte-platform/install-yugabyte-platform/prerequisites/default/"
-
 ##########################################################
 # Catch-all for old links to /latest (now called /preview)
 #
@@ -1312,6 +1356,7 @@
             https://www.googletagmanager.com/
             https://www.gstatic.com/recaptcha/
             https://x.clearbitjs.com
+            https://js.driftt.com/
             https://cdn.segment.com/
         ;
 
@@ -1346,6 +1391,7 @@
             https://www.google-analytics.com/
             https://www.yugabyte.com
             https://www.gstatic.com
+            https://www.google.com/s2/favicons
         ;
 
         child-src 'self' 'unsafe-inline'
@@ -1353,12 +1399,17 @@
             https://app.supademo.com/
             https://www.google.com/
             https://www.youtube.com/
+            https://js.driftt.com/
         ;
 
         frame-ancestors 'self'
             https://*.yugabyte.com/
             https://deploy-preview-12849--infallible-bardeen-164bc9.netlify.app/
             https://yugabyte.thinkific.com/
+        ;
+
+        media-src 'self' 'unsafe-inline'
+        https://js.driftt.com/conductor/assets/
         ;
 '''
     X-Content-Type-Options = "nosniff"

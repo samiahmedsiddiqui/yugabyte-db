@@ -3,9 +3,8 @@ import { useQuery } from 'react-query';
 import { Box, Typography, makeStyles } from '@material-ui/core';
 import _ from 'lodash';
 import clsx from 'clsx';
-import { YBButton } from '@yugabytedb/ui-components';
-import { YBErrorIndicator } from '../common/YBErrorIndicator';
-import { YBBreadcrumb } from '../common/YBBreadcrumb';
+import { Link } from 'react-router';
+import { YBButton, YBErrorIndicator } from '@yugabytedb/ui-components';
 import { SecondaryDashboardData } from './SecondaryDashboardData';
 import { QUERY_KEY, TroubleshootAPI } from '../api';
 import { Anomaly, AppName, GraphQuery, Universe } from '../helpers/dtos';
@@ -57,6 +56,7 @@ export const SecondaryDashboardEntry = ({
   const [userSelectedAnomaly, setUserSelectedAnomaly] = useState<Anomaly | null>(null);
   const [graphRequestParams, setGraphRequestParams] = useState<GraphQuery[] | null>(null);
   const [recommendationMetrics, setRecommendationMetrics] = useState<any>(null);
+  const [universeQueryData, setUniverseQueryData] = useState<any>(null);
 
   const { isLoading, isError, isIdle } = useQuery(
     [QUERY_KEY.fetchAnamolies, universeUuid],
@@ -73,7 +73,21 @@ export const SecondaryDashboardEntry = ({
     }
   );
 
-  if (isLoading) {
+  const { isLoading: universeQueriesLoading, isError: universeQueriesError } = useQuery(
+    [QUERY_KEY.fetchQueries, universeUuid],
+    () => TroubleshootAPI.fetchQueries(universeUuid, hostUrl),
+    {
+      onSuccess: (data) => {
+        setUniverseQueryData(data);
+      },
+      onError: (error: any) => {
+        setUniverseQueryData([]);
+        console.error('Failed to fetch queries', error);
+      }
+    }
+  );
+
+  if (isLoading || universeQueriesLoading) {
     return (
       <Box className={classes.loadingBox}>
         <LoadingIcon className={clsx(classes.icon, classes.inProgressIcon)} />
@@ -81,7 +95,7 @@ export const SecondaryDashboardEntry = ({
     );
   }
 
-  if (isError || (isIdle && userSelectedAnomaly === undefined)) {
+  if (isError || universeQueriesError || (isIdle && userSelectedAnomaly === undefined)) {
     return <YBErrorIndicator customErrorMessage={'Failed to fetch anomalies list'} />;
   }
 
@@ -94,9 +108,9 @@ export const SecondaryDashboardEntry = ({
       {!hideHeader && (
         <Typography variant="h2" className="content-title">
           {appName === AppName.YBA ? (
-            <YBBreadcrumb to={`/universes/${universeUuid}/troubleshoot`}>
-              {'Troubleshoot'}
-            </YBBreadcrumb>
+            <Link to={`/universes/${universeUuid}/troubleshoot`}>
+              <Typography variant="h3">{'Troubleshoot'}</Typography>
+            </Link>
           ) : (
             <Box>
               <YBButton variant="pill" data-testid="BtnAddIPList" onClick={() => routeToPrimary()}>
@@ -106,7 +120,7 @@ export const SecondaryDashboardEntry = ({
           )}
         </Typography>
       )}
-      {userSelectedAnomaly && (
+      {userSelectedAnomaly && universeQueryData && (
         <SecondaryDashboardData
           hostUrl={hostUrl}
           anomalyData={userSelectedAnomaly}
@@ -116,6 +130,7 @@ export const SecondaryDashboardEntry = ({
           timezone={timezone}
           graphParams={graphRequestParams}
           recommendationMetrics={recommendationMetrics}
+          universeQueryData={universeQueryData}
         />
       )}
     </Box>

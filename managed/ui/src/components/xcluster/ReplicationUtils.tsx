@@ -1,5 +1,6 @@
 import { useQuery } from 'react-query';
 import moment from 'moment';
+import i18n from 'i18next';
 
 import { getAlertConfigurations } from '../../actions/universe';
 import { fetchReplicationLag, isBootstrapRequired } from '../../actions/xClusterReplication';
@@ -11,7 +12,8 @@ import {
   XClusterConfigStatus,
   BROKEN_XCLUSTER_CONFIG_STATUSES,
   XClusterConfigType,
-  XClusterTableEligibility
+  XClusterTableEligibility,
+  XClusterTableStatus
 } from './constants';
 import {
   alertConfigQueryKey,
@@ -20,7 +22,7 @@ import {
   universeQueryKey
 } from '../../redesign/helpers/api';
 import { getUniverseStatus } from '../universes/helpers/universeHelpers';
-import { UnavailableUniverseStates, YBTableRelationType } from '../../redesign/helpers/constants';
+import { UnavailableUniverseStates } from '../../redesign/helpers/constants';
 import { assertUnreachableCase } from '../../utils/errorHandlingUtils';
 import { SortOrder } from '../../redesign/helpers/constants';
 import { getTableUuid } from '../../utils/tableUtils';
@@ -29,9 +31,11 @@ import {
   Metrics,
   MetricTimeRange,
   StandardMetricTimeRangeOption,
-  XClusterTable,
+  XClusterReplicationTable,
   MainTableReplicationCandidate,
-  IndexTableReplicationCandidate
+  IndexTableReplicationCandidate,
+  XClusterTableType,
+  XClusterTable
 } from './XClusterTypes';
 import { XClusterConfig, XClusterTableDetails } from './dtos';
 import { MetricTrace, TableType, Universe, YBTable } from '../../redesign/helpers/dtos';
@@ -498,16 +502,25 @@ export const tableSort = <RowType,>(
 };
 
 /**
- * Return the `tableType` of any table in an xCluster config.
+ * Return the table type (YSQL or YCQL) of an xCluster config.
  */
-export const getXClusterConfigTableType = (xClusterConfig: XClusterConfig) => {
+export const getXClusterConfigTableType = (
+  xClusterConfig: XClusterConfig,
+  sourceUniverseTables: YBTable[] | undefined
+): XClusterTableType | null => {
+  // We allow undefined sourceUniverseTables because we are still able to return a value as long as
+  // the xCluster config has updated its internal table type field.
+
   switch (xClusterConfig.tableType) {
     case 'YSQL':
       return TableType.PGSQL_TABLE_TYPE;
     case 'YCQL':
       return TableType.YQL_TABLE_TYPE;
     case 'UNKNOWN':
-      return undefined;
+      return (
+        (sourceUniverseTables?.find((table) => xClusterConfig.tables.includes(getTableUuid(table)))
+          ?.tableType as XClusterTableType) ?? null
+      );
   }
 };
 
@@ -526,15 +539,19 @@ export const shouldAutoIncludeIndexTables = (xClusterConfig: XClusterConfig) =>
   xClusterConfig.type === XClusterConfigType.TXN || xClusterConfig.tableType !== 'YSQL';
 
 /**
- * Returns array of XClusterTable by augmenting YBTable with XClusterTableDetails
+ * Returns array of XClusterReplicationTable or array of XClusterTable by augmenting YBTable with XClusterTableDetails.
+ * - XClusterReplicationTable: may contain dropped tables
+ * - XClusterTable: doest not contain dropped tables
  */
-export const augmentTablesWithXClusterDetails = (
-  ybTable: YBTable[],
+export const augmentTablesWithXClusterDetails = <TIncludeDroppedTables extends boolean>(
+  sourceUniverseTables: YBTable[],
   xClusterConfigTables: XClusterTableDetails[],
-  metricTraces?: MetricTrace[]
-): XClusterTable[] => {
-  const ybTableMap = new Map<string, YBTable>(
-    ybTable.map((table) => {
+  maxAcceptableLag: number | undefined,
+  metricTraces: MetricTrace[] | undefined,
+  options?: { includeDroppedTables: TIncludeDroppedTables }
+): TIncludeDroppedTables extends true ? XClusterReplicationTable[] : XClusterTable[] => {
+  const tableIdToSourceUniverseTableDetails = new Map<string, YBTable>(
+    sourceUniverseTables.map((table) => {
       const { tableUUID, ...tableDetails } = table;
       const adaptedTableUUID = formatUuidForXCluster(getTableUuid(table));
       return [adaptedTableUUID, { ...tableDetails, tableUUID: adaptedTableUUID }];
@@ -548,20 +565,45 @@ export const augmentTablesWithXClusterDetails = (
       parseFloatIfDefined(trace.y[trace.y.length - 1])
     ])
   );
-  const tables = xClusterConfigTables.reduce((tables: XClusterTable[], table) => {
-    const ybTableDetails = ybTableMap.get(table.tableId);
-    const replicationLag = tableIdToReplicationLag.get(table.tableId);
-    if (ybTableDetails) {
-      const { tableId, ...xClusterTableDetails } = table;
-      tables.push({ ...ybTableDetails, ...xClusterTableDetails, replicationLag });
-    } else {
-      console.error(
-        `Missing table details for table ${table.tableId}. This table was found in an xCluster configuration but not in the corresponding source universe.`
-      );
+
+  const tableStatusTranslationPrefix = 'clusterDetail.xCluster.config.tableStatus';
+  // Augment tables in the current xCluster config with additional table details for the YBA UI.
+  const tables = xClusterConfigTables.reduce((tables: XClusterReplicationTable[], table) => {
+    const { tableId, ...xClusterTableDetails } = table;
+    const sourceUniverseTableDetails = tableIdToSourceUniverseTableDetails.get(tableId);
+    const replicationLag = tableIdToReplicationLag.get(tableId);
+    if (sourceUniverseTableDetails) {
+      const tableStatus =
+        xClusterTableDetails.status === XClusterTableStatus.RUNNING &&
+        maxAcceptableLag &&
+        replicationLag &&
+        replicationLag > maxAcceptableLag
+          ? XClusterTableStatus.WARNING
+          : xClusterTableDetails.status;
+      tables.push({
+        ...sourceUniverseTableDetails,
+        ...xClusterTableDetails,
+        status: tableStatus,
+        statusLabel: i18n.t(`${tableStatusTranslationPrefix}.${tableStatus}`),
+        replicationLag
+      });
+    } else if (options?.includeDroppedTables) {
+      // The current tableId is deleted on the source universe.
+      const tableStatus = XClusterTableStatus.DROPPED;
+      tables.push({
+        ...xClusterTableDetails,
+        tableUUID: tableId,
+        status: tableStatus,
+        statusLabel: i18n.t(`${tableStatusTranslationPrefix}.${tableStatus}`),
+        replicationLag
+      });
     }
     return tables;
   }, []);
-  return tables;
+
+  return tables as TIncludeDroppedTables extends true
+    ? XClusterReplicationTable[]
+    : XClusterTable[];
 };
 
 /**

@@ -12,7 +12,6 @@ import com.yugabyte.troubleshoot.ts.yba.client.YBAClient;
 import com.yugabyte.troubleshoot.ts.yba.client.YBAClientError;
 import com.yugabyte.troubleshoot.ts.yba.models.RunQueryResult;
 import io.prometheus.client.Summary;
-import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -50,10 +49,11 @@ public class ActiveSessionHistoryQuery {
 
   static final String ASH_QUERY_NO_TIMESTAMP =
       "select sample_time, root_request_id, rpc_request_id, wait_event_component, wait_event_class,"
-          + " wait_event, top_level_node_id, query_id, ysql_session_id, client_node_ip,"
-          + " wait_event_aux, sample_weight from pg_catalog.yb_active_session_history";
+          + " wait_event_type, wait_event, top_level_node_id, query_id, ysql_session_id,"
+          + " client_node_ip, wait_event_aux, sample_weight"
+          + " from pg_catalog.yb_active_session_history";
 
-  static final String ASH_SAMPLE_TIME_FILTER = " where sample_time > ";
+  static final String ASH_SAMPLE_TIME_FILTER = " where sample_time >= ";
 
   static final String ASH_ORDER_AND_LIMIT = " order by sample_time ASC limit ";
 
@@ -62,6 +62,7 @@ public class ActiveSessionHistoryQuery {
   private static final String PRC_REQUEST_ID = "rpc_request_id";
   private static final String WAIT_EVENT_COMPONENT = "wait_event_component";
   private static final String WAIT_EVENT_CLASS = "wait_event_class";
+  private static final String WAIT_EVENT_TYPE = "wait_event_type";
   private static final String WAIT_EVENT = "wait_event";
   private static final String TOP_LEVEL_NODE_ID = "top_level_node_id";
   private static final String QUERY_ID = "query_id";
@@ -210,8 +211,7 @@ public class ActiveSessionHistoryQuery {
       while (!fullyProcessed) {
         String query = ASH_QUERY_NO_TIMESTAMP;
         if (queryState != null) {
-          query +=
-              ASH_SAMPLE_TIME_FILTER + "'" + Timestamp.from(queryState.getLastSampleTime()) + "'";
+          query += ASH_SAMPLE_TIME_FILTER + "'" + queryState.getLastSampleTime().toString() + "'";
         }
         query += ASH_ORDER_AND_LIMIT + batchSize;
         RunQueryResult result =
@@ -234,6 +234,7 @@ public class ActiveSessionHistoryQuery {
                   .setRootRequestId(UUID.fromString(statsJson.get(ROOT_REQUEST_ID).asText()))
                   .setWaitEventComponent(statsJson.get(WAIT_EVENT_COMPONENT).asText())
                   .setWaitEventClass(statsJson.get(WAIT_EVENT_CLASS).asText())
+                  .setWaitEventType(statsJson.get(WAIT_EVENT_TYPE).asText())
                   .setWaitEvent(statsJson.get(WAIT_EVENT).asText())
                   .setTopLevelNodeId(UUID.fromString(statsJson.get(TOP_LEVEL_NODE_ID).asText()))
                   .setQueryId(statsJson.get(QUERY_ID).asLong())
@@ -254,6 +255,16 @@ public class ActiveSessionHistoryQuery {
           ashList.add(ashEntry);
         }
 
+        fullyProcessed = result.getResult().size() < batchSize;
+        if (!fullyProcessed && !ashList.isEmpty()) {
+          // We don't store last sample as we have no way to properly filter out it's entries
+          // on next read. We'll store everything except last sample and re-read it next time.
+          Instant sampleTimeToIgnore = lastSampleTime;
+          ashList =
+              ashList.stream()
+                  .filter(ashEntry -> !ashEntry.getSampleTime().equals(sampleTimeToIgnore))
+                  .collect(Collectors.toList());
+        }
         activeSessionHistoryService.save(ashList);
         if (lastSampleTime != null) {
           ActiveSessionHistoryQueryStateId queryStateId =
@@ -266,7 +277,6 @@ public class ActiveSessionHistoryQuery {
                   .setLastSampleTime(lastSampleTime));
           queryState = ashQueryStateService.get(queryStateId);
         }
-        fullyProcessed = result.getResult().size() < batchSize;
       }
       NODE_PROCESS_TIME.labels(RESULT_SUCCESS).observe(System.currentTimeMillis() - startTime);
       return new NodeProcessResult(true);

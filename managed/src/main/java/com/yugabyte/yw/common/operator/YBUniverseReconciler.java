@@ -345,13 +345,15 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
                               .withName(resourceName)
                               .patch(ybUniverse);
                         }
-                        universeDeletionReferenceMap.remove(mapKey);
                       } catch (Exception e) {
-                        log.info(
+                        log.error(
                             "Got error in finalizing YbUniverse object name: {}, namespace: {}"
                                 + " delete",
                             resourceName,
-                            resourceNamespace);
+                            resourceNamespace,
+                            e);
+                      } finally {
+                        universeDeletionReferenceMap.remove(mapKey);
                       }
                     },
                     deleteFinalizerThread);
@@ -892,9 +894,6 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
         Universe.maybeGetUniverseByName(cust.getId(), OperatorUtils.getYbaUniverseName(ybUniverse))
             .orElse(null);
 
-    // requestParams.taskType = UpgradeTaskParams.UpgradeTaskType.Software;
-    // requestParams.upgradeOption = UpgradeTaskParams.UpgradeOption.ROLLING_UPGRADE;
-    requestParams.ybSoftwareVersion = taskParams.getPrimaryCluster().userIntent.ybSoftwareVersion;
     requestParams.setUniverseUUID(oldUniverse.getUniverseUUID());
     log.info("Upgrading universe with new info now");
     return upgradeUniverseHandler.upgradeSoftware(requestParams, cust, oldUniverse);
@@ -1091,6 +1090,10 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
 
     Provider autoProvider =
         cloudProviderHandler.createKubernetes(Customer.getOrBadRequest(customerUUID), providerData);
+    autoProvider.getDetails().getCloudInfo().getKubernetes().setLegacyK8sProvider(false);
+    // This is hardcoded so the UI will filter this provider to show in the "managed kubernetes
+    // service" tab
+    autoProvider.getDetails().getCloudInfo().getKubernetes().setKubernetesProvider("custom");
     // Fetch created provider from DB.
     return Provider.get(customerUUID, providerName, CloudType.kubernetes);
   }

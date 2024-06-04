@@ -8,6 +8,7 @@ import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.api.client.util.Throwables;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Strings;
@@ -121,6 +122,7 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.nodes.UpdateNodeProcess;
 import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.ChangeXClusterRole;
 import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteBootstrapIds;
 import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteReplication;
+import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteReplicationOnSource;
 import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteXClusterConfigEntry;
 import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.DeleteXClusterTableConfigEntry;
 import com.yugabyte.yw.commissioner.tasks.subtasks.xcluster.PromoteSecondaryConfigToMainConfig;
@@ -147,9 +149,11 @@ import com.yugabyte.yw.common.XClusterUniverseService;
 import com.yugabyte.yw.common.backuprestore.BackupUtil;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupNodeRetriever;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil;
+import com.yugabyte.yw.common.config.CustomerConfKeys;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.gflags.AutoFlagUtil;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.common.nodeui.DumpEntitiesResponse;
 import com.yugabyte.yw.forms.BackupRequestParams;
@@ -247,6 +251,7 @@ import org.yb.ColumnSchema.SortOrder;
 import org.yb.CommonTypes;
 import org.yb.CommonTypes.TableType;
 import org.yb.cdc.CdcConsumer.XClusterRole;
+import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.GetTableSchemaResponse;
 import org.yb.client.ListLiveTabletServersResponse;
 import org.yb.client.ListMastersResponse;
@@ -478,11 +483,16 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       return () -> {
         // Refresh the nodes from the DB to get IPs.
         Universe universe = Universe.getOrBadRequest(universeUuid);
+        // TODO cloudEnabled is supposed to be a static config but this is read from runtime config
+        // to make itests work.
+        boolean cloudEnabled =
+            confGetter.getConfForScope(
+                Customer.get(universe.getCustomerId()), CustomerConfKeys.cloudEnabled);
         return universe.getHostPortsString(
             universe.getNodes().stream().filter(n -> nodes.contains(n)).collect(Collectors.toSet()),
             ServerType.MASTER,
             PortType.RPC,
-            config.getBoolean("yb.cloud.enabled"));
+            cloudEnabled);
       };
     }
 
@@ -558,6 +568,13 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return true;
   }
 
+  /**
+   * Returns the allowed tasks object when the universe is in a frozen failed state.
+   *
+   * @param placementModificationTaskInfo the task_info for task which froze the universe and
+   *     failed.
+   * @return the allowed tasks.
+   */
   public static AllowedTasks getAllowedTasksOnFailure(TaskInfo placementModificationTaskInfo) {
     TaskType lockedTaskType = placementModificationTaskInfo.getTaskType();
     AllowedTasks.AllowedTasksBuilder builder =
@@ -585,29 +602,6 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   }
 
   /**
-   * Returns the allowed tasks object when the universe is in a frozen failed state.
-   *
-   * @param lockedTaskType the task which froze the universe and failed.
-   * @return the allowed tasks.
-   */
-  public static AllowedTasks getAllowedTasksOnFailure(TaskType lockedTaskType) {
-    AllowedTasks.AllowedTasksBuilder builder =
-        AllowedTasks.builder().lockedTaskType(lockedTaskType);
-    if (PLACEMENT_MODIFICATION_TASKS.contains(lockedTaskType)) {
-      builder.restricted(true);
-      builder.taskTypes(SAFE_TO_RUN_IF_UNIVERSE_BROKEN);
-      if (RERUNNABLE_PLACEMENT_MODIFICATION_TASKS.contains(lockedTaskType)) {
-        // Allow only this task.
-        builder.taskType(lockedTaskType);
-      }
-      if (ROLLBACK_SUPPORTED_SOFTWARE_UPGRADE_TASKS.contains(lockedTaskType)) {
-        builder.taskTypes(SOFTWARE_UPGRADE_ROLLBACK_TASKS);
-      }
-    }
-    return builder.build();
-  }
-
-  /**
    * Returns the allowed task object when the universe is in a frozen failed state.
    *
    * @param lockedPlacementModificationTaskUuid the placement modification task UUID.
@@ -626,7 +620,7 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
           .taskTypes(SAFE_TO_RUN_IF_UNIVERSE_BROKEN)
           .build();
     }
-    return getAllowedTasksOnFailure(optional.get().getTaskType());
+    return getAllowedTasksOnFailure(optional.get());
   }
 
   @Override
@@ -1245,7 +1239,11 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     params.enableYCQL = userIntent.enableYCQL;
     params.enableYCQLAuth = userIntent.enableYCQLAuth;
     params.enableYSQLAuth = userIntent.enableYSQLAuth;
-    params.auditLogConfig = userIntent.auditLogConfig;
+
+    // Add audit log config from the primary cluster
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    params.auditLogConfig =
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.auditLogConfig;
 
     // The software package to install for this cluster.
     params.ybSoftwareVersion = userIntent.ybSoftwareVersion;
@@ -1901,7 +1899,10 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
                   universe.getUniverseDetails().getClusterByUuid(n.placementUuid);
               UUID imageBundleUUID =
                   Util.retreiveImageBundleUUID(
-                      universe.getUniverseDetails().arch, cluster.userIntent, provider);
+                      universe.getUniverseDetails().arch,
+                      cluster.userIntent,
+                      provider,
+                      confGetter.getStaticConf().getBoolean("yb.cloud.enabled"));
               if (imageBundleUUID != null) {
                 ImageBundle.NodeProperties toOverwriteNodeProperties =
                     imageBundleUtil.getNodePropertiesOrFail(
@@ -1909,6 +1910,10 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
                         n.cloudInfo.region,
                         cluster.userIntent.providerType.toString());
                 params.sshUser = toOverwriteNodeProperties.getSshUser();
+              } else {
+                // ImageBundleUUID will be null for the case when YBM specifies machineImage
+                // on fly during universe creation.
+                params.sshUser = providerDetails.getSshUser();
               }
 
               params.airgap = provider.getAirGapInstall();
@@ -2213,14 +2218,13 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     }
   }
 
-  /*
-   * For a given node, finds the tablets assigned to its tserver (if relevant).
+  /**
+   * Fetch DB entities from /dump-entities endpoint.
    *
-   * @param universe universe for which the node belongs.
-   * @param currentNode node we want to check.
-   * @return a set of tablets for the associated tserver.
+   * @param universe the universe.
+   * @return the API response.
    */
-  public Set<String> getTserverTablets(Universe universe, NodeDetails currentNode) {
+  public DumpEntitiesResponse dumpDbEntities(Universe universe) {
     // Wait for a maximum of 10 seconds for url to succeed.
     NodeDetails masterLeaderNode = universe.getMasterLeaderNode();
     HostAndPort masterLeaderHostPort =
@@ -2238,20 +2242,93 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
                   Json.fromJson(masterLeaderDumpJson, DumpEntitiesResponse.class);
               return dumpEntities;
             },
-            (d) -> {
+            d -> {
               if (d.getError() != null) {
                 log.warn("Url request to {} failed with error {}", masterLeaderUrl, d.getError());
                 return false;
               }
               return true;
             });
+    return waitForCheck.retryWithBackoff(1, 2, 10);
+  }
 
-    DumpEntitiesResponse dumpEntitiesResponse = waitForCheck.retryWithBackoff(1, 2, 10);
-
+  /**
+   * For a given node, finds the tablets assigned to its tserver (if relevant).
+   *
+   * @param universe universe for which the node belongs.
+   * @param currentNode node we want to check.
+   * @return a set of tablets for the associated tserver.
+   */
+  public Set<String> getTserverTablets(Universe universe, NodeDetails currentNode) {
+    // TODO cloudEnabled is supposed to be a static config but this is read from runtime config to
+    // make itests work.
+    boolean cloudEnabled =
+        confGetter.getConfForScope(
+            Customer.get(universe.getCustomerId()), CustomerConfKeys.cloudEnabled);
+    DumpEntitiesResponse dumpEntitiesResponse = dumpDbEntities(universe);
+    boolean useSecondaryIp = GFlagsUtil.isUseSecondaryIP(universe, currentNode, cloudEnabled);
     HostAndPort currentNodeHP =
-        HostAndPort.fromParts(currentNode.cloudInfo.private_ip, currentNode.tserverRpcPort);
-
+        HostAndPort.fromParts(
+            useSecondaryIp
+                ? currentNode.cloudInfo.secondary_private_ip
+                : currentNode.cloudInfo.private_ip,
+            currentNode.tserverRpcPort);
     return dumpEntitiesResponse.getTabletsByTserverAddress(currentNodeHP);
+  }
+
+  /**
+   * After data-move is done, this method is invoked to verify that no tablets are assigned to the
+   * blacklisted nodes. It throws illegal exception for the first node it finds.
+   *
+   * @param universe the universe.
+   */
+  public void verifyNoTabletsOnBlacklistedTservers(Universe universe) {
+    String masterAddresses = universe.getMasterAddresses();
+    try (YBClient client =
+        ybService.getClient(masterAddresses, universe.getCertificateNodetoNode())) {
+      DumpEntitiesResponse dumpEntitiesResponse = dumpDbEntities(universe);
+      GetMasterClusterConfigResponse response = client.getMasterClusterConfig();
+      Optional<String> errMsgOp =
+          response.getConfig().getServerBlacklist().getHostsList().stream()
+              .map(
+                  hp -> {
+                    NodeDetails node = universe.getNodeByAnyIP(hp.getHost());
+                    if (node == null) {
+                      // The node can be an old permanently blacklisted one.
+                      log.info(
+                          "Unknown blacklisted node {} in universe {}",
+                          hp,
+                          universe.getUniverseUUID());
+                      return null;
+                    }
+                    // Use the RPC port from node because it is generally not set in the HostAndPort
+                    // response.
+                    Set<String> tabletIds =
+                        dumpEntitiesResponse.getTabletsByTserverAddress(
+                            HostAndPort.fromParts(hp.getHost(), node.tserverRpcPort));
+                    if (log.isDebugEnabled()) {
+                      log.debug(
+                          "Number of tablets on tserver {} is {} tablets. Example tablets {}...",
+                          node.getNodeName(),
+                          tabletIds.size(),
+                          tabletIds.stream().limit(20).collect(Collectors.toSet()));
+                    }
+                    if (CollectionUtils.isNotEmpty(tabletIds)) {
+                      return String.format(
+                          "Expected 0 tablets on node %s. Got %d tablets",
+                          node.getNodeName(), tabletIds.size());
+                    }
+                    return null;
+                  })
+              .filter(Objects::nonNull)
+              .findFirst();
+      if (errMsgOp.isPresent()) {
+        throw new IllegalStateException(errMsgOp.get());
+      }
+    } catch (Exception e) {
+      log.error("Error in verifying no tablets on blacklisted tservers - {}", e.getMessage());
+      Throwables.propagate(e);
+    }
   }
 
   /**
@@ -2288,8 +2365,12 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     if (!result) {
       throw new RuntimeException(
           String.format(
-              "Timed out waiting for tablets on node %s to have 0 tablets",
-              currentNode.getNodeName()));
+              "Could not verify that tserver %s has 0 tablets as expected."
+                  + " Removal of a tserver with non-zero tablets can cause data loss."
+                  + " To adjust this check, use the runtime configs %s and %s.",
+              currentNode.getNodeName(),
+              UniverseConfKeys.clusterMembershipCheckEnabled.getKey(),
+              UniverseConfKeys.clusterMembershipCheckTimeout.getKey()));
     }
   }
 
@@ -2302,13 +2383,15 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
    */
   protected boolean nodeInMasterConfig(Universe universe, NodeDetails node) {
     String ip = node.cloudInfo.private_ip;
+    String secondary_ip = node.cloudInfo.secondary_private_ip;
     String masterAddresses = universe.getMasterAddresses();
 
     try (YBClient client =
         ybService.getClient(masterAddresses, universe.getCertificateNodetoNode())) {
       ListMastersResponse response = client.listMasters();
       List<ServerInfo> servers = response.getMasters();
-      return servers.stream().anyMatch(s -> s.getHost().equals(ip));
+      return servers.stream()
+          .anyMatch(s -> s.getHost().equals(ip) || s.getHost().equals(secondary_ip));
     } catch (Exception e) {
       String msg =
           String.format(
@@ -2386,7 +2469,7 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       ServerType processType,
       String command,
       int sleepAfterCmdMillis,
-      Consumer<AnsibleClusterServerCtl.Params> paramsCustomizer) {
+      @Nullable Consumer<AnsibleClusterServerCtl.Params> paramsCustomizer) {
     AnsibleClusterServerCtl.Params params = new AnsibleClusterServerCtl.Params();
     UserIntent userIntent = getUserIntent();
     // Add the node name.
@@ -2412,7 +2495,9 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     params.instanceType = node.cloudInfo.instance_type;
     params.checkVolumesAttached = processType == ServerType.TSERVER && command.equals("start");
     params.useSystemd = userIntent.useSystemd;
-    paramsCustomizer.accept(params);
+    if (paramsCustomizer != null) {
+      paramsCustomizer.accept(params);
+    }
     // Create the Ansible task to get the server info.
     AnsibleClusterServerCtl task = createTask(AnsibleClusterServerCtl.class);
     task.initialize(params);
@@ -2712,6 +2797,9 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     params.azUuid = node.azUuid;
     params.instanceType = currentInstanceType;
     params.deviceInfo = currentDeviceInfo;
+    if (StringUtils.isNotEmpty(node.machineImage)) {
+      params.machineImage = node.machineImage;
+    }
 
     UpdateMountedDisks updateMountedDisksTask = createTask(UpdateMountedDisks.class);
     updateMountedDisksTask.initialize(params);
@@ -2930,48 +3018,28 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return subTaskGroup;
   }
 
-  /**
-   * Creates a task list to start the masters and adds it to the task queue.
-   *
-   * @param nodes : a collection of nodes that need masters to be spawned.
-   * @return The subtask group.
-   */
   public SubTaskGroup createStartMasterTasks(Collection<NodeDetails> nodes) {
-    SubTaskGroup subTaskGroup = createSubTaskGroup("AnsibleClusterServerCtl");
-    for (NodeDetails node : nodes) {
-      AnsibleClusterServerCtl.Params params = new AnsibleClusterServerCtl.Params();
-      UserIntent userIntent = getUserIntent();
-      // Add the node name.
-      params.nodeName = node.nodeName;
-      // Add the universe uuid.
-      params.setUniverseUUID(taskParams().getUniverseUUID());
-      // Add the az uuid.
-      params.azUuid = node.azUuid;
-      // The service and the command we want to run.
-      params.process = "master";
-      params.command = "start";
-      params.placementUuid = node.placementUuid;
-      // Set the InstanceType
-      params.instanceType = node.cloudInfo.instance_type;
-      // Start universe with systemd
-      params.useSystemd = userIntent.useSystemd;
-      // Create the Ansible task to get the server info.
-      AnsibleClusterServerCtl task = createTask(AnsibleClusterServerCtl.class);
-      task.initialize(params);
-      // Add it to the task list.
-      subTaskGroup.addSubTask(task);
-    }
-    getRunnableTask().addSubTaskGroup(subTaskGroup);
-    return subTaskGroup;
+    return createStartServerTasks(nodes, ServerType.MASTER, null /* param customizer */);
+  }
+
+  public SubTaskGroup createStartTServerTasks(Collection<NodeDetails> nodes) {
+    return createStartServerTasks(nodes, ServerType.TSERVER, null /* param customizer */);
   }
 
   /**
-   * Creates a task list to start the tservers and adds it to the task queue.
+   * Creates subtasks to start the servers of the given type with the optional params customizer
+   * callback.
    *
-   * @param nodes : a collection of nodes that need tservers to be spawned.
-   * @return The subtask group.
+   * @param nodes the nodes on which the servers are to be started.
+   * @param serverType the server type.
+   * @param paramsCustomizer the callback to set custom params.
+   * @return the subtask group.
    */
-  public SubTaskGroup createStartTServerTasks(Collection<NodeDetails> nodes) {
+  // TODO See if this can be combined with createServerControlTask method which sets more params.
+  public SubTaskGroup createStartServerTasks(
+      Collection<NodeDetails> nodes,
+      ServerType serverType,
+      @Nullable Consumer<AnsibleClusterServerCtl.Params> paramsCustomizer) {
     SubTaskGroup subTaskGroup = createSubTaskGroup("AnsibleClusterServerCtl");
     for (NodeDetails node : nodes) {
       AnsibleClusterServerCtl.Params params = new AnsibleClusterServerCtl.Params();
@@ -2983,13 +3051,16 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       // Add the az uuid.
       params.azUuid = node.azUuid;
       // The service and the command we want to run.
-      params.process = ServerType.TSERVER.name().toLowerCase();
+      params.process = serverType.name().toLowerCase();
       params.command = "start";
       params.placementUuid = node.placementUuid;
       // Set the InstanceType
       params.instanceType = node.cloudInfo.instance_type;
       // Start universe with systemd
       params.useSystemd = userIntent.useSystemd;
+      if (paramsCustomizer != null) {
+        paramsCustomizer.accept(params);
+      }
       // Create the Ansible task to get the server info.
       AnsibleClusterServerCtl task = createTask(AnsibleClusterServerCtl.class);
       task.initialize(params);
@@ -3033,13 +3104,25 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return createStopYbControllerTasks(nodes, false /*isIgnoreError*/);
   }
 
-  /**
-   * Creates a task list to stop the tservers of the cluster and adds it to the task queue.
-   *
-   * @param nodes set of nodes to be stopped as master
-   */
   public SubTaskGroup createStopServerTasks(
       Collection<NodeDetails> nodes, ServerType serverType, boolean isIgnoreError) {
+    return createStopServerTasks(nodes, serverType, params -> params.isIgnoreError = isIgnoreError);
+  }
+
+  /**
+   * Creates subtasks to stop the servers of the given type with the optional params customizer
+   * callback.
+   *
+   * @param nodes the nodes on which the servers are running.
+   * @param serverType the server type.
+   * @param paramsCustomizer the callback to set custom params.
+   * @return the subtask group.
+   */
+  // TODO See if this can be combined with createServerControlTask method which sets more params.
+  public SubTaskGroup createStopServerTasks(
+      Collection<NodeDetails> nodes,
+      ServerType serverType,
+      @Nullable Consumer<AnsibleClusterServerCtl.Params> paramsCustomizer) {
     SubTaskGroup subTaskGroup = createSubTaskGroup("AnsibleClusterServerCtl");
     for (NodeDetails node : nodes) {
       AnsibleClusterServerCtl.Params params = new AnsibleClusterServerCtl.Params();
@@ -3055,9 +3138,11 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       params.command = "stop";
       // Set the InstanceType
       params.instanceType = node.cloudInfo.instance_type;
-      params.isIgnoreError = isIgnoreError;
       // Set the systemd parameter.
       params.useSystemd = userIntent.useSystemd;
+      if (paramsCustomizer != null) {
+        paramsCustomizer.accept(params);
+      }
       // Create the Ansible task to get the server info.
       AnsibleClusterServerCtl task = createTask(AnsibleClusterServerCtl.class);
       task.initialize(params);
@@ -3547,8 +3632,41 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       String keyspaceName,
       TableType tableType,
       long retentionPeriodSeconds,
+      long snapshotIntervalSeconds) {
+    return createCreatePitrConfigTask(
+        universe,
+        keyspaceName,
+        tableType,
+        retentionPeriodSeconds,
+        snapshotIntervalSeconds,
+        null /* xClusterConfig */);
+  }
+
+  protected SubTaskGroup createCreatePitrConfigTask(
+      Universe universe,
+      String keyspaceName,
+      TableType tableType,
+      long retentionPeriodSeconds,
       long snapshotIntervalSeconds,
       @Nullable XClusterConfig xClusterConfig) {
+    return createCreatePitrConfigTask(
+        universe,
+        keyspaceName,
+        tableType,
+        retentionPeriodSeconds,
+        snapshotIntervalSeconds,
+        xClusterConfig,
+        false /* createdForDr */);
+  }
+
+  protected SubTaskGroup createCreatePitrConfigTask(
+      Universe universe,
+      String keyspaceName,
+      TableType tableType,
+      long retentionPeriodSeconds,
+      long snapshotIntervalSeconds,
+      @Nullable XClusterConfig xClusterConfig,
+      boolean createdForDr) {
     SubTaskGroup subTaskGroup = createSubTaskGroup("CreatePitrConfig");
     CreatePitrConfigParams createPitrConfigParams = new CreatePitrConfigParams();
     createPitrConfigParams.setUniverseUUID(universe.getUniverseUUID());
@@ -3559,27 +3677,13 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     createPitrConfigParams.retentionPeriodInSeconds = retentionPeriodSeconds;
     createPitrConfigParams.xClusterConfig = xClusterConfig;
     createPitrConfigParams.intervalInSeconds = snapshotIntervalSeconds;
+    createPitrConfigParams.createdForDr = createdForDr;
 
     CreatePitrConfig task = createTask(CreatePitrConfig.class);
     task.initialize(createPitrConfigParams);
     subTaskGroup.addSubTask(task);
     getRunnableTask().addSubTaskGroup(subTaskGroup);
     return subTaskGroup;
-  }
-
-  protected SubTaskGroup createCreatePitrConfigTask(
-      Universe universe,
-      String keyspaceName,
-      TableType tableType,
-      long retentionPeriodSeconds,
-      long snapshotIntervalSeconds) {
-    return createCreatePitrConfigTask(
-        universe,
-        keyspaceName,
-        tableType,
-        retentionPeriodSeconds,
-        snapshotIntervalSeconds,
-        null /* xClusterConfig */);
   }
 
   protected SubTaskGroup createRestoreSnapshotScheduleTask(
@@ -4036,20 +4140,20 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
    *
    * @param node node to stop processes.
    * @param processes set of processes to stop.
-   * @param finalState indicates that process will be stopped for unknown amount of time.
    * @param removeMasterFromQuorum true if this stop is a for long time.
+   * @param deconfigure true if the server needs to be deconfigured (stopped permanently).
    * @param subTaskGroupType subtask group type.
    */
   protected void stopProcessesOnNode(
       NodeDetails node,
       Set<ServerType> processes,
-      boolean finalState,
       boolean removeMasterFromQuorum,
+      boolean deconfigure,
       SubTaskGroupType subTaskGroupType) {
     if (processes.contains(ServerType.TSERVER)) {
       addLeaderBlackListIfAvailable(Collections.singletonList(node), subTaskGroupType);
 
-      if (finalState) {
+      if (deconfigure) {
         // Remove node from load balancer.
         UniverseDefinitionTaskParams universeDetails = getUniverse().getUniverseDetails();
         createManageLoadBalancerTasks(
@@ -4061,7 +4165,8 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       }
     }
     for (ServerType processType : processes) {
-      createServerControlTask(node, processType, "stop").setSubTaskGroupType(subTaskGroupType);
+      createServerControlTask(node, processType, "stop", params -> params.deconfigure = deconfigure)
+          .setSubTaskGroupType(subTaskGroupType);
       if (processType == ServerType.MASTER && removeMasterFromQuorum) {
         createWaitForMasterLeaderTask().setSubTaskGroupType(subTaskGroupType);
         createChangeConfigTasks(node, false /* isAdd */, subTaskGroupType);
@@ -5111,10 +5216,31 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
 
   protected void createRemoveTableFromXClusterConfigSubtasks(
       XClusterConfig xClusterConfig, Set<String> tableIds, boolean keepEntry) {
+    createRemoveTableFromXClusterConfigSubtasks(
+        xClusterConfig, tableIds, keepEntry, null /* droppedDatabases */);
+  }
+
+  protected void createRemoveTableFromXClusterConfigSubtasks(
+      XClusterConfig xClusterConfig,
+      Set<String> tableIds,
+      boolean keepEntry,
+      Set<String> droppedDatabases) {
     // Remove the tables from the replication group.
     createXClusterConfigModifyTablesTask(
             xClusterConfig, tableIds, XClusterConfigModifyTables.Params.Action.REMOVE)
         .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ConfigureUniverse);
+
+    if (!CollectionUtils.isEmpty(droppedDatabases)) {
+      // Filter pitr configs for dropped database and which were created as part of xcluster/DR.
+      Set<PitrConfig> pitrConfigsToBeDropped =
+          xClusterConfig.getPitrConfigs().stream()
+              .filter(pitr -> droppedDatabases.contains(pitr.getDbName()) && pitr.isCreatedForDr())
+              .collect(Collectors.toSet());
+      for (PitrConfig pitrConfig : pitrConfigsToBeDropped) {
+        createDeletePitrConfigTask(
+            pitrConfig.getUuid(), xClusterConfig.getTargetUniverseUUID(), false /* ignoreErrors */);
+      }
+    }
 
     // Delete bootstrap IDs created by bootstrap universe subtask.
     createDeleteBootstrapIdsTask(xClusterConfig, tableIds, false /* forceDelete */)
@@ -5139,20 +5265,28 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
               xClusterConfig, null /* sourceRole */, XClusterRole.ACTIVE /* targetRole */)
           .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeleteXClusterReplication);
     }
-
     // Delete the replication CDC streams on the target universe.
     createDeleteReplicationTask(xClusterConfig, forceDelete)
         .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeleteXClusterReplication);
-
-    // Delete bootstrap IDs created by bootstrap universe subtask.
-    createDeleteBootstrapIdsTask(xClusterConfig, xClusterConfig.getTableIds(), forceDelete)
-        .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeleteXClusterReplication);
+    if (xClusterConfig.getType() == ConfigType.Db) {
+      // TODO: add forceDelete.
+      createDeleteReplicationOnSourceTask(xClusterConfig)
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeleteXClusterReplication);
+    } else {
+      // Delete bootstrap IDs created by bootstrap universe subtask.
+      createDeleteBootstrapIdsTask(xClusterConfig, xClusterConfig.getTableIds(), forceDelete)
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeleteXClusterReplication);
+    }
 
     if (deletePitrConfigs
-        && xClusterConfig.getType().equals(ConfigType.Txn)
+        && (xClusterConfig.getType() == ConfigType.Txn || xClusterConfig.getType() == ConfigType.Db)
         && xClusterConfig.getTargetUniverseUUID() != null) {
       List<PitrConfig> pitrConfigs = xClusterConfig.getPitrConfigs();
       for (PitrConfig pitrConfig : pitrConfigs) {
+        // Only delete PITR config which were specifically created for DR.
+        if (!pitrConfig.isCreatedForDr()) {
+          continue;
+        }
         createDeletePitrConfigTask(
             pitrConfig.getUuid(),
             xClusterConfig.getTargetUniverseUUID(),
@@ -5563,6 +5697,31 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
               }
             });
   }
+
+  // DB Scoped replication methods.
+  // --------------------------------------------------------------------------------
+
+  /**
+   * Deletes db scope replication on the source universe db side.
+   *
+   * @param xClusterConfig config used
+   * @return the created subtask group
+   */
+  protected SubTaskGroup createDeleteReplicationOnSourceTask(XClusterConfig xClusterConfig) {
+    SubTaskGroup subTaskGroup = createSubTaskGroup("DeleteReplicationOnSource");
+    XClusterConfigTaskParams xClusterConfigParams = new XClusterConfigTaskParams();
+    xClusterConfigParams.xClusterConfig = xClusterConfig;
+
+    DeleteReplicationOnSource task = createTask(DeleteReplicationOnSource.class);
+    task.initialize(xClusterConfigParams);
+    subTaskGroup.addSubTask(task);
+    getRunnableTask().addSubTaskGroup(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  // --------------------------------------------------------------------------------
+  // End of DB Scoped replication methods.
+
   // --------------------------------------------------------------------------------
   // End of XCluster.
 }

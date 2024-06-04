@@ -103,7 +103,6 @@ Next, open a database connection and run a few SQL requests:
 
     ```shell
     \q
-    exit
     ```
 
 ## Explore YugabyteDB UI
@@ -171,7 +170,7 @@ To view more detailed information about the cluster nodes, go to the **Nodes** d
 
 ![YugabyteDB UI Nodes Dashboard](/images/tutorials/build-and-learn/chpater2-yugabytedb-ui-nodes-tab.png)
 
-The **Number of Tablets** column provides insights into how YugabyteDB [distributes data and workload](../../../architecture/docdb-replication/replication/#concepts):
+The **Number of Tablets** column provides insights into how YugabyteDB [distributes data and workload](../../../architecture/docdb-sharding).
 
 * **Tablets** - YugabyteDB shards your data by splitting tables into tablets, which are then distributed across the cluster nodes. Currently, the cluster splits system-level tables into `9` tablets (see the **Total** column).
 

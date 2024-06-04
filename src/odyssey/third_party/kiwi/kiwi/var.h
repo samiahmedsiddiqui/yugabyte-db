@@ -8,6 +8,7 @@
  */
 
 #define KIWI_MAX_VAR_SIZE 128
+#define KIWI_MAX_NAME_SIZE 64
 
 typedef struct kiwi_var kiwi_var_t;
 typedef struct kiwi_vars kiwi_vars_t;
@@ -45,7 +46,7 @@ struct kiwi_var {
 #ifdef YB_GUC_SUPPORT_VIA_SHMEM
 	kiwi_var_type_t type;
 #endif
-	char *name;
+	char name[KIWI_MAX_NAME_SIZE];
 	int name_len;
 	char value[KIWI_MAX_VAR_SIZE];
 	int value_len;
@@ -67,9 +68,9 @@ static inline void kiwi_var_init(kiwi_var_t *var, char *name, int name_len)
 	var->name = name;
 #else
 	if (name_len == 0)
-		var->name = NULL;
+		var->name[0] = '\0';
 	else
-		var->name = strdup(name);
+		memcpy(var->name, name, name_len);
 #endif
 	var->name_len = name_len;
 	var->value_len = 0;
@@ -136,7 +137,6 @@ static inline void yb_kiwi_var_push(kiwi_vars_t *vars, char *name, int name_len,
 		vars->vars = realloc(vars->vars, vars->size * sizeof(kiwi_var_t));
 
 	kiwi_var_t *var = &vars->vars[vars->size - 1];
-	var->name = (char *)malloc(name_len * sizeof(char));
 	memcpy(var->name, name, name_len);
 	var->name_len = name_len;
 	memcpy(var->value, value, value_len);
@@ -219,9 +219,9 @@ static inline void kiwi_vars_init(kiwi_vars_t *vars)
 #else
 	vars->size = 0;
 
-	/* Ensure that role is "cached" after session_authorization. */
-	yb_kiwi_var_push(vars, "session_authorization", 22, "default", 8);
-	yb_kiwi_var_push(vars, "role", 5, "none", 5);
+	/* Ensure that role oid is "cached" after session authorization oid. */
+	yb_kiwi_var_push(vars, "session_authorization_oid", 26, "-1", 3);
+	yb_kiwi_var_push(vars, "role_oid", 9, "-1", 3);
 #endif
 }
 
@@ -366,6 +366,13 @@ __attribute__((hot)) static inline int kiwi_vars_cas(kiwi_vars_t *client,
 
 		if (strcmp(var->name, "compression") == 0)
 			continue;
+
+		/* do not send default value oid packets to the server */
+		if (((strcmp(var->name, "role_oid") == 0) ||
+			strcmp(var->name, "session_authorization_oid") == 0) &&
+			(strcmp(var->value, "-1") == 0))
+			continue;
+
 		kiwi_var_t *server_var;
 		server_var = yb_kiwi_vars_get(server, var->name);
 #endif
@@ -383,19 +390,13 @@ __attribute__((hot)) static inline int kiwi_vars_cas(kiwi_vars_t *client,
 		memcpy(query + pos, "=", 1);
 		pos += 1;
 
-		/* Do not enquote the default values for auth related params. */
-		if (!(strcmp(var->name, "role") == 0 && strcmp(var->value, "none") == 0) &&
-			!(strcmp(var->name, "session_authorization") == 0 && strcmp(var->value, "default") == 0)) {
-			int quote_len;
-			quote_len =
-				kiwi_enquote(var->value, query + pos, query_len - pos);
-			if (quote_len == -1)
-				return -1;
-			pos += quote_len;
-		} else {
-			memcpy(query + pos, var->value, var->value_len - 1);
-			pos += var->value_len - 1;
-		}
+		int quote_len;
+		quote_len =
+			kiwi_enquote(var->value, query + pos, query_len - pos);
+		if (quote_len == -1)
+			return -1;
+		pos += quote_len;
+
 		memcpy(query + pos, ";", 1);
 		pos += 1;
 	}

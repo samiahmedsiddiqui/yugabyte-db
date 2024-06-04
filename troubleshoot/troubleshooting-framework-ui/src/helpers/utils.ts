@@ -1,6 +1,6 @@
+import { isNonEmptyArray, isNonEmptyObject } from '@yugabytedb/ui-components';
 import { MIN_OUTLIER_NUM_NODES } from "./constants";
-import { Anomaly, AppName, GraphMetadata, GraphQuery, MetricMeasure, RCAGuideline, SplitMode, SplitType, TroubleshootingRecommendations } from "./dtos";
-import { isNonEmptyArray, isNonEmptyObject } from './objectUtils';
+import { Anomaly, AppName, GraphLabel, GraphMetadata, MetricMeasure, RCAGuideline, SplitMode, SplitType, TroubleshootingRecommendations } from "./dtos";
 
 export const formatData = (data: any, appName: AppName) => {
   const formattedData = 
@@ -245,6 +245,12 @@ export const getGraphRequestParams = (anomalyData: Anomaly, startDate=null, endD
       request.start = anomalyData.graphStartTime;
       request.end = anomalyData.graphEndTime;
       request.settings = anomalyData.defaultSettings;
+       // if (graph.name === "active_session_history") {
+      //   request.groupBy = [];
+      // }
+      if (graph.name.startsWith('active_session_history')) {
+        request.groupBy = [];
+      }
       return request;
   });
   
@@ -257,6 +263,12 @@ export const getGraphRequestParams = (anomalyData: Anomaly, startDate=null, endD
       request.start = anomalyData.graphStartTime;
       request.end = anomalyData.graphEndTime;
       request.settings = anomalyData.defaultSettings;
+      // if (graph.name === "active_session_history") {
+      //   request.groupBy = [];
+      // }
+      if (graph.name.startsWith('active_session_history')) {
+        request.groupBy = [];
+      }
       return request;
       })
     })

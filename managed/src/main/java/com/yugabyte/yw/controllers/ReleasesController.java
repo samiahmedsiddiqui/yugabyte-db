@@ -1,7 +1,9 @@
 package com.yugabyte.yw.controllers;
 
+import com.google.inject.Inject;
 import com.yugabyte.yw.cloud.PublicCloudConstants.Architecture;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.ReleasesUtils;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.rbac.PermissionInfo.Action;
 import com.yugabyte.yw.common.rbac.PermissionInfo.ResourceType;
@@ -16,6 +18,7 @@ import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Release;
 import com.yugabyte.yw.models.ReleaseArtifact;
 import com.yugabyte.yw.models.ReleaseLocalFile;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.common.YbaApi;
 import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
 import com.yugabyte.yw.rbac.annotations.AuthzPath;
@@ -30,12 +33,12 @@ import io.swagger.annotations.ApiImplicitParam;
 import io.swagger.annotations.ApiImplicitParams;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.Authorization;
-import java.io.File;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -49,6 +52,7 @@ import play.mvc.Result;
     hidden = true)
 @Slf4j
 public class ReleasesController extends AuthenticatedController {
+  @Inject ReleasesUtils releasesUtils;
 
   @ApiOperation(
       value = "Create a release",
@@ -75,6 +79,10 @@ public class ReleasesController extends AuthenticatedController {
     Customer.getOrBadRequest(customerUUID);
     CreateRelease reqRelease =
         formFactory.getFormDataOrBadRequest(request.body().asJson(), CreateRelease.class);
+
+    // Validate the version
+    releasesUtils.validateVersionAgainstCurrentYBA(reqRelease.version);
+
     // Validate the version/tag combo doesn't exist
     if (reqRelease.release_uuid == null) {
       log.trace("generating random release UUID as one was not provided");
@@ -160,9 +168,10 @@ public class ReleasesController extends AuthenticatedController {
     } else {
       releases = Release.getAll();
     }
+    Map<String, List<Universe>> versionUniverseMap = releasesUtils.versionUniversesMap();
     List<ResponseRelease> respReleases = new ArrayList<>();
     for (Release release : releases) {
-      ResponseRelease resp = releaseToResponseRelease(release);
+      ResponseRelease resp = releaseToResponseRelease(release, versionUniverseMap);
       respReleases.add(resp);
     }
     return PlatformResults.withData(respReleases);
@@ -183,7 +192,8 @@ public class ReleasesController extends AuthenticatedController {
   public Result get(UUID customerUUID, UUID releaseUUID, Http.Request request) {
     Customer.getOrBadRequest(customerUUID);
     Release release = Release.getOrBadRequest(releaseUUID);
-    ResponseRelease resp = releaseToResponseRelease(release);
+    Map<String, List<Universe>> versionUniverseMap = releasesUtils.versionUniversesMap();
+    ResponseRelease resp = releaseToResponseRelease(release, versionUniverseMap);
     return PlatformResults.withData(resp);
   }
 
@@ -255,14 +265,14 @@ public class ReleasesController extends AuthenticatedController {
       if (reqRelease.release_tag != null
           && !reqRelease.release_tag.equals(release.getReleaseTag())) {
         log.debug("updating release tag to {}", reqRelease.release_tag);
-        release.setReleaseTag(reqRelease.release_tag);
+        release.saveReleaseTag(reqRelease.release_tag);
       }
       if (reqRelease.release_date != null) {
         try {
           Date releaseDate = Date.from(Instant.ofEpochSecond(reqRelease.release_date));
           if (!releaseDate.equals(release.getReleaseDate())) {
             log.debug("updating release date to {}", reqRelease.release_date);
-            release.setReleaseDate(releaseDate);
+            release.saveReleaseDate(releaseDate);
           }
         } catch (IllegalArgumentException | DateTimeException e) {
           log.warn("unable to parse date format", e);
@@ -271,7 +281,7 @@ public class ReleasesController extends AuthenticatedController {
       if (reqRelease.release_notes != null
           && !reqRelease.release_notes.equals(release.getReleaseNotes())) {
         log.debug("updating release notes to {}", reqRelease.release_notes);
-        release.setReleaseNotes(reqRelease.release_notes);
+        release.saveReleaseNotes(reqRelease.release_notes);
       }
       if (reqRelease.state != null
           && !release.getState().equals(Release.ReleaseState.valueOf(reqRelease.state))) {
@@ -280,7 +290,7 @@ public class ReleasesController extends AuthenticatedController {
               BAD_REQUEST, "cannot change state of in-use release " + releaseUUID);
         }
         log.info("updating release state to {}", reqRelease.state);
-        release.setState(Release.ReleaseState.valueOf(reqRelease.state));
+        release.saveState(Release.ReleaseState.valueOf(reqRelease.state));
       }
 
       // Now, check if any artifacts have changed, and update them as needed
@@ -318,7 +328,7 @@ public class ReleasesController extends AuthenticatedController {
                     "updating artifact {} sha to {}",
                     artifact.getArtifactUUID(),
                     reqArtifact.sha256);
-                artifact.setSha256(reqArtifact.sha256);
+                artifact.saveSha256(reqArtifact.sha256);
               }
               break;
             }
@@ -368,7 +378,8 @@ public class ReleasesController extends AuthenticatedController {
     return YBPSuccess.empty();
   }
 
-  private ResponseRelease releaseToResponseRelease(Release release) {
+  private ResponseRelease releaseToResponseRelease(
+      Release release, Map<String, List<Universe>> versionUniversesMap) {
     ResponseRelease resp = new ResponseRelease();
     resp.release_uuid = release.getReleaseUUID();
     resp.version = release.getVersion();
@@ -388,7 +399,7 @@ public class ReleasesController extends AuthenticatedController {
       if (artifact.getPackageFileID() != null) {
         respArtifact.package_file_id = artifact.getPackageFileID();
         ReleaseLocalFile rlf = ReleaseLocalFile.get(artifact.getPackageFileID());
-        respArtifact.file_name = new File(rlf.getLocalFilePath()).getName();
+        respArtifact.file_name = rlf.getLocalFilePath();
       } else {
         respArtifact.package_url = artifact.getPackageURL();
       }
@@ -396,7 +407,7 @@ public class ReleasesController extends AuthenticatedController {
     }
 
     resp.universes =
-        release.getUniverses().stream()
+        versionUniversesMap.getOrDefault(release.getVersion(), new ArrayList<Universe>()).stream()
             .map(
                 u ->
                     new ResponseRelease.Universe(

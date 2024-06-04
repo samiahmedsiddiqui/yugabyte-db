@@ -139,6 +139,11 @@ extern bool yb_enable_alter_table_rewrite;
 extern bool yb_enable_replica_identity;
 
 /*
+ * GUC variable that specifies default replica identity for tables at the time of creation.
+ */
+extern char* yb_default_replica_identity;
+
+/*
  * xcluster consistency level
  */
 #define XCLUSTER_CONSISTENCY_TABLET 0
@@ -179,6 +184,34 @@ extern int yb_walsender_poll_sleep_duration_nonempty_ms;
  */
 extern int yb_walsender_poll_sleep_duration_empty_ms;
 
+/*
+ * Allows for customizing the maximum size of a batch of explicit row lock operations.
+ */
+extern int yb_explicit_row_locking_batch_size;
+
+/*
+ * Ease transition to YSQL by reducing read restart errors for new apps.
+ *
+ * This option doesn't affect SERIALIZABLE isolation level since
+ * SERIALIZABLE can't face read restart errors anyway.
+ *
+ * See the help text for yb_read_after_commit_visibility GUC for more
+ * information.
+ *
+ * XXX: This GUC is meant as a workaround only by relaxing the
+ * read-after-commit-visibility guarantee. Ideally,
+ * (a) Users should fix their apps to handle read restart errors, or
+ * (b) TODO(#22317): YB should use very accurate clocks to avoid read restart
+ *     errors altogether.
+ */
+typedef enum {
+  YB_STRICT_READ_AFTER_COMMIT_VISIBILITY = 0,
+  YB_RELAXED_READ_AFTER_COMMIT_VISIBILITY = 1,
+} YBReadAfterCommitVisibilityEnum;
+
+/* GUC for the enum above. */
+extern int yb_read_after_commit_visibility;
+
 typedef struct YBCStatusStruct* YBCStatus;
 
 bool YBCStatusIsNotFound(YBCStatus s);
@@ -208,6 +241,7 @@ bool YBCIsTxnConflictError(uint16_t txn_errcode);
 bool YBCIsTxnSkipLockingError(uint16_t txn_errcode);
 bool YBCIsTxnDeadlockError(uint16_t txn_errcode);
 bool YBCIsTxnAbortedError(uint16_t txn_errcode);
+const char* YBCTxnErrCodeToString(uint16_t txn_errcode);
 uint16_t YBCGetTxnConflictErrorCode();
 
 void YBCResolveHostname();
@@ -295,6 +329,7 @@ const char* YBCGetWaitEventName(uint32_t wait_event_info);
 const char* YBCGetWaitEventClass(uint32_t wait_event_info);
 const char* YBCGetWaitEventComponent(uint32_t wait_event_info);
 const char* YBCGetWaitEventType(uint32_t wait_event_info);
+uint8_t YBCGetQueryIdForCatalogRequests();
 
 #ifdef __cplusplus
 } // extern "C"

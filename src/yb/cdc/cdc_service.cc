@@ -69,6 +69,8 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_participant.h"
 
+#include "yb/tserver/service_util.h"
+
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -181,6 +183,10 @@ DEFINE_RUNTIME_uint32(cdcsdk_tablet_not_of_interest_timeout_secs, 4 * 60 * 60,
 DEFINE_test_flag(bool, cdc_force_destroy_virtual_wal_failure, false,
                  "For testing only. When set to true, DestroyVirtualWal RPC will return RPC "
                  "failure response.");
+
+DEFINE_RUNTIME_PREVIEW_bool(enable_cdcsdk_setting_get_changes_response_byte_limit, false,
+    "When enabled, we'll consider the proto field getchanges_resp_max_size_bytes in "
+    "GetChangesRequestPB to limit the size of GetChanges response.");
 
 DECLARE_bool(enable_log_retention_by_op_idx);
 
@@ -779,16 +785,6 @@ client::YBClient* CDCServiceImpl::client() { return impl_->async_client_init_->c
 
 namespace {
 
-bool YsqlTableHasPrimaryKey(const client::YBSchema& schema) {
-  for (const auto& col : schema.columns()) {
-    if (col.order() == static_cast<int32_t>(PgSystemAttrNum::kYBRowId)) {
-      // ybrowid column is added for tables that don't have user-specified primary key.
-      return false;
-    }
-  }
-  return true;
-}
-
 std::unordered_map<std::string, std::string> GetCreateCDCStreamOptions(
     const CreateCDCStreamRequestPB* req) {
   std::unordered_map<std::string, std::string> options;
@@ -869,29 +865,6 @@ bool GetFromOpId(const GetChangesRequestPB* req, OpId* op_id, CDCSDKCheckpointPB
     return false;
   }
   return true;
-}
-
-// Check for compatibility whether CDC can be setup on the table
-// This essentially checks that the table should not be a REDIS table since we do not support it
-// and if it's a YSQL or YCQL one, it should have a primary key
-Status CheckCdcCompatibility(const std::shared_ptr<client::YBTable>& table) {
-  // return if it is a CQL table because they always have a user specified primary key
-  if (table->table_type() == client::YBTableType::YQL_TABLE_TYPE) {
-    LOG(INFO) << "Returning while checking CDC compatibility, table is a YCQL table";
-    return Status::OK();
-  }
-
-  if (table->table_type() == client::YBTableType::REDIS_TABLE_TYPE) {
-    return STATUS(InvalidArgument, "Cannot setup CDC on YEDIS_TABLE");
-  }
-
-  // Check if YSQL table has a primary key. CQL tables always have a
-  // user specified primary key.
-  if (!YsqlTableHasPrimaryKey(table->schema())) {
-    return STATUS(InvalidArgument, "Cannot setup CDC on table without primary key");
-  }
-
-  return Status::OK();
 }
 
 CoarseTimePoint GetDeadline(const RpcContext& context, client::YBClient* client) {
@@ -1060,8 +1033,9 @@ Status CDCServiceImpl::CreateCDCStreamForNamespace(
   }
 
   xrepl::StreamId db_stream_id = VERIFY_RESULT_OR_SET_CODE(
-      client()->CreateCDCSDKStreamForNamespace(ns_id, options, populate_namespace_id_as_table_id,
-                                               ReplicationSlotName(""), snapshot_option, deadline),
+      client()->CreateCDCSDKStreamForNamespace(
+          ns_id, options, populate_namespace_id_as_table_id, ReplicationSlotName(""), std::nullopt,
+          snapshot_option, deadline),
       CDCError(CDCErrorPB::INTERNAL_ERROR));
   resp->set_db_stream_id(db_stream_id.ToString());
   return Status::OK();
@@ -1073,59 +1047,30 @@ void CDCServiceImpl::CreateCDCStream(
     return;
   }
 
-  RPC_CHECK_AND_RETURN_ERROR(
-      req->has_table_id() || req->has_namespace_name(),
-      STATUS(InvalidArgument, "Table ID or Database name is required to create CDC stream"),
-      resp->mutable_error(),
-      CDCErrorPB::INVALID_REQUEST,
-      context);
-
-  bool is_xcluster = req->source_type() == XCLUSTER;
-  if (is_xcluster || req->has_table_id()) {
-    std::shared_ptr<client::YBTable> table;
-    Status s = client()->OpenTable(req->table_id(), &table);
-    RPC_STATUS_RETURN_ERROR(s, resp->mutable_error(), CDCErrorPB::TABLE_NOT_FOUND, context);
-
-    // We don't allow CDC on YEDIS and tables without a primary key.
-    if (req->record_format() != CDCRecordFormat::WAL) {
-      s = CheckCdcCompatibility(table);
-      RPC_STATUS_RETURN_ERROR(s, resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
-    }
-
-    std::unordered_map<std::string, std::string> options = GetCreateCDCStreamOptions(req);
-
-    auto stream_id = RPC_VERIFY_RESULT(
-        client()->CreateCDCStream(req->table_id(), options), resp->mutable_error(),
-        CDCErrorPB::INTERNAL_ERROR, context);
-
-    resp->set_stream_id(stream_id.ToString());
-
-    // Add stream to cache.
-    AddStreamMetadataToCache(
-        stream_id,
-        std::make_shared<StreamMetadata>(
-            "",
-            std::vector<TableId>{req->table_id()},
-            req->record_type(),
-            req->record_format(),
-            req->source_type(),
-            req->checkpoint_type(),
-            StreamModeTransactional(req->transactional())));
-  } else if (req->has_namespace_name()) {
-    // Return error if we see that no checkpoint type has been populated.
-    RPC_CHECK_AND_RETURN_ERROR(
-        req->has_checkpoint_type(),
-        STATUS(InvalidArgument, "Checkpoint type is required to create a CDCSDK stream"),
+  if (req->has_table_id() || req->source_type() == XCLUSTER) {
+    RPC_STATUS_RETURN_ERROR(
+        STATUS(InvalidArgument, "xCluster stream should be created on master"),
         resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+  }
 
-    auto deadline = GetDeadline(context, client());
-    Status status = CreateCDCStreamForNamespace(req, resp, deadline);
-    CDCError error(status);
+  RPC_CHECK_AND_RETURN_ERROR(
+      req->has_namespace_name(),
+      STATUS(InvalidArgument, "Table ID or Database name is required to create CDCSDK stream"),
+      resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
 
-    if (!status.ok()) {
-      SetupErrorAndRespond(resp->mutable_error(), status, error.value(), &context);
-      return;
-    }
+  // Return error if we see that no checkpoint type has been populated.
+  RPC_CHECK_AND_RETURN_ERROR(
+      req->has_checkpoint_type(),
+      STATUS(InvalidArgument, "Checkpoint type is required to create a CDCSDK stream"),
+      resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+
+  auto deadline = GetDeadline(context, client());
+  Status status = CreateCDCStreamForNamespace(req, resp, deadline);
+  CDCError error(status);
+
+  if (!status.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), status, error.value(), &context);
+    return;
   }
 
   context.RespondSuccess();
@@ -1546,11 +1491,19 @@ void CDCServiceImpl::GetChanges(
 
   auto original_leader_term = tablet_peer ? tablet_peer->LeaderTerm() : OpId::kUnknownTerm;
 
-  if ((!tablet_peer || tablet_peer->IsNotLeader()) && req->serve_as_proxy()) {
-    // Forward GetChanges() to tablet leader. This commonly happens in Kubernetes setups.
-    auto context_ptr = std::make_shared<RpcContext>(std::move(context));
-    TabletLeaderGetChanges(req, resp, context_ptr, tablet_peer);
-    return;
+  bool isNotLeader = tablet_peer && tablet_peer->IsNotLeader();
+  if (!tablet_peer || isNotLeader) {
+    if (req->serve_as_proxy()) {
+      // Forward GetChanges() to tablet leader. This commonly happens in Kubernetes setups.
+      auto context_ptr = std::make_shared<RpcContext>(std::move(context));
+      VLOG(2)
+          << "GetChangesRpc::TabletLeaderGetChanges is called because serve_as_proxy is turned on";
+      TabletLeaderGetChanges(req, resp, context_ptr, tablet_peer);
+      return;
+    }
+  }
+  if (isNotLeader) {
+    tserver::FillTabletConsensusInfo(resp, tablet_peer->tablet_id(), tablet_peer);
   }
 
   // If we can't serve this tablet...
@@ -1572,7 +1525,8 @@ void CDCServiceImpl::GetChanges(
       resp->mutable_error(),
       CDCErrorPB::LEADER_NOT_READY,
       context);
-
+  // Fill in tablet consensus info now we know that the tablet exists and is leader.
+  tserver::FillTabletConsensusInfoIfRequestOpIdStale(tablet_peer, req, resp);
   auto stream_meta_ptr = RPC_VERIFY_RESULT(
       GetStream(stream_id, RefreshStreamMapOption::kIfInitiatedState), resp->mutable_error(),
       CDCErrorPB::INTERNAL_ERROR, context);
@@ -1605,7 +1559,6 @@ void CDCServiceImpl::GetChanges(
       streaming_checkpoint_pb.set_key("");
       streaming_checkpoint_pb.set_write_id(0);
       resp->mutable_cdc_sdk_checkpoint()->CopyFrom(streaming_checkpoint_pb);
-
       context.RespondSuccess();
       return;
     }
@@ -1744,14 +1697,19 @@ void CDCServiceImpl::GetChanges(
         GetCompositeAttsMapFromCache(namespace_name, cql_namespace), resp->mutable_error(),
         CDCErrorPB::INTERNAL_ERROR, context);
 
+    std::optional<uint64_t> getchanges_resp_max_size_bytes = std::nullopt;
+    if (FLAGS_enable_cdcsdk_setting_get_changes_response_byte_limit &&
+        req->has_getchanges_resp_max_size_bytes()) {
+      getchanges_resp_max_size_bytes = req->getchanges_resp_max_size_bytes();
+    }
+
     status = GetChangesForCDCSDK(
         stream_id, req->tablet_id(), cdc_sdk_from_op_id, record, tablet_peer, mem_tracker, enum_map,
         composite_atts_map, req->cdcsdk_request_source(), client(), &msgs_holder, resp,
         &commit_timestamp, &cached_schema_details, &last_streamed_op_id, req->safe_hybrid_time(),
-        consistent_snapshot_time,
-        req->wal_segment_index(),
-        &last_readable_index, tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "",
-        get_changes_deadline);
+        consistent_snapshot_time, req->wal_segment_index(), &last_readable_index,
+        tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "", get_changes_deadline,
+        getchanges_resp_max_size_bytes);
     // This specific error from the docdb_pgapi layer is used to identify enum cache entry is
     // out of date, hence we need to repopulate.
     if (status.IsCacheMissError()) {
@@ -1773,12 +1731,21 @@ void CDCServiceImpl::GetChanges(
       // Clean all the records which got added in the resp, till the enum cache miss failure is
       // encountered.
       resp->clear_cdc_sdk_proto_records();
+      if (req->has_need_schema_info() && req->need_schema_info()) {
+        VLOG(2) << "Clearing cached schema for tablet " << req->tablet_id()
+                << "since the response needs schema details.";
+        cached_schema_details.clear();
+      }
+
+      VLOG(2) << "Handling GetChanges retry internally for tablet " << req->tablet_id()
+              << " for error: " << status.ToString();
       status = GetChangesForCDCSDK(
           stream_id, req->tablet_id(), cdc_sdk_from_op_id, record, tablet_peer, mem_tracker,
           enum_map, composite_atts_map, req->cdcsdk_request_source(), client(), &msgs_holder, resp,
           &commit_timestamp, &cached_schema_details, &last_streamed_op_id, req->safe_hybrid_time(),
           consistent_snapshot_time, req->wal_segment_index(), &last_readable_index,
-          tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "", get_changes_deadline);
+          tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "", get_changes_deadline,
+          getchanges_resp_max_size_bytes);
     }
     // This specific error indicates that a tablet split occured on the tablet.
     if (status.IsTabletSplit()) {
@@ -2458,8 +2425,58 @@ Result<bool> CDCServiceImpl::CheckBeforeImageActive(
   return is_before_image_active;
 }
 
+Result<std::unordered_map<NamespaceId, uint64_t>>
+CDCServiceImpl::GetNamespaceMinRecordIdCommitTimeMap(
+    const CDCStateTableRange& table_range, Status* iteration_status,
+    StreamIdSet* slot_entries_to_be_deleted) {
+  std::unordered_map<NamespaceId, uint64_t> namespace_to_min_record_id_commit_time;
+
+  // Iterate over all the slot entries and find the minimum record_id_commit_time for each
+  // namespace.
+  for (auto entry_result : table_range) {
+    if (!entry_result) {
+      LOG(WARNING) << "Failed to get min record_id_commit_time per namespace. "
+                   << entry_result.status();
+      return entry_result.status();
+    }
+    const auto& entry = *entry_result;
+
+    if (entry.key.tablet_id != kCDCSDKSlotEntryTabletId) {
+      continue;
+    }
+
+    const auto& stream_id = entry.key.stream_id;
+
+    RSTATUS_DCHECK(
+        entry.record_id_commit_time.has_value(), InternalError,
+        Format("The slot entry for the stream $0 did not have a value for record_id_commit_time"),
+        stream_id);
+
+    if (slot_entries_to_be_deleted && entry.checkpoint == OpId::Max()) {
+      LOG(INFO) << "Stream : " << stream_id << " is being deleted";
+      slot_entries_to_be_deleted->insert(stream_id);
+      continue;
+    }
+
+    auto stream_metadata = VERIFY_RESULT(GetStream(stream_id));
+    auto namespace_id = stream_metadata->GetNamespaceId();
+
+    auto record_id_commit_time = *entry.record_id_commit_time;
+    if (!namespace_to_min_record_id_commit_time.contains(namespace_id)) {
+      namespace_to_min_record_id_commit_time.insert({namespace_id, record_id_commit_time});
+      continue;
+    }
+    namespace_to_min_record_id_commit_time[namespace_id] =
+        std::min(namespace_to_min_record_id_commit_time[namespace_id], record_id_commit_time);
+  }
+
+  RETURN_NOT_OK(*iteration_status);
+  return namespace_to_min_record_id_commit_time;
+}
+
 Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
-    const TabletId& input_tablet_id, TabletIdStreamIdSet* tablet_stream_to_be_deleted) {
+    const TabletId& input_tablet_id, TabletIdStreamIdSet* tablet_stream_to_be_deleted,
+    StreamIdSet* slot_entries_to_be_deleted) {
   TabletIdCDCCheckpointMap tablet_min_checkpoint_map;
   std::unordered_set<xrepl::StreamId> refreshed_metadata_set;
 
@@ -2468,6 +2485,15 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
   auto table_range = VERIFY_RESULT(cdc_state_table_->GetTableRange(
       CDCStateTableEntrySelector().IncludeCheckpoint().IncludeLastReplicationTime().IncludeData(),
       &iteration_status));
+
+  // Get the minimum record_id_commit_time for each namespace by looking at all the slot entries.
+  std::unordered_map<NamespaceId, uint64_t> namespace_to_min_record_id_commit_time;
+  StreamIdSet streams_with_tablet_entries_to_be_deleted;
+  if (FLAGS_ysql_TEST_enable_replication_slot_consumption) {
+    namespace_to_min_record_id_commit_time = VERIFY_RESULT(GetNamespaceMinRecordIdCommitTimeMap(
+        table_range, &iteration_status, slot_entries_to_be_deleted));
+  }
+
   for (auto entry_result : table_range) {
     if (!entry_result) {
       LOG(WARNING) << "Populate tablet checkpoint failed for row. " << entry_result.status();
@@ -2486,8 +2512,9 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
     const auto& checkpoint = *entry.checkpoint;
     count++;
 
-    // kCDCSDKSlotEntryTabletId represent cdc_state entry for a replication slot. Ignore it while
-    // moving retention barriers.
+    // kCDCSDKSlotEntryTabletId represent cdc_state entry for a replication slot. The required
+    // information from slot entry has been extracted and stored into
+    // 'namespace_to_min_record_id_commit_time' map.
     if (tablet_id == kCDCSDKSlotEntryTabletId) {
       continue;
     }
@@ -2534,6 +2561,7 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
         VLOG(2) << "We will remove the entry for the stream: " << stream_id
                 << ", from cdc_state table.";
         tablet_stream_to_be_deleted->insert({tablet_id, stream_id});
+        streams_with_tablet_entries_to_be_deleted.insert(stream_id);
         RemoveStreamFromCache(stream_id);
       }
       continue;
@@ -2546,8 +2574,6 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
 
     HybridTime cdc_sdk_safe_time = HybridTime::kInvalid;
     int64_t last_active_time_cdc_state_table = std::numeric_limits<int64_t>::min();
-    // We will only populate the "cdc_sdk_safe_time" when before image is active or when we are in
-    // taking the snapshot of any table.
     auto is_before_image_active_result = CheckBeforeImageActive(tablet_id, record, tablet_peeer);
     if (!is_before_image_active_result.ok()) {
       LOG(WARNING) << "Unable to obtain before image / replica identity information for tablet: "
@@ -2556,8 +2582,26 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
     }
     bool is_before_image_active = *is_before_image_active_result;
 
-    if (entry.cdc_sdk_safe_time && (is_before_image_active || entry.snapshot_key.has_value())) {
-      cdc_sdk_safe_time = HybridTime(*entry.cdc_sdk_safe_time);
+    // We will only populate the "cdc_sdk_safe_time" when before image is active or when we are in
+    // taking the snapshot of any table.
+    auto namespace_id = record.GetNamespaceId();
+    if ((is_before_image_active || entry.snapshot_key.has_value())) {
+      // For replication slot consumption we can set the cdc_sdk_safe_time to the minimum
+      // acknowledged commit time among all the slots on the namespace.
+      if (FLAGS_ysql_TEST_enable_replication_slot_consumption) {
+        if (slot_entries_to_be_deleted && !slot_entries_to_be_deleted->contains(stream_id)) {
+          // This is possible when Update Peers and Metrics thread comes into action before the slot
+          // entry is added to the cdc_state table.
+          if (!namespace_to_min_record_id_commit_time.contains(namespace_id)) {
+            LOG(WARNING) << "Did not find any value for record_id_commit_time for the namespace: "
+                         << namespace_id;
+            continue;
+          }
+          cdc_sdk_safe_time = HybridTime(namespace_to_min_record_id_commit_time[namespace_id]);
+        }
+      } else if (entry.cdc_sdk_safe_time) {
+        cdc_sdk_safe_time = HybridTime(*entry.cdc_sdk_safe_time);
+      }
     }
 
     if (entry.active_time) {
@@ -2576,6 +2620,7 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
               << ", tablet_id: " << tablet_id
               << ", from cdc_state table since it has OpId::Max().";
       tablet_stream_to_be_deleted->insert({tablet_id, stream_id});
+      streams_with_tablet_entries_to_be_deleted.insert(stream_id);
     }
 
     // If a tablet_id, stream_id pair is in "uninitialized state", we don't need to send the
@@ -2642,6 +2687,15 @@ Result<TabletIdCDCCheckpointMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
   }
 
   RETURN_NOT_OK(iteration_status);
+
+  // Delete the slot entry in the state table in the next pass of Update Peers and Metrics, if
+  // entries with valid tablet_id are being deleted in this pass. This will ensure that the slot
+  // entry is the last entry to be deleted from the state table for a particular stream.
+  for (const auto& stream : streams_with_tablet_entries_to_be_deleted) {
+    if (slot_entries_to_be_deleted && slot_entries_to_be_deleted->contains(stream)) {
+      slot_entries_to_be_deleted->erase(stream);
+    }
+  }
 
   YB_LOG_EVERY_N_SECS(INFO, 300) << "Read " << count << " records from "
                                  << kCdcStateTableName;
@@ -2938,7 +2992,9 @@ void CDCServiceImpl::UpdatePeersAndMetrics() {
     // Don't exit from this thread even if below method throw error, because
     // if we fail to read cdc_state table, lets wait for the next retry after 60 secs.
     TabletIdStreamIdSet cdc_state_entries_to_delete;
-    auto result = PopulateTabletCheckPointInfo("", &cdc_state_entries_to_delete);
+    StreamIdSet slot_entries_to_be_deleted;
+    auto result =
+        PopulateTabletCheckPointInfo("", &cdc_state_entries_to_delete, &slot_entries_to_be_deleted);
     if (!result.ok()) {
       LOG(WARNING) << "Failed to populate tablets checkpoint info: " << result.status();
       continue;
@@ -2965,7 +3021,8 @@ void CDCServiceImpl::UpdatePeersAndMetrics() {
     TEST_SYNC_POINT("UpdateTabletPeersWithMaxCheckpoint::Done");
 
     WARN_NOT_OK(
-        DeleteCDCStateTableMetadata(cdc_state_entries_to_delete, failed_tablet_ids),
+        DeleteCDCStateTableMetadata(
+            cdc_state_entries_to_delete, failed_tablet_ids, slot_entries_to_be_deleted),
         "Unable to cleanup CDC State table metadata");
 
     rate_limiter_->SetBytesPerSecond(
@@ -2976,7 +3033,8 @@ void CDCServiceImpl::UpdatePeersAndMetrics() {
 
 Status CDCServiceImpl::DeleteCDCStateTableMetadata(
     const TabletIdStreamIdSet& cdc_state_entries_to_delete,
-    const std::unordered_set<TabletId>& failed_tablet_ids) {
+    const std::unordered_set<TabletId>& failed_tablet_ids,
+    const StreamIdSet& slot_entries_to_be_deleted) {
   // Iterating over set and deleting entries from the cdc_state table.
   for (const auto& [tablet_id, stream_id] : cdc_state_entries_to_delete) {
     if (failed_tablet_ids.contains(tablet_id)) {
@@ -2999,6 +3057,18 @@ Status CDCServiceImpl::DeleteCDCStateTableMetadata(
       }
       LOG(INFO) << "CDC state table entry for tablet " << tablet_id << " and streamid " << stream_id
                 << " is deleted";
+    }
+  }
+
+  std::vector<CDCStateTableKey> slot_entry_keys_to_be_deleted;
+  for (const auto& stream_id : slot_entries_to_be_deleted) {
+    slot_entry_keys_to_be_deleted.push_back({kCDCSDKSlotEntryTabletId, stream_id});
+  }
+  if (!slot_entry_keys_to_be_deleted.empty()) {
+    Status s = cdc_state_table_->DeleteEntries(slot_entry_keys_to_be_deleted);
+    if (!s.ok()) {
+      LOG(WARNING) << "Unable to flush operations to delete slot entries from state table: " << s;
+      return s.CloneAndPrepend("Error deleting slot rows from cdc_state table");
     }
   }
   return Status::OK();
@@ -3137,6 +3207,7 @@ void CDCServiceImpl::TabletLeaderGetChanges(
       [this, resp, context, rpc_handle](const Status& status, GetChangesResponsePB&& new_resp) {
         auto retained = rpcs_.Unregister(rpc_handle);
         *resp = std::move(new_resp);
+        VLOG(1) << "GetChangesRPC TabletLeaderGetChanges finished with status: " << status;
         RPC_STATUS_RETURN_ERROR(status, resp->mutable_error(), resp->error().code(), *context);
         context->RespondSuccess();
       });
@@ -3607,7 +3678,8 @@ Status CDCServiceImpl::CheckTabletNotOfInterest(
     return Status::OK();
   }
 
-  auto limit = GetAtomicFlag(&FLAGS_cdcsdk_tablet_not_of_interest_timeout_secs) * 1000 * 1000;
+  int64_t limit_flag = GetAtomicFlag(&FLAGS_cdcsdk_tablet_not_of_interest_timeout_secs);
+  auto limit = limit_flag * 1000 * 1000;
   if (deletion_check) {
     // Add a little bit more to the timeout limit to determine if the cdc_state table
     // entry for this producer_tablet can be deleted. This will help avoid race conditions.
@@ -3628,8 +3700,9 @@ Status CDCServiceImpl::CheckTabletNotOfInterest(
   }
 
   VLOG(1) << "Stream: " << producer_tablet.stream_id
-          << ", unpolled for too long " << (now - last_active_time) << "micros"
-          << " for tablet: " << producer_tablet.tablet_id
+          << ", unpolled for too long " << (now - last_active_time) << " mus"
+          << ", limit was " << limit << " mus"
+          << ", for tablet: " << producer_tablet.tablet_id
           << ", active time in CDCState table: " << last_active_time << ", current time: " << now;
   return STATUS_FORMAT(
       InternalError,
@@ -4066,12 +4139,6 @@ void CDCServiceImpl::RemoveStreamFromCache(const xrepl::StreamId& stream_id) {
   stream_metadata_.erase(stream_id);
 }
 
-void CDCServiceImpl::AddStreamMetadataToCache(
-    const xrepl::StreamId& stream_id, const std::shared_ptr<StreamMetadata>& stream_metadata) {
-  std::lock_guard l(mutex_);
-  InsertOrUpdate(&stream_metadata_, stream_id, stream_metadata);
-}
-
 Status CDCServiceImpl::CheckTabletValidForStream(const TabletStreamInfo& info) {
   auto result = VERIFY_RESULT(impl_->PreCheckTabletValidForStream(info));
   if (result) {
@@ -4377,7 +4444,7 @@ void CDCServiceImpl::InitVirtualWALForCDC(
             session_id),
         resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
 
-    virtual_wal = std::make_shared<CDCSDKVirtualWAL>(this);
+    virtual_wal = std::make_shared<CDCSDKVirtualWAL>(this, stream_id, session_id);
     session_virtual_wal_[session_id] = virtual_wal;
   }
 
@@ -4388,7 +4455,7 @@ void CDCServiceImpl::InitVirtualWALForCDC(
 
   HostPort hostport(context.local_address());
   Status s = virtual_wal->InitVirtualWALInternal(
-      stream_id, table_list, hostport, GetDeadline(context, client()));
+      table_list, hostport, GetDeadline(context, client()));
   if (!s.ok()) {
     {
       std::lock_guard l(mutex_);
@@ -4440,8 +4507,8 @@ void CDCServiceImpl::GetConsistentChanges(
 
   auto stream_id = RPC_VERIFY_STRING_TO_STREAM_ID(req->stream_id());
   HostPort hostport(context.local_address());
-  Status s = virtual_wal->GetConsistentChangesInternal(
-      stream_id, resp, hostport, GetDeadline(context, client()));
+  Status s =
+      virtual_wal->GetConsistentChangesInternal(resp, hostport, GetDeadline(context, client()));
   if (!s.ok()) {
     std::string msg =
         Format("GetConsistentChanges failed for stream_id: $0 with error: $1", stream_id, s);
@@ -4578,7 +4645,7 @@ void CDCServiceImpl::UpdateAndPersistLSN(
   auto stream_id = RPC_VERIFY_STRING_TO_STREAM_ID(req->stream_id());
   auto confirmed_flush_lsn = req->confirmed_flush_lsn();
   auto restart_lsn = req->restart_lsn();
-  auto res = virtual_wal->UpdateAndPersistLSNInternal(stream_id, confirmed_flush_lsn, restart_lsn);
+  auto res = virtual_wal->UpdateAndPersistLSNInternal(confirmed_flush_lsn, restart_lsn);
   if (!res.ok()) {
     std::string error_msg = Format("UpdateAndPersistLSN failed for stream_id: $0", stream_id);
     LOG(WARNING) << error_msg;
@@ -4635,7 +4702,7 @@ void CDCServiceImpl::UpdatePublicationTableList(
   }
 
   Status s = virtual_wal->UpdatePublicationTableListInternal(
-      stream_id, new_table_list, hostport, GetDeadline(context, client()));
+      new_table_list, hostport, GetDeadline(context, client()));
   if (!s.ok()) {
     std::string error_msg =
         Format("UpdatePublicationTableList failed for stream_id: $0", stream_id);

@@ -92,7 +92,9 @@ struct SnapshotScheduleRestoration {
 // Class that coordinates transaction aware snapshots at master.
 class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
  public:
-  explicit MasterSnapshotCoordinator(SnapshotCoordinatorContext* context, CatalogManager* cm);
+  MasterSnapshotCoordinator(
+      SnapshotCoordinatorContext* context, CatalogManager* cm,
+      TabletSplitManager& tablet_split_manager);
   ~MasterSnapshotCoordinator();
 
   Result<TxnSnapshotId> Create(
@@ -173,12 +175,11 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
   Result<std::vector<SnapshotScheduleId>> GetSnapshotSchedules(
       SysRowEntryType type, const std::string& object_id);
 
-  Result<SnapshotInfoPB> GetSuitableSnapshot(
+  // Returns the id of a completed snapshot suitable for restoring to the given restore time.
+  Result<TxnSnapshotId> GetSuitableSnapshotForRestore(
       const SnapshotScheduleId& schedule_id, HybridTime restore_at, int64_t leader_term,
       CoarseTimePoint deadline);
-  Result<SnapshotInfoPB> WaitForSnapshotToComplete(
-      const TxnSnapshotId& snapshot_id, HybridTime restore_at, CoarseTimePoint deadline);
-  Result<bool> IsTableCoveredBySomeSnapshotSchedule(const TableInfo& table_info);
+  Result<bool> IsTableCoveredBySomeSnapshotSchedule(const TableInfo& table_info) const;
 
   // Returns true if there are one or more non-deleted
   // snapshot schedules present.

@@ -91,8 +91,7 @@ DECLARE_uint32(wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_
 DEFINE_RUNTIME_PREVIEW_bool(ysql_pack_inserted_value, false,
      "Enabled packing inserted columns into a single packed value in postgres layer.");
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 namespace {
 
 struct TableHolder {
@@ -239,11 +238,13 @@ class PrecastRequestSender {
   boost::container::small_vector<OperationInfo, 16> ops_;
 };
 
-Status FetchExistingYbctids(PgSession::ScopedRefPtr session,
+using ExecParametersMutator = std::function<void(PgExecParameters*)>;
+
+Status FetchExistingYbctids(const PgSession::ScopedRefPtr& session,
                             PgOid database_id,
-                            std::vector<TableYbctid>* ybctids,
-                            const std::unordered_set<PgOid>& region_local_tables,
-                            const bool keep_order) {
+                            TableYbctidVector* ybctids,
+                            const OidSet& region_local_tables,
+                            const ExecParametersMutator& exec_params_mutator) {
   // Group the items by the table ID.
   std::sort(ybctids->begin(), ybctids->end(), [](const auto& a, const auto& b) {
     return a.table_id < b.table_id;
@@ -274,14 +275,13 @@ Status FetchExistingYbctids(PgSession::ScopedRefPtr session,
     doc_ops.push_back(std::make_unique<PgDocReadOp>(
         session, &read_op->table(), std::move(read_op), request_sender));
     auto& doc_op = *doc_ops.back();
-    // Postgres uses SELECT FOR KEY SHARE query for FK check. Use same lock level.
     auto exec_params = doc_op.ExecParameters();
-    exec_params.rowmark = ROW_MARK_KEYSHARE;
+    exec_params_mutator(&exec_params);
     RETURN_NOT_OK(doc_op.ExecuteInit(&exec_params));
     // Populate doc_op with ybctids which belong to current table.
-    RETURN_NOT_OK(doc_op.PopulateDmlByYbctidOps({make_lw_function([&it, table_id, end] {
+    RETURN_NOT_OK(doc_op.PopulateByYbctidOps({make_lw_function([&it, table_id, end] {
       return it != end && it->table_id == table_id ? Slice((it++)->ybctid) : Slice();
-    }), static_cast<size_t>(end - it), keep_order}));
+    }), static_cast<size_t>(end - it)}));
     RETURN_NOT_OK(doc_op.Execute());
   }
 
@@ -309,6 +309,20 @@ Status FetchExistingYbctids(PgSession::ScopedRefPtr session,
   }
 
   return Status::OK();
+}
+
+auto MakeYbctidReaderForExplicitRowLock(const PgSession::ScopedRefPtr& session) {
+  return [&session](TableYbctidVector* ybctids,
+                    const ExplicitRowLockBuffer::Info& info,
+                    const OidSet& region_local_tables) {
+    return FetchExistingYbctids(
+        session, info.database_id, ybctids, region_local_tables,
+        [&info](PgExecParameters* exec_params) {
+          exec_params->rowmark = info.rowmark;
+          exec_params->pg_wait_policy = info.pg_wait_policy;
+          exec_params->docdb_wait_policy = info.docdb_wait_policy;
+        });
+  };
 }
 
 } // namespace
@@ -735,14 +749,13 @@ Status PgApiImpl::IsDatabaseColocated(const PgOid database_oid, bool *colocated,
   return pg_session_->IsDatabaseColocated(database_oid, colocated, legacy_colocated_database);
 }
 
-Status PgApiImpl::NewCreateDatabase(const char *database_name,
-                                    const PgOid database_oid,
-                                    const PgOid source_database_oid,
-                                    const PgOid next_oid,
-                                    const bool colocated,
-                                    PgStatement **handle) {
-  auto stmt = std::make_unique<PgCreateDatabase>(pg_session_, database_name, database_oid,
-                                                 source_database_oid, next_oid, colocated);
+Status PgApiImpl::NewCreateDatabase(
+    const char* database_name, const PgOid database_oid, const PgOid source_database_oid,
+    const char* source_database_name, const PgOid next_oid, const bool colocated,
+    const int64_t clone_time, PgStatement** handle) {
+  auto stmt = std::make_unique<PgCreateDatabase>(
+      pg_session_, database_name, database_oid, source_database_oid, source_database_name, next_oid,
+      clone_time, colocated);
   if (pg_txn_manager_->IsDdlMode()) {
     stmt->UseTransaction();
   }
@@ -888,8 +901,9 @@ Status PgApiImpl::NewCreateTable(const char *database_name,
                                  const char *table_name,
                                  const PgObjectId& table_id,
                                  bool is_shared_table,
+                                 bool is_sys_catalog_table,
                                  bool if_not_exist,
-                                 bool add_primary_key,
+                                 PgYbrowidMode ybrowid_mode,
                                  bool is_colocated_via_database,
                                  const PgObjectId& tablegroup_oid,
                                  const ColocationId colocation_id,
@@ -900,8 +914,8 @@ Status PgApiImpl::NewCreateTable(const char *database_name,
                                  bool is_truncate,
                                  PgStatement **handle) {
   auto stmt = std::make_unique<PgCreateTable>(
-      pg_session_, database_name, schema_name, table_name,
-      table_id, is_shared_table, if_not_exist, add_primary_key, is_colocated_via_database,
+      pg_session_, database_name, schema_name, table_name, table_id, is_shared_table,
+      is_sys_catalog_table, if_not_exist, ybrowid_mode, is_colocated_via_database,
       tablegroup_oid, colocation_id, tablespace_oid, is_matview, pg_table_oid,
       old_relfilenode_oid, is_truncate);
   if (pg_txn_manager_->IsDdlMode()) {
@@ -1199,6 +1213,7 @@ Status PgApiImpl::NewCreateIndex(const char *database_name,
                                  const PgObjectId& index_id,
                                  const PgObjectId& base_table_id,
                                  bool is_shared_index,
+                                 bool is_sys_catalog_index,
                                  bool is_unique_index,
                                  const bool skip_index_backfill,
                                  bool if_not_exist,
@@ -1211,7 +1226,7 @@ Status PgApiImpl::NewCreateIndex(const char *database_name,
                                  PgStatement **handle) {
   auto stmt = std::make_unique<PgCreateTable>(
       pg_session_, database_name, schema_name, index_name, index_id, is_shared_index,
-      if_not_exist, false /* add_primary_key */,
+      is_sys_catalog_index, if_not_exist, PG_YBROWID_MODE_NONE,
       is_colocated_via_database, tablegroup_oid, colocation_id,
       tablespace_oid, false /* is_matview */, pg_table_id, old_relfilenode_id,
       false /* is_truncate */);
@@ -1241,6 +1256,13 @@ Status PgApiImpl::CreateIndexSetNumTablets(PgStatement *handle, int32_t num_tabl
          InvalidArgument,
          "Invalid statement handle");
   return down_cast<PgCreateTable*>(handle)->SetNumTablets(num_tablets);
+}
+
+Status PgApiImpl::CreateIndexSetVectorOptions(PgStatement *handle, YbPgVectorIdxOptions *options) {
+  SCHECK(PgStatement::IsValidStmt(handle, StmtOp::STMT_CREATE_INDEX),
+         InvalidArgument,
+         "Invalid statement handle");
+  return down_cast<PgCreateTable*>(handle)->SetVectorOptions(options);
 }
 
 Status PgApiImpl::ExecCreateIndex(PgStatement *handle) {
@@ -1333,10 +1355,6 @@ Status PgApiImpl::DmlAppendTarget(PgStatement *handle, PgExpr *target) {
   return down_cast<PgDml*>(handle)->AppendTarget(target);
 }
 
-Result<bool> PgApiImpl::DmlHasRegularTargets(PgStatement *handle) {
-  return down_cast<PgDml*>(handle)->has_regular_targets();
-}
-
 Result<bool> PgApiImpl::DmlHasSystemTargets(PgStatement *handle) {
   return down_cast<PgDml*>(handle)->has_system_targets();
 }
@@ -1401,12 +1419,12 @@ Status PgApiImpl::DmlBindHashCode(
 }
 
 Status PgApiImpl::DmlBindRange(YBCPgStatement handle,
-                               Slice start_value,
-                               bool start_inclusive,
-                               Slice end_value,
-                               bool end_inclusive) {
+                               Slice lower_bound,
+                               bool lower_bound_inclusive,
+                               Slice upper_bound,
+                               bool upper_bound_inclusive) {
   return down_cast<PgDmlRead*>(handle)->BindRange(
-      start_value, start_inclusive, end_value, end_inclusive);
+      lower_bound, lower_bound_inclusive, upper_bound, upper_bound_inclusive);
 }
 
 Status PgApiImpl::DmlBindTable(PgStatement *handle) {
@@ -1791,6 +1809,14 @@ Status PgApiImpl::FetchRequestedYbctids(PgStatement *handle, const PgExecParamet
   return dml_read.Exec(exec_params);
 }
 
+Status PgApiImpl::DmlANNBindVector(PgStatement *handle, PgExpr *vector) {
+  return down_cast<PgDml*>(handle)->ANNBindVector(vector);
+}
+
+Status PgApiImpl::DmlANNSetPrefetchSize(PgStatement *handle, int prefetch_size) {
+  return down_cast<PgDml*>(handle)->ANNSetPrefetchSize(prefetch_size);
+}
+
 Status PgApiImpl::ExecSelect(PgStatement *handle, const PgExecParameters *exec_params) {
   if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_SELECT)) {
     // Invalid handle.
@@ -2085,14 +2111,12 @@ Status PgApiImpl::BeginTransaction(int64_t start_time) {
 }
 
 Status PgApiImpl::RecreateTransaction() {
-  pg_session_->InvalidateForeignKeyReferenceCache();
-  pg_session_->DropBufferedOperations();
+  ClearSessionState();
   return pg_txn_manager_->RecreateTransaction();
 }
 
 Status PgApiImpl::RestartTransaction() {
-  pg_session_->InvalidateForeignKeyReferenceCache();
-  pg_session_->DropBufferedOperations();
+  ClearSessionState();
   return pg_txn_manager_->RestartTransaction();
 }
 
@@ -2108,16 +2132,16 @@ bool PgApiImpl::IsRestartReadPointRequested() {
   return pg_txn_manager_->IsRestartReadPointRequested();
 }
 
-Status PgApiImpl::CommitTransaction() {
+Status PgApiImpl::CommitPlainTransaction() {
+  DCHECK(pg_session_->explicit_row_lock_buffer().IsEmpty());
   pg_session_->InvalidateForeignKeyReferenceCache();
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
-  return pg_txn_manager_->CommitTransaction();
+  return pg_txn_manager_->CommitPlainTransaction();
 }
 
-Status PgApiImpl::AbortTransaction() {
-  pg_session_->InvalidateForeignKeyReferenceCache();
-  pg_session_->DropBufferedOperations();
-  return pg_txn_manager_->AbortTransaction();
+Status PgApiImpl::AbortPlainTransaction() {
+  ClearSessionState();
+  return pg_txn_manager_->AbortPlainTransaction();
 }
 
 Status PgApiImpl::SetTransactionIsolationLevel(int isolation) {
@@ -2138,6 +2162,14 @@ Status PgApiImpl::EnableFollowerReads(bool enable_follower_reads, int32_t stalen
 
 Status PgApiImpl::SetTransactionDeferrable(bool deferrable) {
   return pg_txn_manager_->SetDeferrable(deferrable);
+}
+
+Status PgApiImpl::SetInTxnBlock(bool in_txn_blk) {
+  return pg_txn_manager_->SetInTxnBlock(in_txn_blk);
+}
+
+Status PgApiImpl::SetReadOnlyStmt(bool read_only_stmt) {
+  return pg_txn_manager_->SetReadOnlyStmt(read_only_stmt);
 }
 
 Status PgApiImpl::EnterSeparateDdlTxnMode() {
@@ -2161,7 +2193,7 @@ Status PgApiImpl::ExitSeparateDdlTxnMode(PgOid db_oid, bool is_silent_modificati
 }
 
 Status PgApiImpl::ClearSeparateDdlTxnMode() {
-  pg_session_->DropBufferedOperations();
+  ClearSessionState();
   return pg_txn_manager_->ExitSeparateDdlTxnModeWithAbort();
 }
 
@@ -2172,6 +2204,7 @@ Status PgApiImpl::SetActiveSubTransaction(SubTransactionId id) {
 
 Status PgApiImpl::RollbackToSubTransaction(SubTransactionId id) {
   pg_session_->DropBufferedOperations();
+  pg_session_->explicit_row_lock_buffer().Clear();
   return pg_session_->RollbackToSubTransaction(id);
 }
 
@@ -2230,12 +2263,14 @@ void PgApiImpl::ResetCatalogReadTime() {
 Result<bool> PgApiImpl::ForeignKeyReferenceExists(
     PgOid table_id, const Slice& ybctid, PgOid database_id) {
   return pg_session_->ForeignKeyReferenceExists(
-      LightweightTableYbctid(table_id, ybctid), make_lw_function(
-          [this, database_id](std::vector<TableYbctid>* ybctids,
-                              const std::unordered_set<PgOid>& region_local_tables) {
-            return FetchExistingYbctids(
-                pg_session_, database_id, ybctids, region_local_tables, false);
-          }));
+      LightweightTableYbctid(table_id, ybctid),
+      make_lw_function(
+        [this, database_id](TableYbctidVector* ybctids,
+                            const OidSet& region_local_tables) {
+          return FetchExistingYbctids(
+              pg_session_, database_id, ybctids, region_local_tables,
+              [](PgExecParameters* exec_params) {exec_params->rowmark = ROW_MARK_KEYSHARE;});
+        }));
 }
 
 void PgApiImpl::AddForeignKeyReferenceIntent(
@@ -2250,6 +2285,24 @@ void PgApiImpl::DeleteForeignKeyReference(PgOid table_id, const Slice& ybctid) {
 
 void PgApiImpl::AddForeignKeyReference(PgOid table_id, const Slice& ybctid) {
   pg_session_->AddForeignKeyReference(LightweightTableYbctid(table_id, ybctid));
+}
+
+Status PgApiImpl::AddExplicitRowLockIntent(
+    const PgObjectId& table_id, const Slice& ybctid,
+    const PgExplicitRowLockParams& params, bool is_region_local) {
+  return pg_session_->explicit_row_lock_buffer().Add(
+      {.rowmark = params.rowmark,
+       .pg_wait_policy = params.pg_wait_policy,
+       .docdb_wait_policy = params.docdb_wait_policy,
+       .database_id = table_id.database_oid},
+      LightweightTableYbctid(table_id.object_oid, ybctid),
+      is_region_local,
+      make_lw_function(MakeYbctidReaderForExplicitRowLock(pg_session_)));
+}
+
+Status PgApiImpl::FlushExplicitRowLockIntents() {
+  return pg_session_->explicit_row_lock_buffer().Flush(
+      make_lw_function(MakeYbctidReaderForExplicitRowLock(pg_session_)));
 }
 
 void PgApiImpl::SetTimeout(int timeout_ms) {
@@ -2344,11 +2397,12 @@ void PgApiImpl::RestoreSessionParallelData(const YBCPgSessionParallelData* sessi
 //--------------------------------------------------------------------------------------------------
 
 Status PgApiImpl::NewCreateReplicationSlot(const char *slot_name,
+                                           const char *plugin_name,
                                            const PgOid database_oid,
                                            YBCPgReplicationSlotSnapshotAction snapshot_action,
                                            PgStatement **handle) {
   auto stmt = std::make_unique<PgCreateReplicationSlot>(
-      pg_session_, slot_name, database_oid, snapshot_action);
+      pg_session_, slot_name, plugin_name, database_oid, snapshot_action);
   RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
@@ -2420,5 +2474,16 @@ Result<tserver::PgActiveSessionHistoryResponsePB> PgApiImpl::ActiveSessionHistor
   return pg_session_->ActiveSessionHistory();
 }
 
-} // namespace pggate
-} // namespace yb
+Result<tserver::PgTabletsMetadataResponsePB> PgApiImpl::TabletsMetadata() {
+  return pg_session_->TabletsMetadata();
+}
+
+void PgApiImpl::ClearSessionState() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+  pg_session_->DropBufferedOperations();
+  pg_session_->explicit_row_lock_buffer().Clear();
+}
+
+bool PgApiImpl::IsCronLeader() const { return tserver_shared_object_->IsCronLeader(); }
+
+} // namespace yb::pggate

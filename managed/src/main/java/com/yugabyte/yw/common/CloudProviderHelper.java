@@ -6,7 +6,6 @@ import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -37,7 +36,6 @@ import io.fabric8.kubernetes.api.model.Config;
 import io.fabric8.kubernetes.api.model.NamedAuthInfo;
 import io.fabric8.kubernetes.api.model.NamedCluster;
 import io.fabric8.kubernetes.api.model.NamedContext;
-import io.fabric8.kubernetes.api.model.Node;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.client.internal.KubeConfigUtils;
@@ -636,34 +634,10 @@ public class CloudProviderHelper {
 
   // topology/failure-domain labels from the Kubernetes nodes.
   public Multimap<String, String> computeKubernetesRegionToZoneInfo() {
-    List<Node> nodes = kubernetesManagerFactory.getManager().getNodeInfos(null);
-    Multimap<String, String> regionToAZ = HashMultimap.create();
-    nodes.forEach(
-        node -> {
-          Map<String, String> labels = node.getMetadata().getLabels();
-          if (labels == null) {
-            return;
-          }
-          String region = labels.get("topology.kubernetes.io/region");
-          if (region == null) {
-            region = labels.get("failure-domain.beta.kubernetes.io/region");
-          }
-          String zone = labels.get("topology.kubernetes.io/zone");
-          if (zone == null) {
-            zone = labels.get("failure-domain.beta.kubernetes.io/zone");
-          }
-          if (region == null || zone == null) {
-            log.debug(
-                "Value of the zone or region label is empty for "
-                    + node.getMetadata().getName()
-                    + ", skipping.");
-            return;
-          }
-          regionToAZ.put(region, zone);
-        });
-    return regionToAZ;
-  } // Fetches the secret secretName from current namespace, removes
+    return KubernetesUtil.computeKubernetesRegionToZoneInfo(null, kubernetesManagerFactory);
+  }
 
+  // Fetches the secret secretName from current namespace, removes
   // Extra metadata and returns the secret object.
   // Returns null if the secret is not present.
   public Secret getKubernetesPullSecret(String secretName) {
@@ -919,7 +893,7 @@ public class CloudProviderHelper {
         editProviderReq.getImageBundles().stream()
             .filter(iB -> iB.getUuid() != null)
             .collect(Collectors.toMap(iB -> iB.getUuid(), iB -> iB));
-
+    boolean allowInUseBundleEdit = confGetter.getGlobalConf(GlobalConfKeys.allowUsedBundleEdit);
     existingImageBundles.forEach(
         (uuid, imageBundle) -> {
           if (!currentImageBundles.containsKey(uuid) && imageBundle.getUniverseCount() > 0) {
@@ -931,7 +905,8 @@ public class CloudProviderHelper {
           }
           ImageBundle currentImageBundle = currentImageBundles.get(uuid);
           if (imageBundle.getUniverseCount() > 0
-              && !currentImageBundle.allowUpdateDuringUniverseAssociation(imageBundle)) {
+              && !currentImageBundle.allowUpdateDuringUniverseAssociation(imageBundle)
+              && !allowInUseBundleEdit) {
             throw new PlatformServiceException(
                 BAD_REQUEST,
                 String.format(
@@ -968,7 +943,7 @@ public class CloudProviderHelper {
     // Validate the provider request so as to ensure we only allow editing of fields
     // that does not impact the existing running universes.
     long universeCount = provider.getUniverseCount();
-    if (confGetter.getGlobalConf(GlobalConfKeys.allowUsedProviderEdit) && universeCount > 0) {
+    if (universeCount > 0) {
       validateProviderEditPayload(provider, editProviderReq);
     }
     boolean enableVMOSPatching = confGetter.getGlobalConf(GlobalConfKeys.enableVMOSPatching);
@@ -1006,6 +981,10 @@ public class CloudProviderHelper {
         }
       }
     }
+    if (editProviderReq.getCode().equalsIgnoreCase("gcp")) {
+      maybeUpdateGCPProject(editProviderReq);
+    }
+    maybeUpdateVPC(editProviderReq);
     // TODO: Remove this code once the validators are added for all cloud provider.
     CloudAPI cloudAPI = cloudAPIFactory.get(provider.getCode());
     if (cloudAPI != null && !cloudAPI.isValidCreds(editProviderReq)) {

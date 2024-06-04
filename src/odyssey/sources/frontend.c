@@ -326,6 +326,9 @@ od_frontend_attach_and_deploy(od_client_t *client, char *context)
 	if (rc == -1)
 		return OD_ESERVER_WRITE;
 
+	if (client->deploy_err)
+		return YB_OD_DEPLOY_ERR;
+
 	/* set number of replies to discard */
 	client->server->deploy_sync = rc;
 
@@ -798,6 +801,8 @@ static od_frontend_status_t od_frontend_remote_server(od_relay_t *relay,
 	case KIWI_BE_ERROR_RESPONSE:
 		od_backend_error(server, "main", data, size);
 		break;
+	/* fallthrough */
+	case YB_ROLE_OID_PARAMETER_STATUS:
 	case KIWI_BE_PARAMETER_STATUS:
 		rc = od_backend_update_parameter(server, "main", data, size, 0);
 		if (rc == -1)
@@ -848,6 +853,10 @@ static od_frontend_status_t od_frontend_remote_server(od_relay_t *relay,
 	 */
 	if (yb_is_route_invalid(server->route))
 		return OD_ESERVER_READ;
+
+	/* error was caught during the deploy phase, return and forward to client */
+	if (client->deploy_err)
+		return YB_OD_DEPLOY_ERR;
 
 	/* discard replies during configuration deploy */
 	if (is_deploy)
@@ -1044,6 +1053,8 @@ static od_frontend_status_t od_frontend_remote_client(od_relay_t *relay,
 	od_route_t *route = client->route;
 	assert(route != NULL);
 
+	int prev_named_prep_stmt = 1;
+
 	kiwi_fe_type_t type = *data;
 	if (type == KIWI_FE_TERMINATE)
 		return OD_STOP;
@@ -1221,6 +1232,7 @@ static od_frontend_status_t od_frontend_remote_client(od_relay_t *relay,
 
 			if (desc.operator_name[0] == '\0') {
 				/* no need for odyssey to track unnamed prepared statements */
+				prev_named_prep_stmt = 0;
 				break;
 			}
 
@@ -1591,6 +1603,26 @@ static od_frontend_status_t od_frontend_remote_client(od_relay_t *relay,
 			od_error(&instance->logger, "error while forwarding",
 				client, server, "Got error while forwarding the packet");
 			return OD_ESERVER_WRITE;
+		}
+
+		/* unnamed prepared statement was parsed, send ParseComplete to client */
+		if (prev_named_prep_stmt == 0) {
+
+			machine_msg_t *pcmsg;
+			pcmsg = kiwi_be_write_parse_complete(NULL);
+
+			if (pcmsg == NULL) {
+				return OD_ESERVER_WRITE;
+			}
+
+			rc = od_write(&client->io, pcmsg);
+
+			if (rc == -1) {
+				od_error(&instance->logger, "parse", client,
+					 NULL, "write error: %s",
+					 od_io_error(&client->io));
+				return OD_ESERVER_WRITE;
+			}
 		}
 
 		retstatus = OD_SKIP;
@@ -2017,6 +2049,16 @@ static void od_frontend_cleanup(od_client_t *client, char *context,
 			 od_frontend_status_to_str(status), (uint32)status);
 		od_router_close(router, client);
 		break;
+	case YB_OD_DEPLOY_ERR:
+		/* close both client and server connection */
+		/* backend connection is not in a usable state */ 
+		od_error(&instance->logger, context, client, server,
+				"deploy error: %s, status %s", client->deploy_err,
+				od_frontend_status_to_str(status));
+		od_frontend_fatal(client, client->deploy_err->code, client->deploy_err->message);
+		/* close backend connection */
+		od_router_close(router, client);
+		break;
 	default:
 		od_error(
 			&instance->logger, context, client, server,
@@ -2105,6 +2147,8 @@ int yb_clean_shmem(od_client_t *client, od_server_t *server)
 		od_debug(&instance->logger, "clean shared memory", server->client,
 			 server, "Got a packet of type: %s",
 			 kiwi_be_type_to_string(type));
+
+		machine_msg_free(msg);
 
 		if (type == KIWI_BE_READY_FOR_QUERY) {
 			return 0;
@@ -2473,6 +2517,11 @@ int yb_execute_on_control_connection(od_client_t *client,
 			control_conn_client, NULL,
 			"failed to route internal client for control connection: %s",
 			od_router_status_to_str(status));
+
+		if (control_conn_client->io.io) {
+			machine_close(control_conn_client->io.io);
+			machine_io_free(control_conn_client->io.io);
+		}
 		od_client_free(control_conn_client);
 		goto failed_to_acquire_control_connection;
 	}
@@ -2486,6 +2535,10 @@ int yb_execute_on_control_connection(od_client_t *client,
 			"failed to attach internal client for control connection to route: %s",
 			od_router_status_to_str(status));
 		od_router_unroute(router, control_conn_client);
+		if (control_conn_client->io.io) {
+			machine_close(control_conn_client->io.io);
+			machine_io_free(control_conn_client->io.io);
+		}
 		od_client_free(control_conn_client);
 		goto failed_to_acquire_control_connection;
 	}
@@ -2509,6 +2562,10 @@ int yb_execute_on_control_connection(od_client_t *client,
 				 od_io_error(&server->io));
 			od_router_close(router, control_conn_client);
 			od_router_unroute(router, control_conn_client);
+			if (control_conn_client->io.io) {
+				machine_close(control_conn_client->io.io);
+				machine_io_free(control_conn_client->io.io);
+			}
 			od_client_free(control_conn_client);
 			goto failed_to_acquire_control_connection;
 		}
@@ -2519,6 +2576,10 @@ int yb_execute_on_control_connection(od_client_t *client,
 	/* detach and unroute */
 	od_router_detach(router, control_conn_client);
 	od_router_unroute(router, control_conn_client);
+	if (control_conn_client->io.io) {
+		machine_close(control_conn_client->io.io);
+		machine_io_free(control_conn_client->io.io);
+	}
 	od_client_free(control_conn_client);
 
 	if (rc == -1)

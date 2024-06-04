@@ -110,7 +110,13 @@ DECLARE_bool(TEST_cdcsdk_skip_processing_dynamic_table_addition);
 DECLARE_int32(TEST_user_ddl_operation_timeout_sec);
 DECLARE_uint32(cdcsdk_max_consistent_records);
 DECLARE_bool(ysql_TEST_enable_replication_slot_consumption);
-DECLARE_uint64(cdcsdk_publication_list_refresh_interval_micros);
+DECLARE_bool(TEST_cdc_sdk_fail_setting_retention_barrier);
+DECLARE_uint64(cdcsdk_publication_list_refresh_interval_secs);
+DECLARE_bool(TEST_cdcsdk_use_microseconds_refresh_interval);
+DECLARE_uint64(TEST_cdcsdk_publication_list_refresh_interval_micros);
+DECLARE_bool(cdcsdk_enable_dynamic_table_support);
+DECLARE_bool(enable_cdcsdk_setting_get_changes_response_byte_limit);
+DECLARE_uint64(cdcsdk_vwal_getchanges_resp_max_size_bytes);
 
 namespace yb {
 
@@ -165,6 +171,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     uint32_t xmin = 0;
     HybridTime record_id_commit_time = HybridTime::kInvalid;
     HybridTime last_pub_refresh_time = HybridTime::kInvalid;
+    std::string pub_refresh_times = "";
+    std::string last_decided_pub_refresh_time = "";
   };
 
   struct GetAllPendingChangesResponse {
@@ -349,7 +357,7 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       const int tablet_idx = 0, int64 index = 0, int64 term = 0, std::string key = "",
       int32_t write_id = 0, int64 snapshot_time = 0, const TableId table_id = "",
       int64 safe_hybrid_time = -1, int32_t wal_segment_index = 0,
-      const bool populate_checkpoint = true);
+      const bool populate_checkpoint = true, const bool need_schema_info = false);
 
   void PrepareChangeRequest(
       GetChangesRequestPB* change_req, const xrepl::StreamId& stream_id, const TabletId& tablet_id,
@@ -464,7 +472,11 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       int64 safe_hybrid_time = -1,
       int wal_segment_index = 0,
       const bool populate_checkpoint = true,
-      const bool should_retry = true);
+      const bool should_retry = true,
+      const bool need_schema_info = false);
+
+  Result<GetChangesResponsePB> GetChangesFromCDC(
+      const GetChangesRequestPB& change_req, bool should_retry = true);
 
   Result<GetChangesResponsePB> GetChangesFromCDC(
       const xrepl::StreamId& stream_id,
@@ -647,7 +659,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
   Result<CdcStateTableRow> ReadFromCdcStateTable(
       const xrepl::StreamId stream_id, const std::string& tablet_id);
 
-  Result<CdcStateTableSlotRow> ReadSlotEntryFromStateTable(const xrepl::StreamId& stream_id);
+  Result<std::optional<CDCSDKYsqlTest::CdcStateTableSlotRow>> ReadSlotEntryFromStateTable(
+      const xrepl::StreamId& stream_id);
 
   void VerifyExplicitCheckpointingOnTablets(
       const xrepl::StreamId& stream_id,
@@ -764,6 +777,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
   void VerifyTableIdAndPkInCDCRecords(
       GetChangesResponsePB* resp, std::unordered_set<std::string>* record_primary_key,
       std::unordered_set<std::string>* record_table_id);
+
+  std::string GetPubRefreshTimesString(vector<uint64_t> pub_refresh_times);
 };
 
 }  // namespace cdc

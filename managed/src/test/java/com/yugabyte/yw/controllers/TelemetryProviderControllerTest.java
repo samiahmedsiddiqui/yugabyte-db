@@ -19,9 +19,12 @@ import static play.test.Helpers.*;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.RuntimeConfigEntry;
 import com.yugabyte.yw.models.TelemetryProvider;
 import com.yugabyte.yw.models.Users;
+import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.TelemetryProviderService;
 import com.yugabyte.yw.models.helpers.TelemetryProviderServiceTest;
 import java.util.Arrays;
@@ -49,6 +52,7 @@ public class TelemetryProviderControllerTest extends FakeDBApplication {
     customer = ModelFactory.testCustomer();
     user = ModelFactory.testUser(customer);
     authToken = user.createAuthToken();
+    RuntimeConfigEntry.upsertGlobal(GlobalConfKeys.dbAuditLoggingEnabled.getKey(), "true");
 
     telemetryProviderService = app.injector().instanceOf(TelemetryProviderService.class);
     telemetryProviderController = app.injector().instanceOf(TelemetryProviderController.class);
@@ -71,7 +75,9 @@ public class TelemetryProviderControllerTest extends FakeDBApplication {
     List<TelemetryProvider> providers =
         Arrays.asList(Json.fromJson(providersJson, TelemetryProvider[].class));
     assertThat(providers, hasSize(2));
-    assertThat(providers, containsInAnyOrder(provider1, provider2));
+    assertThat(
+        providers,
+        containsInAnyOrder(CommonUtils.maskObject(provider1), CommonUtils.maskObject(provider2)));
   }
 
   @Test

@@ -32,6 +32,15 @@ func StringSlice(in []interface{}) *[]string {
 	return &out
 }
 
+// Float64Slice accepts array of interface and returns a pointer to slice of float64
+func Float64Slice(in []interface{}) *[]float64 {
+	var out []float64
+	for _, v := range in {
+		out = append(out, v.(float64))
+	}
+	return &out
+}
+
 // StringSliceFromString accepts slice of string and returns a pointer to slice of string
 func StringSliceFromString(in []string) *[]string {
 	if len(in) == 0 {
@@ -111,6 +120,11 @@ func GetFloat64Pointer(in float64) *float64 {
 	if in == 0 {
 		return nil
 	}
+	return &in
+}
+
+// GetStringArrayPointer returns the pointer to a string array
+func GetArrayPointer(in []interface{}) *[]interface{} {
 	return &in
 }
 
@@ -305,7 +319,7 @@ func YAMLtoString(filePath string) string {
 			formatter.Colorize("Error reading YAML file: "+err.Error()+"\n",
 				formatter.RedColor))
 	}
-	var data map[string]interface{}
+	var data yaml.MapSlice
 
 	// Unmarshal the YAML content into the map
 	err = yaml.Unmarshal(yamlContent, &data)

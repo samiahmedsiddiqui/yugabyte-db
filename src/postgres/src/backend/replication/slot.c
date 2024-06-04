@@ -103,8 +103,6 @@ ReplicationSlot *MyReplicationSlot = NULL;
 int			max_replication_slots = 0;	/* the maximum number of replication
 										 * slots */
 
-const char *PG_OUTPUT_PLUGIN = "pgoutput";
-
 static void ReplicationSlotDropAcquired(void);
 static void ReplicationSlotDropPtr(ReplicationSlot *slot);
 
@@ -226,6 +224,7 @@ ReplicationSlotValidateName(const char *name, int elevel)
 void
 ReplicationSlotCreate(const char *name, bool db_specific,
 					  ReplicationSlotPersistency persistency,
+					  char *yb_plugin_name,
 					  CRSSnapshotAction yb_snapshot_action,
 					  uint64_t *yb_consistent_snapshot_time)
 {
@@ -243,7 +242,40 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	 */
 	if (IsYugaByteEnabled())
 	{
-		YBCCreateReplicationSlot(name, yb_snapshot_action, yb_consistent_snapshot_time);
+		int32_t max_clock_skew;
+
+		YBCCreateReplicationSlot(name, yb_plugin_name, yb_snapshot_action,
+								 yb_consistent_snapshot_time);
+
+		/*
+		 * The creation of a replication slot establishes a boundry between the
+		 * snapshot and change records. This is represented as a hybrid time.
+		 * This hybrid time can be chosen up to max_clock_skew us in the future.
+		 * We do not want to return the control back to the client before this
+		 * time passes otherwise the below scenario can cause confusion.
+		 *
+		 * T1: Slot creation (snapshot time chosen as Tsnap)
+		 *  ... command returns to the client before Tsnap is in the past.
+		 * T2: Insert operation where T2 < Tsnap
+		 *
+		 * The user would expect the insert operation to be part of the change
+		 * operations as it was done after the slot creation but it'll be
+		 * treated as snapshot operation. Sleeping here prevents that.
+		 *
+		 * Another scenario faced by the PG Debezium connector is that it
+		 * attempts to set the yb_read_time to the consistent snapshot time as
+		 * soon as the slot is created. Since this time is in the future
+		 * (without the sleep), such an attempt to set the yb_read_time to a
+		 * future time value can fail.
+		 *
+		 * It is fine to sleep like this because slot creation is not expected
+		 * to be a frequent operation.
+		 */
+		max_clock_skew = YBGetMaxClockSkewUsec();
+		elog(DEBUG1,
+			 "Sleeping for %d us after the slot creation to handle clock skew.",
+			 max_clock_skew);
+		pg_usleep(max_clock_skew);
 		return;
 	}
 
@@ -371,7 +403,7 @@ retry:
 
 		slot = palloc(sizeof(ReplicationSlot));
 		namestrcpy(&slot->data.name, yb_replication_slot->slot_name);
-		namestrcpy(&slot->data.plugin, PG_OUTPUT_PLUGIN);
+		namestrcpy(&slot->data.plugin, yb_replication_slot->output_plugin);
 		slot->data.database = yb_replication_slot->database_oid;
 		slot->data.persistency = RS_PERSISTENT;
 		strcpy(slot->data.yb_stream_id, yb_replication_slot->stream_id);
@@ -408,11 +440,6 @@ retry:
 		ctl.entrysize = sizeof(YBCPgReplicaIdentityDescriptor);
 		ctl.hcxt = GetCurrentMemoryContext();
 
-		/*
-		 * TODO(#21028): This HTAB must be refreshed in case of dynamic table
-		 * additions so that it also includes the replica identity of the newly
-		 * added columns. It is not necessary to handle drop of a table though.
-		 */
 		replica_identities = hash_create("yb_repl_slot_replica_identities",
 										 32, /* start small and extend */
 										 &ctl, HASH_ELEM | HASH_BLOBS);

@@ -50,7 +50,9 @@ public class TestYbAsh extends BasePgSQLTest {
     flagMap.put("ysql_yb_enable_ash", "true");
     flagMap.put("ysql_yb_ash_sampling_interval_ms", String.valueOf(sampling_interval));
     flagMap.put("ysql_yb_ash_sample_size", String.valueOf(sample_size));
-    restartClusterWithFlags(Collections.emptyMap(), flagMap);
+    // flagMap.put("create_initial_sys_catalog_snapshot", "true");
+    Map<String, String> masterFlagMap = super.getMasterFlags();
+    restartClusterWithFlags(masterFlagMap, flagMap);
   }
 
   private void executePgSleep(Statement statement, long seconds) throws Exception {
@@ -155,19 +157,19 @@ public class TestYbAsh extends BasePgSQLTest {
       }
       statement.execute("TRUNCATE TABLE test_table2");
       statement.execute("DROP TABLE test_table2");
-      // TODO: remove wait_event_component='Postgres' once ASH metadata is propagated to
-      // TServer
+      // TODO: remove wait_event_component='YSQL' once all tserver RPCs are instrumented
       assertOneRow(statement, "SELECT COUNT(*) FROM " + ASH_VIEW + " WHERE query_id = 0 " +
-          "AND wait_event_component='Postgres'", 0);
+          "AND wait_event_component='YSQL'", 0);
     }
   }
 
   /**
-   * Sanity check that nested queries work with ASH enabled
+   * Sanity check that nested queries work with ASH enabled and
+   * nested queries only get tracked when pg_stat_statements tracks nested queries.
    */
   @Test
   public void testNestedQueriesWithAsh() throws Exception {
-    setAshConfigAndRestartCluster(ASH_SAMPLING_INTERVAL, ASH_SAMPLE_SIZE);
+    setAshConfigAndRestartCluster(100, ASH_SAMPLE_SIZE);
     try (Statement statement = connection.createStatement()) {
       String tableName = "test_table";
 
@@ -175,28 +177,57 @@ public class TestYbAsh extends BasePgSQLTest {
       statement.execute("DROP EXTENSION IF EXISTS pg_stat_statements");
       statement.execute("CREATE EXTENSION pg_stat_statements");
 
-      // Queries inside functions
-      statement.execute("CREATE TABLE " + tableName + "(k INT, v TEXT)");
-      statement.execute("CREATE FUNCTION insert_into_table(k INT, v TEXT) " +
-          "RETURNS void AS $$ INSERT INTO " + tableName + " VALUES($1, $2) $$ " +
-          "LANGUAGE SQL");
-
-      for (int i = 0; i < 10; ++i) {
-        statement.execute(String.format("SELECT insert_into_table(%d, 'v-%d')", i, i));
-      }
-
       // Queries inside triggers
-      statement.execute("TRUNCATE " + tableName);
+      statement.execute("CREATE TABLE " + tableName + "(k INT, v INT)");
       statement.execute("CREATE FUNCTION trigger_fn() " +
-          "RETURNS TRIGGER AS $$ BEGIN UPDATE test_table SET v = '1' " +
+          "RETURNS TRIGGER AS $$ BEGIN UPDATE test_table SET v = 1 " +
           "WHERE k = 1; RETURN NEW; END; $$ LANGUAGE plpgsql");
       statement.execute("CREATE TRIGGER trig AFTER INSERT ON test_table " +
           "FOR EACH STATEMENT EXECUTE PROCEDURE trigger_fn()");
 
       for (int i = 0; i < 10; ++i) {
-        statement.execute(String.format("INSERT INTO %s VALUES(%d, 'v-%d')",
+        statement.execute(String.format("INSERT INTO %s VALUES(%d, %d)",
             tableName, i, i));
       }
+
+      // Queries inside functions
+      String get_nested_query_id = "SELECT queryid FROM pg_stat_statements " +
+          "WHERE query = 'INSERT INTO " + tableName + " SELECT i, i FROM " +
+          "generate_series(i, j) as i'";
+      long nested_query_id = 1096741192106424462L; // constant query id of the above INSERT query
+      String nested_query_id_samples_count = "SELECT COUNT(*) FROM " + ASH_VIEW +
+          " WHERE query_id = " + nested_query_id ;
+
+      statement.execute("TRUNCATE " + tableName);
+
+      // Track only top level queries inside pg_stat_statements
+      statement.execute("SET pg_stat_statements.track = 'TOP'");
+
+      statement.execute("CREATE FUNCTION insert_into_table(i INT, j INT) " +
+          "RETURNS void AS $$ INSERT INTO " + tableName + " SELECT i, i FROM " +
+          "generate_series(i, j) as i $$ LANGUAGE SQL");
+      statement.execute(String.format("SELECT insert_into_table(1, 100000)"));
+
+      // Make sure that the nested query doesn't show up in pg_stat_statements
+      ResultSet rs = statement.executeQuery(get_nested_query_id);
+      assertFalse(rs.next());
+
+      // Make sure there are no ASH samples with the nested query id
+      assertEquals(getSingleRow(statement, nested_query_id_samples_count).getLong(0).longValue(),
+          0L);
+
+      // Track all queries inside pg_stat_statements
+      statement.execute("SET pg_stat_statements.track = 'ALL'");
+
+      // Rerun the nested query, now pg_stat_statements should track it
+      statement.execute(String.format("SELECT insert_into_table(100001, 200000)"));
+
+      // Verify that the constant nested query is correct
+      assertEquals(getSingleRow(statement, get_nested_query_id).getLong(0).longValue(),
+          nested_query_id);
+
+      // Verify that there are samples of the nested query
+      assertGreaterThan(getSingleRow(statement, nested_query_id_samples_count).getLong(0), 0L);
     }
   }
 
@@ -213,9 +244,31 @@ public class TestYbAsh extends BasePgSQLTest {
         statement.execute(String.format("SELECT v FROM test_table WHERE k=%d", i));
       }
       int res = getSingleRow(statement, "SELECT COUNT(*) FROM " + ASH_VIEW +
-          " WHERE wait_event_component='Postgres' AND wait_event_aux IS NOT NULL")
+          " WHERE wait_event_component='YSQL' AND wait_event_aux IS NOT NULL")
           .getLong(0).intValue();
       assertEquals(res, 0);
+    }
+  }
+
+  /**
+   * Verify that catalog requests are sampled
+   */
+  @Test
+  public void testCatalogRequests() throws Exception {
+    // Use small sampling interval so that we are more likely to catch catalog requests
+    setAshConfigAndRestartCluster(5, ASH_SAMPLE_SIZE);
+    int catalog_request_query_id = 5;
+    String catalog_read_wait_event = "CatalogRead";
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE test_table(k INT, v TEXT)");
+      for (int i = 0; i < 100; ++i) {
+        statement.execute(String.format("INSERT INTO test_table VALUES(%d, 'v-%d')", i, i));
+        statement.execute(String.format("SELECT v FROM test_table WHERE k=%d", i));
+      }
+      int res1 = getSingleRow(statement, "SELECT COUNT(*) FROM " + ASH_VIEW +
+          " WHERE query_id = " + catalog_request_query_id + " OR " +
+          "wait_event = '" + catalog_read_wait_event + "'").getLong(0).intValue();
+      assertGreaterThan(res1, 0);
     }
   }
 }
