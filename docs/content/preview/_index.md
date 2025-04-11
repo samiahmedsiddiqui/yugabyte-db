@@ -27,6 +27,7 @@ YugabyteDB is an open source PostgreSQL-compatible distributed database for clou
   >}}
 {{< /sections/2-boxes >}}
 
+
 ## Develop for YugabyteDB
 
 {{< sections/3-boxes>}}
@@ -78,3 +79,132 @@ YugabyteDB is an open source PostgreSQL-compatible distributed database for clou
   >}}
 
 {{< /sections/3-boxes >}}
+
+## 4 Columns
+{{< tile/wrapper >}}
+    {{< tile/singleIcon
+        imageUrl="/images/tile/earth-icon.svg" imageAlt="Yugabyte cloud" 
+        title="Multi-region"
+        description="4- Simplify migration from legacy and cloud databases to YugabyteDB." 
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+        buttonType="article" buttonTheme="primary"
+    >}}
+    {{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+            buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="video" 
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}{{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="blog" buttonTheme="secondary"
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}
+    
+    {{< tile/singleIcon 
+        title="Multi-region"
+        description="Simplify migration from legacy and  YugabyteDB."
+        buttonText="Learn More"
+        buttonUrl="/preview/tutorials/quick-start/" buttonType="article" buttonTheme="secondary"
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    
+    >}}
+    
+    
+{{< /tile/wrapper >}}
+ 
+## 4 COl  Multilinks
+ 
+{{< tile/wrapper  >}}
+    {{< tile/multilink
+    title="Blogs"
+    titleIcon="/images/tile/blog-heading-icon.svg"
+    linkText1="How 7 Real-World Customers are Using YugabyteDB Aeon"
+    linkUrl1="#"
+    linkText2="Unlocking the Power of Event Streaming with YugabyteDB"
+    linkUrl2="#"
+    linkText3="Data Replication in YugabyteDB"
+    linkUrl3="#"
+    >}}{{< tile/multilink
+    title="Blogs"
+    titleIcon="/images/tile/blog-heading-icon.svg"
+    linkText1="How 7 Real-World Customers are Using YugabyteDB Aeon"
+    linkUrl1="#"
+    linkText2="Unlocking the Power of Event Streaming with YugabyteDB"
+    linkUrl2="#"
+    linkText3="Data Replication in YugabyteDB"
+    linkUrl3="#"
+    >}}
+    {{< tile/multilink 
+        title="Videos"
+        titleIcon="/images/tile/video-heading-icon.svg"
+        linkText1="Introducing YugabyteDB" linkUrl1="#"
+        linkText2="Architecting highly-available and resilient systems of record   " linkUrl2="#"
+    >}}
+    {{< tile/multilink 
+        title="Article"
+        titleIcon="/images/tile/article-heading-icon.svg"
+        linkText1="Our story" linkUrl1="#"
+        linkText2="Distributed SQL 101" linkUrl2="#"
+        linkText3="How to Scale a Single-Server Database" linkUrl3="#"
+    >}}
+    
+{{< /tile/wrapper >}}
+
+  
+## 3 COl  Multilinks
+ 
+{{< tile/wrapper>}}
+    {{< tile/multilink 
+        titleIcon="/images/tile/video-heading-icon.svg"
+        title="Videos"
+        linkText1="Introducing YugabyteDB" linkUrl1="#"
+        linkText2="Architecting highly-available and resilient systems of record" linkUrl2="#"
+    >}}
+    {{< tile/multilink
+        titleIcon="/images/tile/article-heading-icon.svg"
+        title="Article"
+        linkText1="Our story" linkUrl1="#"
+        linkText2="Distributed SQL 101" linkUrl2="#"
+        linkText3="Our story" linkUrl3="#"
+    >}}{{< tile/multilink
+        titleIcon="/images/tile/article-heading-icon.svg"
+        title="Article"
+        linkText1="Our story" linkUrl1="#"
+        linkText2="Distributed SQL 101" linkUrl2="#"
+        linkText3="Our story" linkUrl3="#"
+    >}}
+    
+{{< /tile/wrapper >}}
+
+    
+## 2 COl  Multilinks
+ 
+{{< tile/wrapper >}}
+    {{< tile/multilink 
+        title="Videos"
+        titleIcon="/images/tile/video-heading-icon.svg"
+        linkText1="Introducing YugabyteDB" linkUrl1="#"
+        linkText2="Architecting highly-available and resilient systems of record   " linkUrl2="#"
+    >}}   {{< tile/multilink 
+        title="Videos"
+        titleIcon="/images/tile/video-heading-icon.svg"
+        linkText1="Introducing YugabyteDB" linkUrl1="#"
+        linkText2="Architecting highly-available and resilient systems of record   " linkUrl2="#"
+    >}}
+    
+{{< /tile/wrapper >}}
+
+## 1 COl  Multilinks
+
+{{< tile/wrapper>}}
+    {{< tile/multilink 
+        title="Videos"
+        titleIcon="/images/tile/video-heading-icon.svg"
+        linkText1="Introducing YugabyteDB" linkUrl1="#"
+        linkText2="Architecting highly-available and resilient systems of record   " linkUrl2="#"
+    >}}
+    
+{{< /tile/wrapper >}}
+
+  

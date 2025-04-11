@@ -1,0 +1,40 @@
+<div class="singlelink-icon card-panel">
+    {{- if .Params.imageUrl -}}
+    <div class="icon">
+        <img src="{{- .Params.imageUrl -}}" {{- if .Params.imageAlt }} alt="{{- .Params.imageAlt -}}" title="{{- .Params.imageAlt -}}" {{- end -}}>
+    </div>
+    {{- end -}}
+    <div class="card-title">
+        {{- .Params.title -}}
+    </div>
+    {{- if .Params.description -}}
+    <div class="card-desc">
+        {{- .Params.description -}}
+    </div>
+    {{- end -}}
+    <div class="card-link">
+        {{- if and (.Params.buttonText) (.Params.buttonUrl) -}}
+        {{- $linkIcon := "" -}}
+        {{- $linkAlt := "" -}}
+        {{- if eq .Params.buttonType "article" -}}
+        {{- $linkIcon = "/images/tiles/article-icon.svg" -}}
+        {{- $linkAlt = "Article" -}}
+        {{- else if eq .Params.buttonType "video" -}}
+        {{- $linkIcon = "/images/tiles/video-icon.svg" -}}
+        {{- $linkAlt = "Video" -}}
+        {{- else if eq .Params.buttonType "blog" -}}
+        {{- $linkIcon = "/images/tiles/blog-icon.svg" -}}
+        {{- $linkAlt = "Blog" -}}
+        {{- end -}}
+
+        <a class="arrow-btn {{ .Params.buttonTheme }}" href="{{ .Params.buttonUrl }}" title="{{- .Params.buttonText -}}"
+           {{- if .Params.buttonTarget }} target="_blank" rel="noopener" {{- end -}}>
+            {{- if $linkIcon -}}
+            <img src="{{ $linkIcon }}" alt="{{ $linkAlt }}">
+            {{- end -}}
+            {{ .Params.buttonText }}
+            <img src="/icons/arrow-btn.svg" width="24" height="24">
+        </a>
+        {{- end -}}
+    </div>
+</div>

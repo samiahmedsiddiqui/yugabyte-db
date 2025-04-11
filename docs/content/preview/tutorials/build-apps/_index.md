@@ -109,3 +109,85 @@ The tutorials assume you have deployed a YugabyteDB cluster in YugabyteDB Aeon o
     </a>
   </li>
 </ul>
+
+## 4 Columns
+{{< tile/wrapper >}}
+    {{< tile/singleIcon
+        imageUrl="/images/tile/earth-icon.svg" imageAlt="Yugabyte cloud" 
+        title="Multi-region"
+        description="4- Simplify migration from legacy and cloud databases to YugabyteDB." 
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+        buttonType="article" buttonTheme="primary"
+    >}}
+    {{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+            buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="video" 
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}
+    {{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="blog" buttonTheme="secondary"
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}
+    {{< tile/singleIcon 
+        title="Multi-region"
+        description="Simplify migration from legacy and  YugabyteDB."
+        buttonText="Learn More"
+        buttonUrl="/preview/tutorials/quick-start/" buttonType="article" buttonTheme="secondary"
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    
+    >}} 
+{{< /tile/wrapper >}}
+
+## 3 Columns
+{{< tile/wrapper >}}
+    {{< tile/singleIcon
+        imageUrl="/images/tile/earth-icon.svg" imageAlt="Yugabyte cloud" 
+        title="Multi-region"
+        description="4- Simplify migration from legacy and cloud databases to YugabyteDB." 
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+        buttonType="article" buttonTheme="primary"
+    >}}
+    {{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+            buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="video" 
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}
+    {{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="blog" buttonTheme="secondary"
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}  
+{{< /tile/wrapper >}}
+
+## 2 Columns
+{{< tile/wrapper >}}
+    {{< tile/singleIcon
+        imageUrl="/images/tile/earth-icon.svg" imageAlt="Yugabyte cloud" 
+        title="Multi-region"
+        description="4- Simplify migration from legacy and cloud databases to YugabyteDB." 
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+        buttonType="article" buttonTheme="primary"
+    >}}
+    {{< tile/singleIcon
+        title="Multi-region"
+        description="Simplify migration from legacy and cloud databases to YugabyteDB."
+            buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="video" 
+        imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
+    >}}
+{{< /tile/wrapper >}}
+
+## 1 Columns
+{{< tile/wrapper >}}
+    {{< tile/singleIcon
+        imageUrl="/images/tile/earth-icon.svg" imageAlt="Yugabyte cloud" 
+        title="Multi-region"
+        description="4- Simplify migration from legacy and cloud databases to YugabyteDB." 
+        buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+        buttonType="article" buttonTheme="primary"
+    >}}
+{{< /tile/wrapper >}}
