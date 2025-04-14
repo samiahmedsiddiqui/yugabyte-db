@@ -90,19 +90,19 @@ YugabyteDB is an open source PostgreSQL-compatible distributed database for clou
         buttonType="article" buttonTheme="primary"
     >}}
     {{< tile/singleIcon
-        title="Multi-region"
+        title="Video"
         description="Simplify migration from legacy and cloud databases to YugabyteDB."
             buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="video" 
         imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
     >}}{{< tile/singleIcon
-        title="Multi-region"
+        title="Blog"
         description="Simplify migration from legacy and cloud databases to YugabyteDB."
         buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/" buttonType="blog" buttonTheme="secondary"
         imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
     >}}
     
     {{< tile/singleIcon 
-        title="Multi-region"
+        title="Article"
         description="Simplify migration from legacy and  YugabyteDB."
         buttonText="Learn More"
         buttonUrl="/preview/tutorials/quick-start/" buttonType="article" buttonTheme="secondary"
@@ -196,13 +196,33 @@ YugabyteDB is an open source PostgreSQL-compatible distributed database for clou
 {{< /tile/wrapper >}}
 
 ## 1 COl  Multilinks
-
-{{< tile/wrapper>}}
-    {{< tile/multilink 
+ 
+{{< tile/wrapper >}}
+       {{< tile/multilink 
         title="Videos"
         titleIcon="/images/tile/video-heading-icon.svg"
         linkText1="Introducing YugabyteDB" linkUrl1="#"
-        linkText2="Architecting highly-available and resilient systems of record   " linkUrl2="#"
+        linkText2="Architecting highly-available" linkUrl2="#"
+    >}}
+    
+{{< /tile/wrapper >}}
+
+## 1 COl  Multilinks
+
+{{< tile/wrapper>}}
+    {{< tile/singleHorizon
+    imageUrl="/images/tile/sparkline-arrow.svg" imageAlt="Yugabyte cloud"
+    title="Horizontal scalability"
+    description="Handle larger workloads by adding nodes to your cluster."
+    buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+    buttonType="article" buttonTheme="primary"
+    >}}
+       {{< tile/singleHorizon
+    imageUrl="/images/tile/sparkline-arrow.svg" imageAlt="Yugabyte cloud"
+    title="Horizontal scalability"
+    description="Handle larger workloads by adding nodes to your cluster."
+    buttonText="Learn More" buttonUrl="/preview/tutorials/quick-start/"
+    buttonType="article" buttonTheme="primary"
     >}}
     
 {{< /tile/wrapper >}}

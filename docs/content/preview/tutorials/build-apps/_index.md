@@ -139,7 +139,7 @@ The tutorials assume you have deployed a YugabyteDB cluster in YugabyteDB Aeon o
         imageAlt="Yugabyte cloud" imageUrl="/images/tile/earth-icon.svg"
     
     >}} 
-{{< /tile/wrapper >}}
+{{< /tile/wrapper >}} 
 
 ## 3 Columns
 {{< tile/wrapper >}}

@@ -16,6 +16,60 @@ function setCookie(name, value, monthToLive) {
 }
 
 /**
+ * Calculate Boxes Width.
+ */
+function calculateBoxesWidth() {
+  const containers = document.querySelectorAll('.tile-wrapper');
+  const gap = 24;
+  containers.forEach(container => {
+    const children = container.querySelectorAll('.card-panel');
+    console.log('Console--1', children);
+    children.forEach(child => {
+      if (child.classList.contains('horizontal')) {
+        children.classList.add('horizon-tile');
+      }
+    });
+    const childrenCount = children.length;
+    container.setAttribute('data-items', childrenCount); // Set count on container
+    let widthForBoxes = 0;
+    children.forEach(child => {
+      const itemWidth = child.offsetWidth;
+      child.setAttribute('data-width', itemWidth);
+      widthForBoxes += itemWidth;
+    });
+    container.setAttribute('data-width', widthForBoxes + (gap * (childrenCount - 1)));
+  });
+}
+
+function boxesOverflow() {
+  const containers = document.querySelectorAll('.tile-wrapper');
+  containers.forEach(container => {
+    const children = container.querySelectorAll('.card-panel');
+    const childrenCount = children.length;
+    const containerWidth = container.clientWidth;
+    container.classList.remove('theme-4col', 'theme-3col', 'theme-2col', 'theme-1col');
+    if (childrenCount === 0) return;
+    const itemWidth = 230;
+    const gap = 24;
+    const widthFor4 = (itemWidth * 4) + (gap * 3);
+    const widthFor3 = (itemWidth * 3) + (gap * 2);
+    const widthFor2 = (itemWidth * 2) + (gap);
+
+    if (widthFor4 <= containerWidth) {
+      container.classList.add('theme-4col');
+    } else if (widthFor3 <= containerWidth) {
+      container.classList.add('theme-3col');
+    } else if (widthFor2 <= containerWidth) {
+      container.classList.add('theme-2col');
+    } else {
+      container.classList.add('theme-1col');
+    }
+
+    container.classList.add(`items${childrenCount}`);
+  });
+}
+
+/**
  * Show popup when the text limit exceed in Pills.
  */
 function popupOnPills() {
@@ -106,7 +160,7 @@ function yugabyteScrollLeftNav(activeLink) {
  * based on the container width.
  */
 function yugabytePageFinderWidth() {
-  yugabytePageFinderList.forEach(({width, parent}) => {
+  yugabytePageFinderList.forEach(({ width, parent }) => {
     if (parent) {
       const innerContainer = document.querySelector('.content-area');
       if (width > innerContainer.offsetWidth) {
@@ -172,6 +226,8 @@ function yugabyteActiveLeftNav() {
 }
 
 $(document).ready(() => {
+  calculateBoxesWidth();
+  boxesOverflow();
   const isSafari = /Safari/.test(navigator.userAgent) && /Apple Computer/.test(navigator.vendor);
   if (isSafari) {
     $('body').addClass('is-safari');
@@ -275,6 +331,7 @@ $(document).ready(() => {
         });
         $('body').addClass('dragging');
         yugabytePageFinderWidth();
+        boxesOverflow();
       });
     });
 
@@ -653,7 +710,6 @@ $(document).ready(() => {
       window.location.href = `/search/?q=${searchValue}`;
     }
   });
-
   yugabytePageFinderWidth();
   document.querySelector('.side-nav-collapse-toggle-2').addEventListener('click', () => {
     setTimeout(() => {
@@ -664,6 +720,7 @@ $(document).ready(() => {
 
 $(window).resize(() => {
   rightnavAppend();
+  boxesOverflow();
   $('.td-main .td-sidebar').attr('style', '');
   $('.td-main #dragbar').attr('style', '');
   $('.td-main').attr('style', '');

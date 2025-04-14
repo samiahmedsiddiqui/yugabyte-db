@@ -1,0 +1,28 @@
+<div class="card-panel horizontal">
+    {{- if .Params.imageUrl }}
+    <div class="icon">
+        <img src="{{ .Params.imageUrl }}"{{ with .Params.imageAlt }} alt="{{ . }}" title="{{ . }}"{{ end }}>
+    </div>
+    {{- end }}
+
+    <div class="card-content">
+        <div class="card-title">
+            {{ .Params.title }}
+        </div>
+
+        {{- if .Params.description }}
+        <div class="card-desc">
+            {{ .Params.description }}
+        </div>
+        {{- end }}
+    </div>
+    <div class="card-link">
+        {{- if and (.Params.buttonText) (.Params.buttonUrl) -}}
+        <a class="arrow-btn " href="{{ .Params.buttonUrl }}" title="{{- .Params.buttonText -}}"
+           {{- if .Params.buttonTarget }} target="_blank" rel="noopener" {{- end -}}>
+            {{ .Params.buttonText }}
+            <img src="/icons/arrow-btn.svg" width="24" height="24">
+        </a>
+        {{- end -}}
+    </div>
+</div>
