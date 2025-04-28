@@ -12,15 +12,26 @@
 //
 
 #include "yb/cdc/xcluster_types.h"
+
 #include "yb/client/schema.h"
 #include "yb/client/table.h"
 #include "yb/client/xcluster_client.h"
 #include "yb/client/yb_table_name.h"
+
 #include "yb/common/colocated_util.h"
+#include "yb/common/common_types.pb.h"
+
 #include "yb/integration-tests/xcluster/xcluster_ddl_replication_test_base.h"
 #include "yb/integration-tests/xcluster/xcluster_test_base.h"
+
 #include "yb/master/catalog_manager.h"
 #include "yb/master/mini_master.h"
+#include "yb/master/xcluster/xcluster_manager.h"
+
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
+#include "yb/tserver/tserver_xcluster_context_if.h"
+
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/debug.h"
 #include "yb/util/logging_test_util.h"
@@ -141,6 +152,62 @@ TEST_F(XClusterDDLReplicationTest, YB_DISABLE_TEST_ON_MACOS(SurviveRestarts)) {
     ASSERT_OK(producer_cluster_.mini_cluster_.get()->RestartSync());
   }
   ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+}
+
+TEST_F(XClusterDDLReplicationTest, ExtensionRoleUpdating) {
+  ASSERT_OK(SetUpClusters());
+  auto& catalog_manager =
+      ASSERT_RESULT(producer_cluster_.mini_cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+  auto* xcluster_manager = catalog_manager.GetXClusterManagerImpl();
+  const auto namespace_id = ASSERT_RESULT(GetNamespaceId(producer_client(), namespace_name));
+  auto* tserver = producer_cluster_.mini_cluster_->mini_tablet_server(0);
+  auto& xcluster_context = tserver->server()->GetXClusterContext();
+  auto conn = ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name));
+
+  // We expect role NOT_AUTOMATIC_MODE here since no replication is set up yet.
+  EXPECT_EQ(
+      xcluster_context.GetXClusterRole(namespace_id),
+      XClusterNamespaceInfoPB_XClusterRole_NOT_AUTOMATIC_MODE);
+
+  ASSERT_OK(CheckpointReplicationGroup(kReplicationGroupId, /*require_no_bootstrap_needed=*/false));
+  // Bootstrap here would have no effect because the database is empty so we skip it for the test.
+  ASSERT_OK(CreateReplicationFromCheckpoint());
+
+  // The producer should have role AUTOMATIC_SOURCE after automatic mode replication is set up.
+  // We should see this both at the TServer's xcluster_context and on the existing Postgres backend.
+  {
+    EXPECT_EQ(
+        xcluster_context.GetXClusterRole(namespace_id),
+        XClusterNamespaceInfoPB_XClusterRole_AUTOMATIC_SOURCE);
+    std::string current_role = ASSERT_RESULT(
+        conn.FetchRowAsString("SELECT yb_xcluster_ddl_replication.get_replication_role()"));
+    EXPECT_EQ(current_role, "source");
+  }
+
+  // Manually change the role to AUTOMATIC_TARGET and verify the change is seen.
+  ASSERT_OK(xcluster_manager->SetXClusterRole(
+      catalog_manager.GetLeaderEpochInternal(), namespace_id,
+      XClusterNamespaceInfoPB_XClusterRole_AUTOMATIC_TARGET));
+  // TODO(mlillibridge): replace with a call to wait for heartbeats once that call is available.
+  std::this_thread::sleep_for(30s);
+  {
+    EXPECT_EQ(
+        xcluster_context.GetXClusterRole(namespace_id),
+        XClusterNamespaceInfoPB_XClusterRole_AUTOMATIC_TARGET);
+    std::string current_role = ASSERT_RESULT(
+        conn.FetchRowAsString("SELECT yb_xcluster_ddl_replication.get_replication_role()"));
+    EXPECT_EQ(current_role, "target");
+  }
+
+  ASSERT_OK(DeleteOutboundReplicationGroup());
+  // TODO(mlillibridge): modify DeleteOutboundReplicationGroup() with a call to wait for heartbeats
+  // once that call is available.
+  std::this_thread::sleep_for(30s);
+
+  // After replication is dropped, we should be back to role NOT_AUTOMATIC_MODE.
+  EXPECT_EQ(
+      xcluster_context.GetXClusterRole(namespace_id),
+      XClusterNamespaceInfoPB_XClusterRole_NOT_AUTOMATIC_MODE);
 }
 
 TEST_F(XClusterDDLReplicationTest, TestExtensionDeletionWithMultipleReplicationGroups) {
@@ -319,6 +386,30 @@ TEST_F(XClusterDDLReplicationTest, CreateTable) {
   InsertRowsIntoProducerTableAndVerifyConsumer(producer_table_name_new_user);
 }
 
+TEST_F(XClusterDDLReplicationTest, CreateTableInExistingConnection) {
+  ASSERT_OK(SetUpClusters());
+  {
+    auto conn = ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name));
+
+    ASSERT_OK(
+        CheckpointReplicationGroup(kReplicationGroupId, /*require_no_bootstrap_needed=*/false));
+    // Bootstrap here would have no effect because the database is empty so we skip it for the test.
+    ASSERT_OK(CreateReplicationFromCheckpoint());
+
+    // Here we create a table using a connection open before replication got set up.
+    ASSERT_OK(conn.Execute("CREATE TABLE test_table_1 (key int PRIMARY KEY);"));
+    ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  }
+
+  {
+    auto conn = ASSERT_RESULT(consumer_cluster_.ConnectToDB(namespace_name));
+    std::string row_count =
+        ASSERT_RESULT(conn.FetchRowAsString("SELECT count(*) FROM test_table_1;"));
+    // Check that the CREATE TABLE DDL got replicated.
+    ASSERT_EQ(row_count, "0");
+  }
+}
+
 TEST_F(XClusterDDLReplicationTest, CreateTableWithEnum) {
   ASSERT_OK(SetUpClusters());
   ASSERT_OK(CheckpointReplicationGroup(kReplicationGroupId, /*require_no_bootstrap_needed=*/false));
@@ -446,6 +537,104 @@ TEST_F(XClusterDDLReplicationTest, CreateIndex) {
   ASSERT_NOK(c_conn.ExecuteFormat("INSERT INTO $0 VALUES(101, 101, '1');", kBaseTableName));
   ASSERT_OK(c_conn.ExecuteFormat("INSERT INTO $0 VALUES(101, 101, '101');", kBaseTableName));
   ASSERT_OK(c_conn.Execute("SET yb_non_ddl_txn_for_sys_tables_allowed = false"));
+}
+
+TEST_F(XClusterDDLReplicationTest, NonconcurrentBackfills) {
+  // Test commands that trigger nonconcurrent backfills.
+  // Want to ensure that we don't trigger the backfill on the target, otherwise we may see duplicate
+  // rows.
+  ASSERT_OK(SetUpClustersAndCheckpointReplicationGroup());
+  ASSERT_OK(CreateReplicationFromCheckpoint());
+
+  const std::string kBaseTableName = "base_table";
+  const std::string kColumn2Name = "a";
+  auto p_conn = ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name));
+  auto c_conn = ASSERT_RESULT(consumer_cluster_.ConnectToDB(namespace_name));
+
+  // Create a base table.
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE TABLE $0($1 int PRIMARY KEY, $2 int);", kBaseTableName, kKeyColumnName,
+      kColumn2Name));
+
+  // Insert some rows.
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "INSERT INTO $0 SELECT i, i%2 FROM generate_series(1, 100) as i;", kBaseTableName));
+  const auto producer_base_table_name = ASSERT_RESULT(
+      GetYsqlTable(&producer_cluster_, namespace_name, /*schema_name*/ "", kBaseTableName));
+  {
+    ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+    auto producer_table = ASSERT_RESULT(GetProducerTable(producer_base_table_name));
+    auto consumer_table = ASSERT_RESULT(GetConsumerTable(producer_base_table_name));
+    ASSERT_OK(VerifyWrittenRecords(producer_table, consumer_table));
+  }
+
+  // Create index nonconcurrently.
+  const auto kNonconcurrentIndex = "nonconcurrent_index";
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE INDEX NONCONCURRENTLY $0 ON $1($2 ASC)", kNonconcurrentIndex, kBaseTableName,
+      kColumn2Name));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  // Verify index is replicated on consumer and has proper count of rows.
+  const auto kCol2CountStmt = Format(
+      "/*+ IndexScan($0) */ SELECT COUNT(*) FROM $1 WHERE $2 >= 0", kNonconcurrentIndex,
+      kBaseTableName, kColumn2Name);
+  ASSERT_EQ(ASSERT_RESULT(c_conn.FetchRow<int64_t>(kCol2CountStmt)), 100);
+
+  // Ensure that we can also create a unique index nonconcurrently.
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE UNIQUE INDEX NONCONCURRENTLY ON $0($1)", kBaseTableName, kKeyColumnName));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+
+  // Test adding a unique constraint, this will also trigger a nonconcurrent backfill.
+  const auto kUniqueConstraintName = "unique_constraint";
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "ALTER TABLE $0 ADD CONSTRAINT $1 UNIQUE($2);", kBaseTableName, kUniqueConstraintName,
+      kKeyColumnName));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  // Verify unique constraint is replicated on consumer.
+  const auto kUniqueCountStmt = Format(
+      "/*+ IndexScan($0) */ SELECT COUNT(*) FROM $1 WHERE $2 >= 0", kUniqueConstraintName,
+      kBaseTableName, kKeyColumnName);
+  ASSERT_EQ(ASSERT_RESULT(c_conn.FetchRow<int64_t>(kUniqueCountStmt)), 100);
+}
+
+TEST_F(XClusterDDLReplicationTest, NonconcurrentBackfillsWithPartitions) {
+  ASSERT_OK(SetUpClustersAndCheckpointReplicationGroup());
+  ASSERT_OK(CreateReplicationFromCheckpoint());
+
+  const auto kPartitionedTableName = "partitioned_table";
+  const auto kPartitionedIndexName = "partitioned_index";
+  const std::string kColumn2Name = "a";
+  auto p_conn = ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name));
+  auto c_conn = ASSERT_RESULT(consumer_cluster_.ConnectToDB(namespace_name));
+
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE TABLE $0 ($1 int PRIMARY KEY, $2 int) PARTITION BY RANGE ($1);",
+      kPartitionedTableName, kKeyColumnName, kColumn2Name));
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE TABLE $0_p1 PARTITION OF $0 FOR VALUES FROM (0) TO (100);", kPartitionedTableName));
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE TABLE $0_p2 PARTITION OF $0 FOR VALUES FROM (100) TO (200);", kPartitionedTableName));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  // Insert some rows.
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "INSERT INTO $0 SELECT i, i%2 FROM generate_series(51, 150) as i;", kPartitionedTableName));
+  // Create partitioned index on the parent, this will cause nonconcurrent index creates on the
+  // partitions. Make the table ranged so we can force an index scan later.
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE INDEX $0 ON $1($2 ASC);", kPartitionedIndexName, kPartitionedTableName,
+      kColumn2Name));
+  // Verify indexes on target.
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  const auto kPartitionedIndexCountStmt = Format(
+      "/*+ IndexScan($0) */ SELECT COUNT(*) FROM $1 WHERE $2 >= 0", kPartitionedIndexName,
+      kPartitionedTableName, kColumn2Name);
+  ASSERT_EQ(ASSERT_RESULT(c_conn.FetchRow<int64_t>(kPartitionedIndexCountStmt)), 100);
+
+  // Also verify that we can create a unique index on the partitioned table.
+  ASSERT_OK(p_conn.ExecuteFormat(
+      "CREATE UNIQUE INDEX ON $0($1, $2);", kPartitionedTableName, kKeyColumnName, kColumn2Name));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
 }
 
 TEST_F(XClusterDDLReplicationTest, ExactlyOnceReplication) {
@@ -1150,6 +1339,9 @@ TEST_F(XClusterDDLReplicationSwitchoverTest, SwitchoverWithPendingDDL) {
         "Could not find matching table");
     // Note that A will get marked as a target at this point.
     // TODO(#26160): reset A back to a source on replication failure.
+    // TODO(mlillibridge): Add a call to wait for heartbeats to create replication from checkpoint
+    // code once that call is available.
+    std::this_thread::sleep_for(30s);
     ASSERT_OK(ValidateReplicationRole(*cluster_A_, "target"));
     ASSERT_OK(ValidateReplicationRole(*cluster_B_, "target"));
 
@@ -1735,6 +1927,134 @@ TEST_F(XClusterDDLReplicationTableRewriteTest, AlterTypeIsBlocked) {
 
   // Verify column 2 is still indexed.
   VerifyIndex(kColumn2Name_, /* expected_indexed */ true);
+}
+
+TEST_F(XClusterDDLReplicationTest, BackupRestorePreservesEnumSortValue) {
+  if (!UseYbController()) {
+    GTEST_SKIP() << "This test does not work with yb_backup.py";
+  }
+
+  ASSERT_OK(SetUpClusters(/*is_colocated=*/false, /*start_yb_controller_servers=*/true));
+  {
+    auto conn = std::make_unique<pgwrapper::PGConn>(
+        ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name)));
+
+    ASSERT_OK(conn->ExecuteFormat(R"(
+        CREATE TYPE planets AS ENUM ( 'A', 'D' );
+        ALTER TYPE planets ADD VALUE 'B' BEFORE 'D';
+        ALTER TYPE planets ADD VALUE 'C' BEFORE 'D';
+    )"));
+    ASSERT_OK(conn->ExecuteFormat(R"(
+        CREATE TABLE enum_table (c planets, PRIMARY KEY (c ASC));
+        INSERT INTO enum_table (c) VALUES('D');
+        INSERT INTO enum_table (c) VALUES('A');
+    )"));
+    // If we keep adding new nables before 'Z', we will run into enum label renumber
+    // that is not yet supported in Yugabyte.
+    ASSERT_OK(conn->ExecuteFormat(R"(
+        CREATE TYPE overflow AS ENUM ( 'A', 'Z' );
+        ALTER TYPE overflow ADD VALUE 'B' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'C' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'D' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'E' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'F' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'G' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'H' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'I' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'J' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'K' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'L' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'M' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'N' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'O' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'P' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'Q' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'R' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'S' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'T' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'U' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'V' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'W' BEFORE 'Z';
+        ALTER TYPE overflow ADD VALUE 'X' BEFORE 'Z';
+    )"));
+    ASSERT_NOK_STR_CONTAINS(conn->ExecuteFormat(R"(
+        ALTER TYPE overflow ADD VALUE 'Y' BEFORE 'Z';
+    )"), "renumber enum labels is not yet supported");
+    ASSERT_OK(conn->ExecuteFormat(R"(
+        CREATE TYPE underflow AS ENUM ( 'A', 'Z' );
+        ALTER TYPE underflow ADD VALUE 'Y' BEFORE 'Z';
+        ALTER TYPE underflow ADD VALUE 'X' BEFORE 'Y';
+        ALTER TYPE underflow ADD VALUE 'W' BEFORE 'X';
+        ALTER TYPE underflow ADD VALUE 'V' BEFORE 'W';
+        ALTER TYPE underflow ADD VALUE 'U' BEFORE 'V';
+        ALTER TYPE underflow ADD VALUE 'T' BEFORE 'U';
+        ALTER TYPE underflow ADD VALUE 'S' BEFORE 'T';
+        ALTER TYPE underflow ADD VALUE 'R' BEFORE 'S';
+        ALTER TYPE underflow ADD VALUE 'Q' BEFORE 'R';
+        ALTER TYPE underflow ADD VALUE 'P' BEFORE 'Q';
+        ALTER TYPE underflow ADD VALUE 'O' BEFORE 'P';
+        ALTER TYPE underflow ADD VALUE 'N' BEFORE 'O';
+        ALTER TYPE underflow ADD VALUE 'M' BEFORE 'N';
+        ALTER TYPE underflow ADD VALUE 'L' BEFORE 'M';
+        ALTER TYPE underflow ADD VALUE 'K' BEFORE 'L';
+        ALTER TYPE underflow ADD VALUE 'J' BEFORE 'K';
+        ALTER TYPE underflow ADD VALUE 'I' BEFORE 'J';
+        ALTER TYPE underflow ADD VALUE 'H' BEFORE 'I';
+        ALTER TYPE underflow ADD VALUE 'G' BEFORE 'H';
+        ALTER TYPE underflow ADD VALUE 'F' BEFORE 'G';
+        ALTER TYPE underflow ADD VALUE 'E' BEFORE 'F';
+        ALTER TYPE underflow ADD VALUE 'D' BEFORE 'E';
+        ALTER TYPE underflow ADD VALUE 'C' BEFORE 'D';
+    )"));
+    ASSERT_NOK_STR_CONTAINS(conn->ExecuteFormat(R"(
+        ALTER TYPE underflow ADD VALUE 'B' BEFORE 'C';
+    )"), "renumber enum labels is not yet supported");
+  }
+
+  auto GetEnumInfoAndOrderedRows =
+      [&](Cluster& cluster) -> Result<std::pair<std::string, std::string>> {
+    auto conn = VERIFY_RESULT(cluster.ConnectToDB(namespace_name));
+    auto enum_info = Format("enum information:\n$0",
+        VERIFY_RESULT(conn.FetchAllAsString(
+        "SELECT typname, enumlabel, pg_enum.oid, enumsortorder FROM pg_enum "
+        "JOIN pg_type ON pg_enum.enumtypid = pg_type.oid ORDER BY typname, enumlabel ASC;",
+        ", ", "\n")));
+    LOG(INFO) << enum_info;
+    auto enum_table_c =
+        VERIFY_RESULT(conn.FetchAllAsString(
+        // WARNING: you need the enum_table.c here to avoid it referring to the result of c::text.
+        "SELECT c::text FROM enum_table ORDER BY enum_table.c ASC;", ", ", "\n"));
+    return std::make_pair(enum_info, enum_table_c);
+  };
+
+  std::string expected_enum_info;
+  {
+    auto [enum_info, rows] = ASSERT_RESULT(GetEnumInfoAndOrderedRows(producer_cluster_));
+    expected_enum_info = enum_info;
+    LOG(INFO) << "before we backup: " << rows;
+  }
+
+  // Backup then restore our database; in theory this should not affect anything.
+  ASSERT_OK(BackupFromProducer());
+  SetReplicationDirection(ReplicationDirection::BToA);
+  ASSERT_OK(RestoreToConsumer());
+  SetReplicationDirection(ReplicationDirection::AToB);
+
+  {
+    auto conn = std::make_unique<pgwrapper::PGConn>(
+        ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name)));
+    ASSERT_OK(conn->ExecuteFormat(R"(
+        INSERT INTO enum_table (c) VALUES('C');
+    )"));
+  }
+
+  // At this point, we have inserted D then A before the backup&restore then inserted C afterwards.
+  {
+    auto [enum_info, rows] = ASSERT_RESULT(GetEnumInfoAndOrderedRows(producer_cluster_));
+    ASSERT_EQ(rows, "A\nC\nD");
+    // Also check after restore the exact enum info (including enumsortorder) do not change.
+    ASSERT_EQ(enum_info, expected_enum_info);
+  }
 }
 
 }  // namespace yb

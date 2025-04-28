@@ -616,9 +616,6 @@ extern int	StatementTimeout;
 /* Add stacktrace information to every YSQL error. */
 extern bool yb_debug_report_error_stacktrace;
 
-/* Log cache misses and cache refresh events. */
-extern bool yb_debug_log_catcache_events;
-
 /*
  * Log automatic statement (or transaction) restarts such as read-restarts and
  * schema-version restarts (e.g. catalog version mismatch errors).
@@ -768,7 +765,7 @@ extern bool yb_enable_docdb_vector_type;
  */
 extern bool yb_silence_advisory_locks_not_supported_error;
 
-extern bool yb_skip_data_insert_for_table_rewrite;
+extern bool yb_skip_data_insert_for_xcluster_target;
 
 /*
  * See also ybc_util.h which contains additional such variable declarations for
@@ -829,7 +826,12 @@ typedef enum YbSysCatalogModificationAspect
 	YB_SYS_CAT_MOD_ASPECT_ALTERING_EXISTING_DATA = 1,
 	YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT = 2,
 	YB_SYS_CAT_MOD_ASPECT_BREAKING_CHANGE = 4,
-	YB_SYS_CAT_MOD_ASPECT_ONLINE_SCHEMA_CHANGE = 8,
+	/*
+	 * Indicates if the statement runs in an autonomous transaction even if
+	 * transactional DDL support is enabled.
+	 * Always unset if TEST_ysql_yb_ddl_transaction_block_enabled is false.
+	 */
+	YB_SYS_CAT_MOD_ASPECT_AUTONOMOUS_TRANSACTION_CHANGE = 8,
 } YbSysCatalogModificationAspect;
 
 typedef enum YbDdlMode
@@ -845,10 +847,10 @@ typedef enum YbDdlMode
 								   YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT |
 								   YB_SYS_CAT_MOD_ASPECT_BREAKING_CHANGE),
 
-	YB_DDL_MODE_ONLINE_SCHEMA_CHANGE_VERSION_INCREMENT =
+	YB_DDL_MODE_AUTONOMOUS_TRANSACTION_CHANGE_VERSION_INCREMENT =
 		(YB_SYS_CAT_MOD_ASPECT_ALTERING_EXISTING_DATA |
 		 YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT |
-		 YB_SYS_CAT_MOD_ASPECT_ONLINE_SCHEMA_CHANGE),
+		 YB_SYS_CAT_MOD_ASPECT_AUTONOMOUS_TRANSACTION_CHANGE),
 } YbDdlMode;
 
 void		YBIncrementDdlNestingLevel(YbDdlMode mode);
@@ -1158,7 +1160,10 @@ void		GetStatusMsgAndArgumentsByCode(const uint32_t pg_err_code, YbcStatus s,
 										   const char ***msg_args,
 										   const char **detail_buf,
 										   size_t *detail_nargs,
-										   const char ***detail_args);
+										   const char ***detail_args,
+										   const char **detail_log_buf,
+										   size_t *detail_log_nargs,
+										   const char ***detail_log_args);
 
 bool		YbIsBatchedExecution();
 void		YbSetIsBatchedExecution(bool value);
@@ -1199,14 +1204,19 @@ YbOptSplit *YbGetSplitOptions(Relation rel);
 			const char *funcname = YBCStatusFuncname(_status); \
 			const char *msg_buf = NULL; \
 			const char *detail_buf = NULL; \
+			const char *detail_log_buf = NULL; \
 			size_t msg_nargs = 0; \
 			size_t detail_nargs = 0; \
+			size_t detail_log_nargs = 0; \
 			const char **msg_args = NULL; \
 			const char **detail_args = NULL; \
+			const char **detail_log_args = NULL; \
 			GetStatusMsgAndArgumentsByCode(pg_err_code, _status, \
 										   &msg_buf, &msg_nargs, &msg_args, \
 										   &detail_buf, &detail_nargs, \
-										   &detail_args); \
+										   &detail_args, &detail_log_buf, \
+										   &detail_log_nargs, \
+										   &detail_log_args); \
 			YBCFreeStatus(_status); \
 			if (errstart(adjusted_elevel, TEXTDOMAIN)) \
 			{ \
@@ -1214,6 +1224,10 @@ YbOptSplit *YbGetSplitOptions(Relation rel);
 				yb_errmsg_from_status(msg_buf, msg_nargs, msg_args); \
 				if (detail_buf) \
 					yb_errdetail_from_status(detail_buf, detail_nargs, detail_args); \
+				if (detail_log_buf) \
+					yb_errdetail_log_from_status(detail_log_buf, \
+												 detail_log_nargs, \
+												 detail_log_args); \
 				yb_set_pallocd_error_file_and_func(filename, funcname); \
 				errcode(pg_err_code); \
 				errhidecontext(true); \
@@ -1347,7 +1361,7 @@ extern bool YbApplyInvalidationMessages(YbcCatalogMessageLists *message_lists);
 
 extern bool YbInvalidationMessagesTableExists();
 
-extern bool yb_is_calling_internal_function_for_ddl;
+extern bool yb_is_calling_internal_sql_for_ddl;
 
 extern char *YbGetPotentiallyHiddenOidText(Oid oid);
 
@@ -1356,5 +1370,7 @@ extern void YbWaitForSharedCatalogVersionToCatchup(uint64_t version);
 extern bool YbIsInvalidationMessageEnabled();
 
 extern bool YbRefreshMatviewInPlace();
+
+extern void YbForceSendInvalMessages();
 
 #endif							/* PG_YB_UTILS_H */

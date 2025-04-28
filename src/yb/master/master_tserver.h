@@ -121,6 +121,11 @@ class MasterTabletServer : public tserver::TabletServerIf,
   void SetYsqlDBCatalogVersions(
       const tserver::DBCatalogVersionDataPB& db_catalog_version_data) override {}
 
+  Result<tserver::GetYSQLLeaseInfoResponsePB> GetYSQLLeaseInfo() const override;
+  Status RestartPG() const override {
+    return STATUS(NotSupported, "RestartPG not implemented for masters");
+  }
+
   const std::string& permanent_uuid() const override;
 
   Result<tserver::PgTxnSnapshot> GetLocalPgTxnSnapshot(

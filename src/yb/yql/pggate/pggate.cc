@@ -29,11 +29,9 @@
 
 #include "yb/dockv/partition.h"
 #include "yb/common/pg_system_attr.h"
-#include "yb/common/pgsql_protocol.pb.h"
 #include "yb/common/schema.h"
 
 #include "yb/dockv/doc_key.h"
-#include "yb/dockv/primitive_value.h"
 #include "yb/dockv/value_type.h"
 
 #include "yb/gutil/casts.h"
@@ -71,7 +69,6 @@
 #include "yb/yql/pggate/pg_session.h"
 #include "yb/yql/pggate/pg_shared_mem.h"
 #include "yb/yql/pggate/pg_statement.h"
-#include "yb/yql/pggate/pg_table.h"
 #include "yb/yql/pggate/pg_tabledesc.h"
 #include "yb/yql/pggate/pg_tools.h"
 #include "yb/yql/pggate/pg_truncate_colocated.h"
@@ -162,7 +159,7 @@ std::optional<PgSelect::IndexQueryInfo> MakeIndexQueryInfo(
 Result<std::unique_ptr<PgStatement>> MakeSelectStatement(
     const PgSession::ScopedRefPtr& pg_session, const PgObjectId& table_id,
     const PgObjectId& index_id, const YbcPgPrepareParameters* params, bool is_region_local) {
-  if (params && (params->index_only_scan || YBCIsNonembeddedYbctidsOnlyFetch(params))) {
+  if (params && params->index_only_scan) {
     return PgSelectIndex::Make(pg_session, index_id, is_region_local);
   }
   return PgSelect::Make(
@@ -291,7 +288,7 @@ constexpr std::pair<size_t, bool> UniqTagsCount(
     std::tie(count, has_duplicates) = UniqTagsCount(found_items, std::forward<Args>(args)...);
   }
   for (auto t : tags) {
-    const auto idx = to_underlying(t.stmt_op);
+    const auto idx = std::to_underlying(t.stmt_op);
     if (idx < found_items.size() && !found_items.data()[idx]) {
       ++count;
       found_items.data()[idx] = true;
@@ -542,7 +539,7 @@ Result<dockv::KeyBytes> PgApiImpl::TupleIdBuilder::Build(
       values->emplace_back(dockv::KeyEntryType::kNullLow);
       continue;
     }
-    if (attr->attr_num == to_underlying(PgSystemAttrNum::kYBRowId)) {
+    if (attr->attr_num == std::to_underlying(PgSystemAttrNum::kYBRowId)) {
       SCHECK(new_row_id_holder.empty(), Corruption, "Multiple kYBRowId attribute detected");
       new_row_id_holder = session->GenerateNewYbrowid();
       expr_pb->mutable_value()->ref_binary_value(new_row_id_holder);
@@ -1027,7 +1024,9 @@ Status PgApiImpl::NewDropTable(const PgObjectId& table_id, bool if_exist, PgStat
          IllegalState,
          "Table is being dropped outside of DDL mode");
   return AddToCurrentPgMemctx(
-      std::make_unique<PgDropTable>(pg_session_, table_id, if_exist), handle);
+      std::make_unique<PgDropTable>(
+          pg_session_, table_id, if_exist, pg_txn_manager_->IsDdlModeWithRegularTransactionBlock()),
+      handle);
 }
 
 Status PgApiImpl::NewTruncateTable(const PgObjectId& table_id, PgStatement** handle) {
@@ -1178,7 +1177,10 @@ Status PgApiImpl::NewDropIndex(
     const PgObjectId& index_id, bool if_exist, bool ddl_rollback_enabled, PgStatement** handle) {
   SCHECK(pg_txn_manager_->IsDdlMode(), IllegalState, "Index is being dropped outside of DDL mode");
   return AddToCurrentPgMemctx(
-      std::make_unique<PgDropIndex>(pg_session_, index_id, if_exist, ddl_rollback_enabled), handle);
+      std::make_unique<PgDropIndex>(
+          pg_session_, index_id, if_exist, ddl_rollback_enabled,
+          pg_txn_manager_->IsDdlModeWithRegularTransactionBlock()),
+      handle);
 }
 
 Status PgApiImpl::ExecPostponedDdlStmt(PgStatement* handle) {
@@ -1210,7 +1212,7 @@ Status PgApiImpl::ExecPostponedDdlStmt(PgStatement* handle) {
 
 #undef YB_EXECUTE_PG_STMT
 
-  RSTATUS_DCHECK(false, IllegalState, "Unexpected stmt_op $0", to_underlying(stmt_op));
+  RSTATUS_DCHECK(false, IllegalState, "Unexpected stmt_op $0", std::to_underlying(stmt_op));
   return Status::OK();
 }
 
@@ -1587,6 +1589,10 @@ Status PgApiImpl::ExecSelect(PgStatement* handle, const YbcPgExecParameters* exe
   return select.Exec(exec_params);
 }
 
+void PgApiImpl::IncrementIndexRecheckCount() {
+  pg_session_->metrics().RecordRowRemovedByIndexRecheck();
+}
+
 
 //--------------------------------------------------------------------------------------------------
 // Functions.
@@ -1825,6 +1831,10 @@ const unsigned char *PgApiImpl::GetLocalTserverUuid() const {
 
 pid_t PgApiImpl::GetLocalTServerPid() const {
   return tserver_shared_object_->pid();
+}
+
+Result<int> PgApiImpl::GetXClusterRole(uint32_t db_oid) {
+  return pg_session_->GetXClusterRole(db_oid);
 }
 
 // Tuple Expression -----------------------------------------------------------------------------
@@ -2092,6 +2102,10 @@ void PgApiImpl::ClearInsertOnConflictCache(void* state) {
 
 void PgApiImpl::SetTimeout(int timeout_ms) {
   pg_session_->SetTimeout(timeout_ms);
+}
+
+void PgApiImpl::SetLockTimeout(int lock_timeout_ms) {
+  pg_session_->SetLockTimeout(lock_timeout_ms);
 }
 
 Result<yb::tserver::PgGetLockStatusResponsePB> PgApiImpl::GetLockStatusData(

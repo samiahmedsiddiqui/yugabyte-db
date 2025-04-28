@@ -137,8 +137,17 @@ void SetProxyAddress(std::string* flag, const std::string& name,
   uint16_t port, bool override_port = false) {
   if (flag->empty() || override_port) {
     std::vector<HostPort> bind_addresses;
-    Status status = HostPort::ParseStrings(FLAGS_rpc_bind_addresses, 0, &bind_addresses);
-    LOG_IF(DFATAL, !status.ok()) << "Bad public IPs " << FLAGS_rpc_bind_addresses << ": " << status;
+    Status status;
+    if (flag->empty()) {
+      // If the flag is empty, we set ip address to the default rpc bind address.
+      status = HostPort::ParseStrings(FLAGS_rpc_bind_addresses, 0, &bind_addresses);
+      LOG_IF(DFATAL, !status.ok()) << "Bad public IPs " << FLAGS_rpc_bind_addresses << ": "
+             << status;
+    } else {
+      // If override_port is true, we keep the existing ip addresses and just change the port.
+      status = HostPort::ParseStrings(*flag, 0, &bind_addresses);
+      LOG_IF(DFATAL, !status.ok()) << "Bad public IPs " << *flag << ": " << status;
+    }
     if (!bind_addresses.empty()) {
       for (auto& addr : bind_addresses) {
         addr.set_port(port);
@@ -285,7 +294,11 @@ int TabletServerMain(int argc, char** argv) {
               << pg_process_conf.listen_addresses << ", port " << pg_process_conf.pg_port;
 
     pg_supervisor = std::make_unique<PgSupervisor>(pg_process_conf, server.get());
-    LOG_AND_RETURN_FROM_MAIN_NOT_OK(pg_supervisor->Start());
+    // If the ysql lease feature is enabled, we don't want to accept pg connections until the
+    // tserver acquires a lease from the master leader.
+    LOG_AND_RETURN_FROM_MAIN_NOT_OK(
+        pg_supervisor->Start(/* run_process */ !TabletServer::YSQLLeaseEnabled()));
+    LOG_AND_RETURN_FROM_MAIN_NOT_OK(server->StartYSQLLeaseRefresher());
   }
 
   std::unique_ptr<ysql_conn_mgr_wrapper::YsqlConnMgrSupervisor> ysql_conn_mgr_supervisor;

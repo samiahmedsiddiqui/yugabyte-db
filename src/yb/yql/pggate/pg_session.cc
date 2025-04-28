@@ -16,38 +16,31 @@
 #include "yb/yql/pggate/pg_session.h"
 
 #include <algorithm>
-#include <future>
 #include <optional>
 #include <utility>
 
 #include "yb/client/table_info.h"
 
 #include "yb/common/pg_types.h"
-#include "yb/common/tablespace_parser.h"
-#include "yb/qlexpr/ql_expr.h"
-#include "yb/common/ql_value.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/row_mark.h"
 #include "yb/common/schema.h"
-#include "yb/common/transaction_error.h"
+#include "yb/common/tablespace_parser.h"
 
 #include "yb/gutil/casts.h"
-
-#include "yb/tserver/pg_client.messages.h"
 
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/oid_generator.h"
 #include "yb/util/result.h"
 #include "yb/util/status_format.h"
-#include "yb/util/string_util.h"
 
 #include "yb/yql/pggate/pg_client.h"
-#include "yb/yql/pggate/pg_expr.h"
 #include "yb/yql/pggate/pg_op.h"
 #include "yb/yql/pggate/pggate_flags.h"
-#include "yb/yql/pggate/ybc_pggate.h"
 #include "yb/yql/pggate/util/ybc_util.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 using namespace std::literals;
 
@@ -331,7 +324,9 @@ class PgSession::RunHelper {
     if (operations_.Empty() && pg_session_.buffering_enabled_ &&
         !force_non_bufferable_ && op->is_write()) {
         if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {
-          LOG_WITH_PREFIX(INFO) << "Buffering operation: " << op->ToString();
+          LOG_WITH_PREFIX(INFO) << "Buffering operation on table "
+            << table.table_name().table_name() << ": "
+            << op->ToString();
         }
         return buffer.Add(table,
                           PgsqlWriteOpPtr(std::move(op), down_cast<PgsqlWriteOp*>(op.get())),
@@ -368,7 +363,9 @@ class PgSession::RunHelper {
     }
 
     if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {
-      LOG_WITH_PREFIX(INFO) << "Applying operation: " << op->ToString();
+      LOG_WITH_PREFIX(INFO) << "Applying operation on table "
+      << table.table_name().table_name()
+      << ": " << op->ToString();
     }
 
     const auto row_mark_type = GetRowMarkType(*op);
@@ -494,6 +491,10 @@ Status PgSession::GetCatalogMasterVersion(uint64_t *version) {
   return Status::OK();
 }
 
+Result<int> PgSession::GetXClusterRole(uint32_t db_oid) {
+  return pg_client_.GetXClusterRole(db_oid);
+}
+
 Status PgSession::CancelTransaction(const unsigned char* transaction_id) {
   return pg_client_.CancelTransaction(transaction_id);
 }
@@ -558,33 +559,26 @@ Result<std::pair<int64_t, bool>> PgSession::ReadSequenceTuple(int64_t db_oid,
 
 //--------------------------------------------------------------------------------------------------
 
-Status PgSession::DropTable(const PgObjectId& table_id) {
+Status PgSession::DropTable(const PgObjectId& table_id, bool use_regular_transaction_block) {
   tserver::PgDropTableRequestPB req;
   table_id.ToPB(req.mutable_table_id());
+  req.set_use_regular_transaction_block(use_regular_transaction_block);
   return ResultToStatus(pg_client_.DropTable(&req, CoarseTimePoint()));
 }
 
 Status PgSession::DropIndex(
     const PgObjectId& index_id,
+    bool use_regular_transaction_block,
     client::YBTableName* indexed_table_name) {
   tserver::PgDropTableRequestPB req;
   index_id.ToPB(req.mutable_table_id());
   req.set_index(true);
+  req.set_use_regular_transaction_block(use_regular_transaction_block);
   auto result = VERIFY_RESULT(pg_client_.DropTable(&req, CoarseTimePoint()));
   if (indexed_table_name) {
     *indexed_table_name = std::move(result);
   }
   return Status::OK();
-}
-
-Status PgSession::DropTablegroup(const PgOid database_oid,
-                                 PgOid tablegroup_oid) {
-  tserver::PgDropTablegroupRequestPB req;
-  PgObjectId tablegroup_id(database_oid, tablegroup_oid);
-  tablegroup_id.ToPB(req.mutable_tablegroup_id());
-  Status s = pg_client_.DropTablegroup(&req, CoarseTimePoint());
-  InvalidateTableCache(PgObjectId(database_oid, tablegroup_oid), InvalidateOnPgClient::kFalse);
-  return s;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -953,6 +947,10 @@ Status PgSession::GetIndexBackfillProgress(std::vector<PgObjectId> index_ids,
 
 void PgSession::SetTimeout(const int timeout_ms) {
   pg_client_.SetTimeout(timeout_ms * 1ms);
+}
+
+void PgSession::SetLockTimeout(int lock_timeout_ms) {
+  pg_client_.SetLockTimeout(lock_timeout_ms * 1ms);
 }
 
 void PgSession::ResetCatalogReadPoint() {

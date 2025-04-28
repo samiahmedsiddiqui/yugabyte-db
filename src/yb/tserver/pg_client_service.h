@@ -16,7 +16,6 @@
 #include <functional>
 #include <future>
 #include <memory>
-#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -24,13 +23,10 @@
 
 #include "yb/gutil/ref_counted.h"
 
-#include "yb/master/master_heartbeat.fwd.h"
-
 #include "yb/rpc/rpc_fwd.h"
 
 #include "yb/server/server_base_options.h"
 
-#include "yb/tserver/pg_client_session.h"
 #include "yb/tserver/pg_client.service.h"
 #include "yb/tserver/pg_txn_snapshot_manager.h"
 
@@ -73,8 +69,9 @@ class TserverXClusterContextIf;
     (GetReplicationSlot) \
     (GetTableDiskSize) \
     (GetTablePartitionList) \
-    (GetTserverCatalogVersionInfo) \
     (GetTserverCatalogMessageLists) \
+    (GetTserverCatalogVersionInfo) \
+    (GetXClusterRole) \
     (Heartbeat) \
     (InsertSequenceTuple) \
     (IsInitDbDone) \
@@ -115,6 +112,12 @@ class TserverXClusterContextIf;
     (GetTableKeyRanges) \
     /**/
 
+
+struct YSQLLeaseInfo {
+  bool is_live;
+  uint64_t lease_epoch;
+};
+
 class PgClientServiceImpl : public PgClientServiceIf {
  public:
   explicit PgClientServiceImpl(
@@ -138,6 +141,7 @@ class PgClientServiceImpl : public PgClientServiceIf {
   Result<PgTxnSnapshot> GetLocalPgTxnSnapshot(const PgTxnSnapshotLocalId& snapshot_id);
 
   void ProcessLeaseUpdate(const master::RefreshYsqlLeaseInfoPB& lease_refresh_info, MonoTime time);
+  YSQLLeaseInfo GetYSQLLeaseInfo() const;
 
   size_t TEST_SessionsCount();
 

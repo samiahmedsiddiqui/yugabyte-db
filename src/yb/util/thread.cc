@@ -53,9 +53,6 @@
 
 #include <boost/intrusive/list.hpp>
 
-#include <cds/init.h>
-#include <cds/gc/dhp.h>
-
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/bind.h"
 #include "yb/gutil/dynamic_annotations.h"
@@ -253,15 +250,11 @@ uint64_t& ThreadCategoryTracker::RegisterGaugeForAllMetricEntities(const string&
 class ThreadMgr {
  public:
   ThreadMgr() {
-    cds::Initialize();
-    cds::gc::dhp::GarbageCollector::construct();
-    cds::threading::Manager::attachThread();
     started_category_tracker_ = std::make_unique<ThreadCategoryTracker>("threads_started");
     running_category_tracker_ = std::make_unique<ThreadCategoryTracker>("threads_running");
   }
 
   ~ThreadMgr() {
-    cds::Terminate();
     thread_categories_.clear();
   }
 
@@ -537,7 +530,7 @@ void ThreadMgr::RenderThreadCategoryRows(const ThreadCategory& category, std::st
       } else {
         symbolized = thread.stack_trace.status().message().ToBuffer();
       }
-      active_out = output + to_underlying(group);
+      active_out = output + std::to_underlying(group);
     }
 
     *active_out += Format(
@@ -593,7 +586,7 @@ void ThreadMgr::RenderThreadGroupUnlocked(const std::string& group, std::ostream
   }
 
   for (auto g : StackTraceGroupList()) {
-    output << groups[to_underlying(g)];
+    output << groups[std::to_underlying(g)];
   }
   output << "</table>";
 }
@@ -937,8 +930,6 @@ void* Thread::SuperviseThread(void* arg) {
   t->descriptor_ = descriptor.get();
   thread_manager->AddThread(std::move(descriptor));
 
-  cds::threading::Manager::attachThread();
-
   // FinishThread() is guaranteed to run (even if functor_ throws an
   // exception) because pthread_cleanup_push() creates a scoped object
   // whose destructor invokes the provided callback.
@@ -955,8 +946,6 @@ void Thread::Join() {
 }
 
 void Thread::FinishThread(void* arg) {
-  cds::threading::Manager::detachThread();
-
   Thread* t = static_cast<Thread*>(arg);
 
   for (Closure& c : t->exit_callbacks_) {
@@ -994,14 +983,6 @@ Status Thread::SendSignal(ThreadIdForStack tid, int signal) {
     return status;
   }
   return Status::OK();
-}
-
-CDSAttacher::CDSAttacher() {
-  cds::threading::Manager::attachThread();
-}
-
-CDSAttacher::~CDSAttacher() {
-  cds::threading::Manager::detachThread();
 }
 
 void RenderAllThreadStacks(std::ostream& output) {
